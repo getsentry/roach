@@ -209,6 +209,16 @@ describe("roach service", () => {
       ],
     });
 
+    // The control API answers a bad body with the fault of the client.
+    const runsUrl = `${service.url}/__roach/runs`;
+    const notJson = await fetch(runsUrl, { method: "POST", body: "{" });
+    expect(notJson.status).toBe(400);
+    const tooLarge = await fetch(runsUrl, {
+      method: "POST",
+      body: "x".repeat(65 * 1024 * 1024),
+    });
+    expect(tooLarge.status).toBe(413);
+
     // A body over the limit gets HTTP 413 and never goes live.
     const large = await send(run.url, { prompt: "x".repeat(65 * 1024 * 1024) });
     expect(large.status).toBe(413);

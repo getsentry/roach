@@ -109,10 +109,14 @@ function readBody(
   });
 }
 
+/** Read a JSON request body. A body that is not JSON fails with HTTP 400. */
 export async function readJson<T>(incoming: http.IncomingMessage): Promise<T> {
-  return JSON.parse(
-    (await readBody(incoming, MAX_BODY_BYTES)).toString("utf8") || "{}",
-  ) as T;
+  const text = (await readBody(incoming, MAX_BODY_BYTES)).toString("utf8");
+  try {
+    return JSON.parse(text || "{}") as T;
+  } catch {
+    throw httpError(400, "body is not JSON");
+  }
 }
 
 /** Compare tokens in constant time. */
@@ -415,8 +419,16 @@ export async function listenProxy(
     }
     options.control(incoming, outgoing).catch((error: unknown) => {
       process.stderr.write(`[roach] Control failed: ${String(error)}\n`);
-      if (!outgoing.headersSent) outgoing.writeHead(500);
-      outgoing.end();
+      // An error with a status, such as 413 from readBody, is the fault of
+      // the client. Any other error is a bug of the proxy.
+      const status = (error as { status?: number }).status ?? 500;
+      if (outgoing.headersSent) {
+        outgoing.end();
+        return;
+      }
+      sendJson(outgoing, status, {
+        error: status === 500 ? "internal error" : (error as Error).message,
+      });
     });
   });
   server.on("connection", (socket: Socket) => {
