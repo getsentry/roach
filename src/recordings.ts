@@ -96,13 +96,16 @@ export function createFileStore(directory: string): RecordingStore {
     },
 
     async keysOf(session) {
-      const names = await readdir(directory).catch((error: unknown) => {
-        if (isMissing(error)) return [];
-        throw error;
-      });
+      const entries = await readdir(directory, { withFileTypes: true }).catch(
+        (error: unknown) => {
+          if (isMissing(error)) return [];
+          throw error;
+        },
+      );
       const keys: string[] = [];
-      for (const rule of names) {
-        for (const entry of (await indexOf(rule)).values()) {
+      // Each rule is a directory. Skip other files, such as `.DS_Store`.
+      for (const rule of entries.filter((entry) => entry.isDirectory())) {
+        for (const entry of (await indexOf(rule.name)).values()) {
           if (entry.session === session) keys.push(entry.key);
         }
       }
