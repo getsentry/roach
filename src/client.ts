@@ -1,18 +1,21 @@
 /**
  * The client of Roach. See `README.md`.
  *
- * `spawnRoach()` starts the proxy in its own process and returns
- * `env`, the variables that send the traffic of a process through it.
- * `connectRoach()` controls a running proxy from another process,
- * such as a test worker.
+ * `startRemoteRun()` starts a run on a Roach service (`service.ts`).
+ * `spawnRoach()` starts a local proxy in its own process. Both return
+ * `env`, the variables that send the traffic of a process through the
+ * proxy. `connectRoach()` controls a run or a local proxy from another
+ * process, such as a test worker.
  */
 import { spawn } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
+import https from "node:https";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CONTROL_PATH } from "./server.ts";
+import type { RemoteRun, RunConfig } from "./service.ts";
 import type { RoachAddress, RoachConfig, RecordingStats } from "./types.ts";
 
 /** The open session of one test. */
@@ -57,23 +60,33 @@ const PROXY_VARIABLES = new Set([
   "node_use_env_proxy",
 ]);
 
+/** Where the control API is, and its token. */
+type ControlAddress = Pick<RoachAddress, "controlUrl" | "url"> & {
+  token?: string | undefined;
+};
+
 /** Call the control API, and return the JSON of the response. */
 function callControl<T>(
-  address: Pick<RoachAddress, "token" | "url">,
-  method: "GET" | "POST",
+  address: ControlAddress,
+  method: "DELETE" | "GET" | "POST",
   route: string,
   body?: unknown,
 ): Promise<T> {
   const payload = body === undefined ? undefined : JSON.stringify(body);
+  const base = address.controlUrl ?? `${address.url}${CONTROL_PATH}`;
+  const url = route ? `${base}/${route}` : base;
+  const client = url.startsWith("https:") ? https : http;
   return new Promise((resolve, reject) => {
-    const request = http.request(
-      `${address.url}${CONTROL_PATH}/${route}`,
+    const request = client.request(
+      url,
       {
         // Its own agent, so that a proxy agent of the process is not used.
         agent: false,
         method,
         headers: {
-          authorization: `Bearer ${address.token}`,
+          ...(address.token
+            ? { authorization: `Bearer ${address.token}` }
+            : {}),
           ...(payload ? { "content-type": "application/json" } : {}),
         },
       },
@@ -101,9 +114,9 @@ function callControl<T>(
   });
 }
 
-/** Control a running proxy, for example from a test worker. */
+/** Control a run or a local proxy, for example from a test worker. */
 export function connectRoach(
-  address: Pick<RoachAddress, "token" | "url">,
+  address: Pick<RoachAddress, "controlUrl" | "token" | "url">,
 ): RoachControl {
   return {
     async startSession(name) {
@@ -168,14 +181,73 @@ export async function spawnRoach(
   );
   child.stdin.end(JSON.stringify(config));
   const address = await readAddress(child);
-  // `NODE_EXTRA_CA_CERTS` takes a file.
-  const caDirectory = await mkdtemp(path.join(tmpdir(), "roach-"));
-  const caFile = path.join(caDirectory, "ca.pem");
-  await writeFile(caFile, address.caCert);
+  const proxyEnv = await createProxyEnv(address, noProxy);
 
   return {
     ...address,
     ...connectRoach(address),
+    env: proxyEnv.env,
+    async close() {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGTERM");
+        await exited;
+      }
+      await proxyEnv.remove();
+    },
+  };
+}
+
+/** A run on a Roach service (`service.ts`). */
+export interface RemoteRoach extends RemoteRun, RoachControl {
+  /** The same variables as `Roach.env`, for the proxy URL of the run. */
+  env: Record<string, string>;
+  /** End the run. Returns its stats. */
+  close(): Promise<RecordingStats>;
+}
+
+/**
+ * Start a run on a Roach service, such as `https://roach.example.com`.
+ *
+ * `token` is the token of the tenant. Only this call uses it. Without it,
+ * the service only allows `replay` mode, so CI jobs of forks can replay
+ * without a secret. The run and its workers use the run token.
+ */
+export async function startRemoteRun(
+  service: { url: string; token?: string | undefined },
+  config: RunConfig,
+  { noProxy = "localhost,127.0.0.1,::1" }: { noProxy?: string } = {},
+): Promise<RemoteRoach> {
+  const run = await callControl<RemoteRun>(
+    { url: service.url.replace(/\/$/, ""), token: service.token },
+    "POST",
+    "runs",
+    config,
+  );
+  const proxyEnv = await createProxyEnv(run, noProxy);
+  return {
+    ...run,
+    ...connectRoach(run),
+    env: proxyEnv.env,
+    async close() {
+      try {
+        return await callControl<RecordingStats>(run, "DELETE", "");
+      } finally {
+        await proxyEnv.remove();
+      }
+    },
+  };
+}
+
+/** The proxy variables of a process, with the CA certificate in a file. */
+async function createProxyEnv(
+  address: Pick<RoachAddress, "caCert" | "url">,
+  noProxy: string,
+): Promise<{ env: Record<string, string>; remove(): Promise<void> }> {
+  // `NODE_EXTRA_CA_CERTS` takes a file.
+  const caDirectory = await mkdtemp(path.join(tmpdir(), "roach-"));
+  const caFile = path.join(caDirectory, "ca.pem");
+  await writeFile(caFile, address.caCert);
+  return {
     env: {
       HTTP_PROXY: address.url,
       HTTPS_PROXY: address.url,
@@ -183,12 +255,6 @@ export async function spawnRoach(
       NODE_USE_ENV_PROXY: "1",
       NODE_EXTRA_CA_CERTS: caFile,
     },
-    async close() {
-      if (child.exitCode === null && child.signalCode === null) {
-        child.kill("SIGTERM");
-        await exited;
-      }
-      await rm(caDirectory, { force: true, recursive: true });
-    },
+    remove: () => rm(caDirectory, { force: true, recursive: true }),
   };
 }

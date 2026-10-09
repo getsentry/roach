@@ -7,9 +7,8 @@
  *
  * A store keeps recordings by key, `<rule>/<hash>.json`. The file store
  * (`recordings.ts`) keeps them in a directory that can be committed. The
- * remote store (`remote-store.ts`) keeps them in the Worker (`worker/`).
- *
- * This file uses no Node built-ins, because the Worker uses it too.
+ * GCS store (`gcs.ts`) keeps them in a bucket, for the shared service
+ * (`service.ts`).
  */
 /** A short hash of each part of a request, by part name. */
 export type RequestParts = Record<string, string>;
@@ -48,7 +47,7 @@ export interface RecordingStore {
    * The recording of `rule` with the most equal parts. Recordings of the
    * same session come first, because a test usually sends the same
    * requests as the last time it ran. Only the file store has this: it is a
-   * hint for debugging a miss, and the Worker keeps no index for it.
+   * hint for debugging a miss, and a bucket has no index for it.
    */
   closest?(
     rule: string,
@@ -64,9 +63,6 @@ export interface RecordingStore {
 
 /** A rule name that a store accepts. It is a directory name. */
 export const RULE_NAME = /^[A-Za-z0-9][\w.-]{0,63}$/;
-
-/** A key that a store accepts: `<rule>/<sha-256 hex>.json`. */
-export const RECORDING_KEY = /^([A-Za-z0-9][\w.-]{0,63})\/[0-9a-f]{64}\.json$/;
 
 /** The key of a request of `rule` with the hash `hash`. */
 export const recordingKey = (rule: string, hash: string) =>

@@ -5,7 +5,7 @@
  * rule matches, with a function that sends the request live. The recorder
  * decides whether to replay, send live, or fail the request, and it owns
  * every read and write of the recordings. A store keeps them: the file
- * store (`recordings.ts`) or a Roach Worker (`remote-store.ts`).
+ * store (`recordings.ts`) or a GCS bucket (`gcs.ts`).
  *
  * A session groups the requests of one test. One session is open at a
  * time. The recorder keeps the new recordings of a session in memory until
@@ -20,8 +20,6 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import type { IncomingHttpHeaders } from "node:http";
 import path from "node:path";
-import { createFileStore } from "./recordings.ts";
-import { createRemoteStore } from "./remote-store.ts";
 import { describeParts, keyRequest, type KeyedRequest } from "./request-key.ts";
 import { createSecrets } from "./secrets.ts";
 import {
@@ -147,42 +145,24 @@ function fromRecording(
   return { status: response.status, headers: response.headers, body };
 }
 
-/** The store of a config. Throws when the config does not name one. */
-function storeOf(config: RoachConfig): RecordingStore {
-  if ((config.directory === undefined) === (config.store === undefined)) {
-    throw new Error("Roach config must set directory or store, not both");
-  }
+/** The parts of a config that the recorder uses. */
+export type RecorderConfig = Pick<
+  RoachConfig,
+  "missDirectory" | "mode" | "rules" | "secrets" | "usedFile"
+>;
+
+/** Create the recorder of one proxy run, with the store of its recordings. */
+export function createRecorder(config: RecorderConfig, store: RecordingStore) {
   for (const rule of config.rules) {
     if (!RULE_NAME.test(rule.name)) {
       throw new Error(`Roach rule name is not valid: ${rule.name}`);
     }
   }
-  if (config.store) {
-    if (config.usedFile) throw new Error("usedFile needs directory");
-    return createRemoteStore(config.store);
-  }
-  return createFileStore(config.directory!);
-}
-
-/** Create the recorder of one proxy run. */
-export function createRecorder(config: RoachConfig) {
-  const store = storeOf(config);
   const missDirectory = config.missDirectory
     ? path.resolve(config.missDirectory)
     : undefined;
-  if (
-    missDirectory &&
-    config.directory !== undefined &&
-    !path.relative(config.directory, missDirectory).startsWith("..")
-  ) {
-    // Miss files hold request bodies. Keep them out of the committed files.
-    throw new Error("missDirectory must not be inside directory");
-  }
   let session: Session | undefined;
-  const secrets = createSecrets([
-    ...(config.secrets ?? []),
-    ...(config.store ? [config.store.token] : []),
-  ]);
+  const secrets = createSecrets(config.secrets);
   /** Recordings that passed sessions, or requests outside one, used. */
   const used = new Set<string>();
   const stats: RecordingStats = {

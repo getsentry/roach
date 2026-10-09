@@ -4,4 +4,3 @@ minimumReleaseAge: 1440
 allowBuilds:
   esbuild: true
   simple-git-hooks: true
-  workerd: true

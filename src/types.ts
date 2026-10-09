@@ -42,29 +42,13 @@ export interface RecordingRule {
   values?: ValuePatterns;
 }
 
-/** A Roach Worker (`worker/`) that keeps the recordings. */
-export interface RemoteStoreConfig {
-  /** The URL of the Worker, such as `https://roach.example.workers.dev`. */
-  url: string;
-  /**
-   * The token of the tenant. The proxy sends it only to `url`, and never
-   * writes it to a recording.
-   */
-  token: string;
-  /**
-   * The run of this proxy, such as the GitHub Actions run id. The Worker
-   * counts the runs that use each recording, so a recording that only one
-   * run uses shows up in Sentry.
-   */
-  run?: string;
-}
-
-/** The configuration of one proxy. Set `directory` or `store`. */
+/**
+ * The configuration of one local proxy (`server.ts`). The shared service
+ * (`service.ts`) has its own configuration.
+ */
 export interface RoachConfig {
   /** The directory of the recordings. Each rule has a subdirectory. */
-  directory?: string;
-  /** The Worker that keeps the recordings, in place of `directory`. */
-  store?: RemoteStoreConfig;
+  directory: string;
   mode: RecordingMode;
   /**
    * The only origins that the proxy sends requests to, such as
@@ -75,8 +59,7 @@ export interface RoachConfig {
   /**
    * When the proxy stops, it lists here the recordings that sessions used.
    * A failed session uses all recordings that it recorded before. Give these
-   * files to the `prune` command. Only for `directory`: R2 deletes the recordings
-   * of the Worker 30 days after they were written.
+   * files to the `prune` command.
    */
   usedFile?: string;
   /**
@@ -134,6 +117,8 @@ export interface RoachAddress {
   url: string;
   /** The bearer token of the control API. */
   token: string;
+  /** The base URL of the control API. Default: `<url>/__roach`. */
+  controlUrl?: string;
   /** The PEM certificate of the authority that signs intercepted hosts. */
   caCert: string;
 }

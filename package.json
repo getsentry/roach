@@ -2,7 +2,7 @@
   "name": "@sentry/roach",
   "version": "0.0.0",
   "private": true,
-  "description": "A recording HTTPS proxy for tests.",
+  "description": "A recording HTTPS proxy for tests, as a shared service or a local process.",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
@@ -16,6 +16,7 @@
     "./client": "./src/client.ts",
     "./report": "./src/report.ts",
     "./server": "./src/server.ts",
+    "./service": "./src/service.ts",
     "./types": "./src/types.ts",
     "./values": "./src/values.ts"
   },
@@ -30,15 +31,12 @@
     "skills:install": "dotagents --project install",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
-    "typecheck": "tsc -p . && tsc -p worker",
-    "worker:dev": "wrangler dev",
-    "worker:deploy": "wrangler deploy"
+    "typecheck": "tsc -p ."
   },
   "dependencies": {
-    "@sentry/cloudflare": "11.6.0"
+    "@sentry/node": "11.6.0"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^5.20261008.1",
     "@sentry/dotagents": "^3.3.0",
     "@types/node": "^24.19.1",
     "@vitest/coverage-v8": "^5.0.3",
@@ -50,8 +48,7 @@
     "simple-git-hooks": "^2.14.0",
     "typescript": "^7.0.2",
     "undici": "^8.11.2",
-    "vitest": "^5.0.3",
-    "wrangler": "^4.149.0"
+    "vitest": "^5.0.3"
   },
   "simple-git-hooks": {
     "pre-commit": "pnpm exec lint-staged",

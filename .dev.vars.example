@@ -1,5 +1,0 @@
-# Copy to .dev.vars for `wrangler dev`. The value is the SHA-256 hex of each
-# tenant token. This one is the hash of "local-token".
-ROACH_TENANTS={"local":"c7ec7c548f5992a239dc52fea748b808b408fe083c4625e9aa6ffe717343f9c1"}
-# Optional: send the roach.recording metrics to Sentry.
-# SENTRY_DSN=https://<key>@<org>.ingest.sentry.io/<project>

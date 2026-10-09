@@ -13,24 +13,24 @@
 | Test case        | `pnpm exec vitest run tests/roach.test.ts -t "…"` |
 | Lint file        | `pnpm exec oxlint --deny-warnings src/server.ts`  |
 | Format           | `pnpm format`                                     |
-| Typecheck        | `pnpm typecheck` (proxy and Worker)               |
-| Worker tests     | `pnpm exec vitest run tests/worker.test.ts`       |
+| Typecheck        | `pnpm typecheck`                                  |
+| Deployed shape   | `pnpm exec vitest run tests/deployed.test.ts`     |
 | Unused code/deps | `pnpm knip`                                       |
 | Everything (CI)  | `pnpm check`                                      |
 
 ## External References
 
-| Need                                   | File                    |
-| -------------------------------------- | ----------------------- |
-| Usage, config, recordings, control API | `README.md`             |
-| Worker setup, routes, and limits       | "Worker" in `README.md` |
-| Public types                           | `src/types.ts`          |
-| Map of source files                    | "Files" in `README.md`  |
+| Need                                   | File                                  |
+| -------------------------------------- | ------------------------------------- |
+| Usage, config, recordings, control API | `README.md`                           |
+| Service access, limits, and deploy     | "Service" and "Deploy" in `README.md` |
+| Public types                           | `src/types.ts`                        |
+| Map of source files                    | "Files" in `README.md`                |
 
 ## Key Conventions
 
-- The proxy (`src/`) has no runtime dependencies. Use Node built-ins and the `openssl` command only. The only runtime dependency is `@sentry/cloudflare`, for `worker/`.
-- `worker/` runs on Cloudflare Workers, with `worker/tsconfig.json`. The `src/` files that it imports (`store.ts`) must not use Node built-ins.
+- Use Node built-ins and the `openssl` command. The only runtime dependency is `@sentry/node`, and only `src/service.ts` imports it. The local proxy and the client must not load it.
+- `deploy/gcp/` is the production setup (Terraform). Change it in the same change when the service config (`RoachServiceConfig`) changes. CI runs `terraform validate` on it.
 - Node runs `src/` as TypeScript with type stripping. Use only erasable syntax, and import local files with the `.ts` extension.
 - Use functions and plain objects, not classes.
 - Start each source file with a comment that says what the file owns. Give each export a short JSDoc.
