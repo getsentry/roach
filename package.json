@@ -1,0 +1,32 @@
+{
+  "name": "@sentry/roach",
+  "version": "0.0.0",
+  "private": true,
+  "description": "A recording HTTPS proxy for tests.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "packageManager": "pnpm@11.8.0",
+  "bin": {
+    "roach": "./src/cli.ts"
+  },
+  "exports": {
+    "./client": "./src/client.ts",
+    "./report": "./src/report.ts",
+    "./server": "./src/server.ts",
+    "./types": "./src/types.ts",
+    "./values": "./src/values.ts"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "typescript": "^6.0.3",
+    "undici": "7.29.0",
+    "vitest": "^4.1.7"
+  }
+}
