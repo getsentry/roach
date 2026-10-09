@@ -75,8 +75,8 @@ export interface RoachConfig {
   /**
    * When the proxy stops, it lists here the recordings that sessions used.
    * A failed session uses all recordings that it recorded before. Give these
-   * files to the `prune` command. Only for `directory`: the Worker deletes
-   * recordings that nobody used for some time.
+   * files to the `prune` command. Only for `directory`: R2 deletes the recordings
+   * of the Worker 30 days after they were written.
    */
   usedFile?: string;
   /**

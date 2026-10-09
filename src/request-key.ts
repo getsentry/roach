@@ -1,18 +1,23 @@
 /**
- * The key of a recorded request, and the hashes of its parts.
+ * The key of a recorded request, and the parts that miss diagnosis
+ * compares.
  *
  * The key is the hash of the rule, the method, the URL, the key headers,
  * and the body. A JSON body has sorted object keys, so key order does not
  * matter. Each changing value of the rule is `<<name>>` in the key
  * (`values.ts`).
  *
- * A recording also keeps a short hash of each part of its request
- * (`parts.ts`).
+ * A recording also keeps a short hash of each part of its request: the
+ * method, the URL, each key header, each top-level field of a JSON body,
+ * and each item of a top-level array, such as `messages[3]`. When a request
+ * has no recording, the file store finds the recording with the most equal
+ * parts and reports the parts that differ. This only helps a person debug a
+ * miss. It never makes a replay.
  */
 import { createHash } from "node:crypto";
 import type { IncomingHttpHeaders } from "node:http";
-import type { RequestParts } from "./parts.ts";
 import { THINKING_BLOCK_TYPES } from "./streams.ts";
+import type { RequestParts } from "./store.ts";
 import type { RecordingRule } from "./types.ts";
 import {
   extractValues,
@@ -193,4 +198,40 @@ export function keyRequest(
       body: parseJson(text) ?? text,
     },
   };
+}
+
+const partOrder = new Intl.Collator("en", { numeric: true }).compare;
+
+/**
+ * The candidate with the most equal parts, and the parts that differ from
+ * it, in a readable order. Returns `undefined` when there is no candidate.
+ */
+export function closestRequest<T extends { parts: RequestParts }>(
+  parts: RequestParts,
+  candidates: Iterable<T>,
+): { candidate: T; differs: string[] } | undefined {
+  let best: T | undefined;
+  let bestEqual = -1;
+  for (const candidate of candidates) {
+    const equal = Object.keys(parts).filter(
+      (name) => candidate.parts[name] === parts[name],
+    ).length;
+    if (equal > bestEqual) {
+      bestEqual = equal;
+      best = candidate;
+    }
+  }
+  if (!best) return undefined;
+  const names = new Set([...Object.keys(parts), ...Object.keys(best.parts)]);
+  const differs = [...names]
+    .filter((name) => parts[name] !== best.parts[name])
+    .toSorted(partOrder);
+  return { candidate: best, differs };
+}
+
+/** Name some parts, such as `messages[3], tools`. */
+export function describeParts(parts: string[]): string {
+  if (parts.length === 0) return "no part";
+  const shown = parts.slice(0, 6).join(", ");
+  return parts.length > 6 ? `${shown} and ${parts.length - 6} more` : shown;
 }

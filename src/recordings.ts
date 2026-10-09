@@ -2,26 +2,16 @@
  * The file store, and prune.
  *
  * The file store keeps each recording (`store.ts`) in `<directory>/<key>`,
- * so recordings can be committed. For miss diagnosis, it reads all
- * recordings of a rule on the first miss of that rule in a run. That is
- * one read of the local disk per rule. The remote store does the same
- * search in a database query.
+ * so recordings can be committed.
  */
-import { randomBytes } from "node:crypto";
-import {
-  mkdir,
-  readdir,
-  readFile,
-  rename,
-  rm,
-  writeFile,
-} from "node:fs/promises";
+import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { closestRequest, type RequestParts } from "./parts.ts";
+import { closestRequest } from "./request-key.ts";
 import {
   formatRecording,
   type Recording,
   type RecordingStore,
+  type RequestParts,
 } from "./store.ts";
 
 const isMissing = (error: unknown) =>
@@ -43,8 +33,9 @@ interface IndexEntry {
 }
 
 /**
- * The store of the recordings in `directory`. For miss diagnosis, it reads
- * all recordings of a rule on its first miss of that rule.
+ * The store of the recordings in `directory`. To find the closest
+ * recording of a miss, it reads all recordings of the rule on the first
+ * miss of that rule, and then keeps them in memory.
  */
 export function createFileStore(directory: string): RecordingStore {
   const indexes = new Map<string, Promise<Map<string, IndexEntry>>>();
@@ -74,11 +65,7 @@ export function createFileStore(directory: string): RecordingStore {
           }
           if ((await readText(file)) === content) return false;
           await mkdir(path.dirname(file), { recursive: true });
-          // Write a new file and rename it, so a reader in another run
-          // never sees half of a recording.
-          const partial = `${file}.${randomBytes(6).toString("hex")}.tmp`;
-          await writeFile(partial, content);
-          await rename(partial, file);
+          await writeFile(file, content);
           return true;
         }),
       );

@@ -6,4 +6,3 @@ agents.lock
 .agents/.gitignore
 .wrangler
 .dev.vars
-dist

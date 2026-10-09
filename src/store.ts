@@ -2,7 +2,7 @@
  * Recordings, and the contract of a store that keeps them.
  *
  * A recording keeps the response of one request, the session (test) that
- * recorded it, and the parts of the request (`parts.ts`). It does not keep
+ * recorded it, and the parts of the request (`request-key.ts`). It does not keep
  * the request body, so prompts and other inputs are not stored.
  *
  * A store keeps recordings by key, `<rule>/<hash>.json`. The file store
@@ -11,7 +11,8 @@
  *
  * This file uses no Node built-ins, because the Worker uses it too.
  */
-import type { RequestParts } from "./parts.ts";
+/** A short hash of each part of a request, by part name. */
+export type RequestParts = Record<string, string>;
 
 /** One recorded response. */
 export interface Recording {

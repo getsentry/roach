@@ -286,7 +286,6 @@ The proxy is in `src/`. The Worker is in `worker/`. Tests are in `tests/`.
 - `store.ts`: the recording format and the store contract.
 - `recordings.ts`: the file store and prune.
 - `remote-store.ts`: the store that calls the Worker.
-- `parts.ts`: compares the parts of requests to debug a miss.
 - `values.ts`: changing values and their placeholders.
 - `streams.ts`: merges the deltas of a recorded model stream.
 - `certificates.ts`: the certificate authority for HTTPS.
