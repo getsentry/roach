@@ -82,16 +82,24 @@ function authorityOf(origin: URL): string {
   return `${origin.hostname}:${port}`;
 }
 
-function readBody(stream: http.IncomingMessage): Promise<Buffer> {
+/**
+ * Read a whole body. A body over `maxBytes` fails with HTTP 413. Only
+ * request bodies have a limit: the client sends them, and a large upstream
+ * response is not the fault of the client.
+ */
+function readBody(
+  stream: http.IncomingMessage,
+  maxBytes = Infinity,
+): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
     stream.on("data", (chunk: Buffer) => {
       size += chunk.length;
-      if (size > MAX_BODY_BYTES) {
+      if (size > maxBytes) {
         // Read the rest without keeping it, so the client gets the 413.
         chunks.length = 0;
-        reject(httpError(413, `body is over ${MAX_BODY_BYTES} bytes`));
+        reject(httpError(413, `body is over ${maxBytes} bytes`));
         return;
       }
       chunks.push(chunk);
@@ -102,7 +110,9 @@ function readBody(stream: http.IncomingMessage): Promise<Buffer> {
 }
 
 export async function readJson<T>(incoming: http.IncomingMessage): Promise<T> {
-  return JSON.parse((await readBody(incoming)).toString("utf8") || "{}") as T;
+  return JSON.parse(
+    (await readBody(incoming, MAX_BODY_BYTES)).toString("utf8") || "{}",
+  ) as T;
 }
 
 /** Compare tokens in constant time. */
@@ -179,7 +189,7 @@ async function proxyRequest(
     method: incoming.method ?? "GET",
     url,
     headers: incoming.headers,
-    body: await readBody(incoming),
+    body: await readBody(incoming, MAX_BODY_BYTES),
   };
   const rule = recorder.ruleFor(request);
 

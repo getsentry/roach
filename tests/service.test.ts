@@ -75,6 +75,10 @@ beforeEach(async () => {
   liveRequests = 0;
   upstream = createServer((incoming, outgoing) => {
     liveRequests += 1;
+    if (incoming.headers["x-large"]) {
+      outgoing.end("x".repeat(65 * 1024 * 1024));
+      return;
+    }
     // Echo a credential, as an API that shows the key of the caller does.
     outgoing.writeHead(200, { "content-type": "application/json" });
     outgoing.end(
@@ -208,11 +212,16 @@ describe("roach service", () => {
     // A body over the limit gets HTTP 413 and never goes live.
     const large = await send(run.url, { prompt: "x".repeat(65 * 1024 * 1024) });
     expect(large.status).toBe(413);
+    // The limit is only for requests. A large response is recorded.
+    const response = await send(run.url, { prompt: "hi" }, { "x-large": "1" });
+    expect(response).toMatchObject({ status: 200, source: "live" });
+    expect(response.body).toHaveLength(65 * 1024 * 1024);
 
     // An ended run refuses its proxy URL.
     await run.close();
     await expect(send(run.url, { prompt: "hi" })).rejects.toThrow(/407/);
-    expect(liveRequests).toBe(0);
+    // Only the large response went live.
+    expect(liveRequests).toBe(1);
   });
 
   it("redacts request credentials and the secrets of the service", async () => {
