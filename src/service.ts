@@ -124,6 +124,7 @@ export interface RoachService {
 
 interface Run extends ProxyTarget {
   id: string;
+  tenant: string;
   token: string;
   started: number;
 }
@@ -131,6 +132,11 @@ interface Run extends ProxyTarget {
 const MODES = new Set<RecordingMode>(["auto", "off", "record", "replay"]);
 /** A run that is open longer than this ends as failed, such as a dead job. */
 const RUN_TIMEOUT_MS = 6 * 60 * 60 * 1000;
+/**
+ * The open runs without a token that one tenant can have. Anyone can start
+ * them, so the cap keeps memory bounded. Runs with the token have no cap.
+ */
+const MAX_PUBLIC_RUNS = 50;
 const MAX_RUN_NAME = 128;
 
 const sha256 = (value: string) => createHash("sha256").update(value).digest();
@@ -299,6 +305,7 @@ export async function startRoachService(
     );
     const run: Run = {
       id,
+      tenant: runConfig.tenant,
       token,
       started: Date.now(),
       origins: parseOrigins(allow.map((origin) => origin.replace(/\/$/, ""))),
@@ -377,6 +384,18 @@ export async function startRoachService(
           error: `${runConfig.mode} mode needs the token of ${tenant}`,
         });
         return;
+      }
+      if (!canWrite) {
+        let open = 0;
+        for (const other of runs.values()) {
+          if (other.replayOnly && other.tenant === tenant) open += 1;
+        }
+        if (open >= MAX_PUBLIC_RUNS) {
+          sendJson(outgoing, 429, {
+            error: `${tenant} has ${MAX_PUBLIC_RUNS} open runs without a token`,
+          });
+          return;
+        }
       }
       sendJson(outgoing, 201, createRun(runConfig as RunConfig, canWrite));
       return;

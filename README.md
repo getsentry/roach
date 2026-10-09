@@ -229,6 +229,8 @@ give this hint, because it would have to read every recording.
 
 - Runs live in memory in one process. A restart ends the open runs, and
   their CI jobs fail. A run that is open for 6 hours ends as failed.
+- A tenant can have 50 open runs without a token. Another one gets HTTP
+  429 until one ends. Runs with the token have no cap.
 - A request body over 64 MiB gets HTTP 413.
 - GCS deletes each recording 30 days after it was written, also when runs
   still replay it. Then `auto` mode records it again, and `replay` mode

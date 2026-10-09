@@ -225,6 +225,18 @@ describe("roach service", () => {
     });
     expect(tooLarge.status).toBe(413);
 
+    // Anyone can start a run without a token, so a tenant has a cap on them.
+    const open = await Promise.all(
+      Array.from({ length: 50 }, () => startRun(undefined, "replay")),
+    );
+    await expect(startRun(undefined, "replay")).rejects.toThrow(/429/);
+    // The cap is per tenant, and runs with the token have none.
+    await startRun(undefined, "replay", { tenant: "beta" });
+    await startRun("alpha-token", "auto");
+    // An ended run frees its place.
+    await open[0]!.close();
+    await startRun(undefined, "replay");
+
     // A body over the limit gets HTTP 413 and never goes live.
     const large = await send(run.url, { prompt: "x".repeat(65 * 1024 * 1024) });
     expect(large.status).toBe(413);
