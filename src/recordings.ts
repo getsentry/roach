@@ -13,7 +13,7 @@ import { closestRequest, type RequestParts } from "./request-key.ts";
 /** One recorded response. */
 export interface Recording {
   /** The session (test) that recorded the response. */
-  session?: string;
+  session?: string | undefined;
   request: { method: string; url: string; parts: RequestParts };
   response: {
     status: number;
@@ -65,7 +65,7 @@ export async function writeRecordings(
 
 interface IndexEntry {
   file: string;
-  session?: string;
+  session?: string | undefined;
   parts: RequestParts;
 }
 
@@ -86,15 +86,16 @@ export interface RecordingIndex {
   filesOf(session: string): Promise<string[]>;
 }
 
+const entryOf = (file: string, recording: Recording): IndexEntry => ({
+  file,
+  session: recording.session,
+  parts: recording.request.parts,
+});
+
 /** Index the recordings of one rule directory. It reads them on first use. */
 export function createRecordingIndex(directory: string): RecordingIndex {
   const entries = new Map<string, IndexEntry>();
   let loaded: Promise<void> | undefined;
-  const entryOf = (file: string, recording: Recording): IndexEntry => ({
-    file,
-    session: recording.session,
-    parts: recording.request.parts,
-  });
   const load = async () => {
     const names = await readdir(directory).catch((error: unknown) => {
       if (isMissing(error)) return [];

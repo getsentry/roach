@@ -11,11 +11,11 @@ import {
   it,
   onTestFinished,
 } from "vitest";
-import { connectRoach } from "../src/client";
-import { pruneRecordings } from "../src/recordings";
-import { startRoach, type RoachServer } from "../src/server";
-import type { RecordingMode, RoachConfig } from "../src/types";
-import { VALUE_PATTERNS } from "../src/values";
+import { connectRoach } from "../src/client.ts";
+import { pruneRecordings } from "../src/recordings.ts";
+import { startRoach, type RoachServer } from "../src/server.ts";
+import type { RecordingMode, RoachConfig } from "../src/types.ts";
+import { VALUE_PATTERNS } from "../src/values.ts";
 
 let upstream: Server;
 let origin: string;
@@ -49,9 +49,14 @@ async function start(
     ],
     ...options,
   });
-  agent = new ProxyAgent({ uri: proxy.url });
+  // Tunnel plain HTTP too, so the tests use `CONNECT` as HTTPS clients do.
+  agent = new ProxyAgent({ uri: proxy.url, proxyTunnel: true });
   return proxy;
 }
+
+/** One delta event of an Anthropic Messages stream. */
+const delta = (type: string, field: string, text: string) =>
+  `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type, [field]: text } })}\n\n`;
 
 /** Send requests through the proxy. */
 async function send(bodies: unknown[], target = `${origin}/v1/messages`) {
@@ -59,7 +64,7 @@ async function send(bodies: unknown[], target = `${origin}/v1/messages`) {
   for (const body of bodies) {
     const response = await request(target, {
       body: JSON.stringify(body),
-      dispatcher: agent,
+      dispatcher: agent!,
       method: "POST",
     });
     responses.push({
@@ -163,8 +168,6 @@ describe("roach", () => {
     // The prompt shows the id again after a newline, which is `\n` in JSON.
     respond = (body) => {
       const id = /"id":"([^"]+)"/.exec(body)![1]!;
-      const delta = (type: string, field: string, text: string) =>
-        `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type, [field]: text } })}\n\n`;
       return [
         delta("thinking_delta", "thinking", `Archive ${id}.`),
         delta("input_json_delta", "partial_json", `{"id":"${id.slice(0, 10)}`),
@@ -172,7 +175,7 @@ describe("roach", () => {
       ].join("");
     };
     const first = "0b7c6a2e-1f4d-4c1a-9b8e-2d3f4a5b6c7d";
-    const request = (id: string, at: string) => ({
+    const requestBody = (id: string, at: string) => ({
       messages: [
         {
           role: "assistant",
@@ -185,10 +188,10 @@ describe("roach", () => {
     });
     const second = "9f8e7d6c-5b4a-4321-8fed-cba987654321";
     const running = await start("auto");
-    await session(running, [request(first, "2026-10-07T03:18:03.123Z")]);
+    await session(running, [requestBody(first, "2026-10-07T03:18:03.123Z")]);
 
     const [replayed] = await session(running, [
-      request(second, "2026-10-09T11:00:00.456Z"),
+      requestBody(second, "2026-10-09T11:00:00.456Z"),
     ]);
 
     expect(replayed!.source).toBe("replayed");
@@ -278,7 +281,7 @@ describe("roach", () => {
     const opened = await connectRoach(running).startSession("test");
     const response = await request(`${origin}/v1/messages`, {
       body: JSON.stringify({ model: "m", note: "cfg-secret=012345" }),
-      dispatcher: agent,
+      dispatcher: agent!,
       // Any header whose name can mean a credential is learned.
       headers: { "x-custom-auth": "Bearer key-from-header-0123456789" },
       method: "POST",
@@ -305,10 +308,15 @@ describe("roach", () => {
   it("sends no request to another origin", async () => {
     await start("auto");
 
-    // The same server under another name is another origin.
-    await expect(
-      send([{}], `${origin.replace("127.0.0.1", "localhost")}/v1/messages`),
-    ).rejects.toThrow("403");
+    // The same server under another name is another origin. The proxy
+    // refuses it in a tunnel and as an absolute-form request.
+    const other = `${origin.replace("127.0.0.1", "localhost")}/v1/messages`;
+    await expect(send([{}], other)).rejects.toThrow("403");
+    const absolute = new ProxyAgent({ uri: proxy!.url, proxyTunnel: false });
+    onTestFinished(() => absolute.close());
+    const response = await request(other, { dispatcher: absolute });
+    await response.body.dump();
+    expect(response.statusCode).toBe(403);
     expect(liveRequests).toBe(0);
   });
 
@@ -336,6 +344,8 @@ describe("roach", () => {
     const opened = await connectRoach(running).startSession("test");
     const pending = send([{ model: "m" }]);
     // Wait until the request reaches the upstream, then end the test.
+    // The upstream server changes `liveRequests`, not this loop.
+    // oxlint-disable-next-line no-unmodified-loop-condition
     while (liveRequests === 0) await new Promise((r) => setTimeout(r, 5));
     await opened.end(true);
     open();
@@ -354,7 +364,7 @@ describe("roach", () => {
     );
     const running = await start("auto", { usedFile });
     await session(running, [{ model: "m" }, { model: "n" }]);
-    const recorded = (await files()).sort();
+    const recorded = (await files()).toSorted();
     const contents = await Promise.all(
       recorded.map((file) => readFile(path.join(directory, "model", file))),
     );
@@ -374,7 +384,7 @@ describe("roach", () => {
       recorded.map((file) => `model/${file}\n`).join(""),
     );
     await expect(pruneRecordings(directory, [usedFile])).resolves.toBe(1);
-    await expect(files().then((names) => names.sort())).resolves.toEqual(
+    await expect(files().then((names) => names.toSorted())).resolves.toEqual(
       recorded,
     );
     await expect(

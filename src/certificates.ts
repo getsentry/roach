@@ -16,7 +16,8 @@ import tls from "node:tls";
 function openssl(args: string[]): Promise<void> {
   return new Promise((resolve, reject) => {
     execFile("openssl", args, (error, _stdout, stderr) => {
-      if (error) reject(new Error(`openssl failed: ${stderr || error}`));
+      if (error)
+        reject(new Error(`openssl failed: ${stderr || error.message}`));
       else resolve();
     });
   });

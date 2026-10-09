@@ -29,7 +29,8 @@ export function createSecrets(initial: string[] = []) {
   };
   initial.forEach(add);
   // Redact longer values first, so no part of one stays visible.
-  const longestFirst = () => [...values].sort((a, b) => b.length - a.length);
+  const longestFirst = () =>
+    [...values].toSorted((a, b) => b.length - a.length);
 
   return {
     /** Learn the credentials in the headers of a request. */
@@ -50,6 +51,3 @@ export function createSecrets(initial: string[] = []) {
     },
   };
 }
-
-/** The secret list of one proxy run. */
-export type Secrets = ReturnType<typeof createSecrets>;

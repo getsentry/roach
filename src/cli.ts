@@ -28,7 +28,7 @@ if (command === "serve") {
   };
   process.stdout.write(`${JSON.stringify(address)}\n`);
   const stop = () => {
-    proxy.close().finally(() => process.exit(0));
+    void proxy.close().finally(() => process.exit(0));
   };
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);

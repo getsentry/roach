@@ -154,7 +154,7 @@ const escape = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
  */
 const literals = (values: string[]) =>
   `${NOT_AFTER_WORD}(?:${values
-    .sort((a, b) => b.length - a.length)
+    .toSorted((a, b) => b.length - a.length)
     .map(escape)
     .join("|")})(?![0-9A-Za-z])`;
 

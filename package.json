@@ -4,14 +4,14 @@
   "private": true,
   "description": "A recording HTTPS proxy for tests.",
   "license": "Apache-2.0",
-  "type": "module",
-  "engines": {
-    "node": ">=22.18"
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/getsentry/roach.git"
   },
-  "packageManager": "pnpm@11.8.0",
   "bin": {
     "roach": "./src/cli.ts"
   },
+  "type": "module",
   "exports": {
     "./client": "./src/client.ts",
     "./report": "./src/report.ts",
@@ -20,13 +20,45 @@
     "./values": "./src/values.ts"
   },
   "scripts": {
+    "check": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm knip && pnpm test",
+    "format": "oxfmt",
+    "format:check": "oxfmt --check",
+    "knip": "knip",
+    "lint": "oxlint --deny-warnings",
+    "lint:fix": "oxlint --fix",
+    "prepare": "simple-git-hooks",
+    "skills:install": "dotagents --project install",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "test:coverage": "vitest run --coverage",
+    "typecheck": "tsc -p ."
   },
   "devDependencies": {
-    "@types/node": "^25.9.1",
-    "typescript": "^6.0.3",
-    "undici": "7.29.0",
-    "vitest": "^4.1.7"
-  }
+    "@sentry/dotagents": "^3.3.0",
+    "@types/node": "^24.19.1",
+    "@vitest/coverage-v8": "^5.0.3",
+    "knip": "^6.40.0",
+    "lint-staged": "^17.6.0",
+    "oxfmt": "^0.72.0",
+    "oxlint": "^1.87.0",
+    "oxlint-tsgolint": "^7.0.2003",
+    "simple-git-hooks": "^2.14.0",
+    "typescript": "^7.0.2",
+    "undici": "^8.11.2",
+    "vitest": "^5.0.3"
+  },
+  "simple-git-hooks": {
+    "pre-commit": "pnpm exec lint-staged",
+    "pre-push": "pnpm typecheck"
+  },
+  "lint-staged": {
+    "*.{ts,mts,js,mjs}": [
+      "oxlint --fix --deny-warnings",
+      "oxfmt --no-error-on-unmatched-pattern"
+    ],
+    "*.{json,jsonc,md,yml,yaml}": "oxfmt --no-error-on-unmatched-pattern"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "packageManager": "pnpm@11.8.0"
 }

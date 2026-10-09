@@ -59,7 +59,7 @@ function stableStringify(value: unknown): string {
   }
   const entries = Object.entries(value as Record<string, unknown>)
     .filter(([, item]) => item !== undefined)
-    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    .toSorted(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
   return `{${entries
     .map(([key, item]) => `${JSON.stringify(key)}:${stableStringify(item)}`)
     .join(",")}}`;
@@ -226,7 +226,7 @@ export function closestRequest<T extends { parts: RequestParts }>(
   const names = new Set([...Object.keys(parts), ...Object.keys(best.parts)]);
   const differs = [...names]
     .filter((name) => parts[name] !== best.parts[name])
-    .sort(partOrder);
+    .toSorted(partOrder);
   return { candidate: best, differs };
 }
 

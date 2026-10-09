@@ -76,11 +76,11 @@ export interface RoachConfig {
 export interface RecordingMiss {
   rule: string;
   /** The session of the request. */
-  session?: string;
+  session?: string | undefined;
   /** The recording file that the request needed, relative to `directory`. */
   file: string;
   /** The recording with the most equal parts, relative to `directory`. */
-  closest?: string;
+  closest?: string | undefined;
   /** The parts that differ from `closest`, such as `messages[3]`. */
   differs: string[];
 }
