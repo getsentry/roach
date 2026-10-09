@@ -10,30 +10,35 @@ import {
   describe,
   expect,
   it,
-  vi,
 } from "vitest";
 import { connectRoach } from "../src/client.ts";
 import { startRoach, type RoachServer } from "../src/server.ts";
 import type { RecordingMode } from "../src/types.ts";
 
-/** The parts of the Worker env that the tests read. */
+/** The part of the Worker env that the tests read. */
 interface TestEnv {
-  DB: {
-    prepare(sql: string): {
-      bind(...values: unknown[]): {
-        all(): Promise<{ results: unknown[] }>;
-      };
-    };
+  RECORDINGS: {
+    list(options: { prefix: string }): Promise<{
+      objects: Array<{ key: string }>;
+    }>;
   };
-  RECORDINGS: { head(key: string): Promise<unknown> };
 }
 
 const sha256 = (text: string) =>
   createHash("sha256").update(text).digest("hex");
-const TOKENS = { alpha: "alpha-token", beta: "beta-token", gamma: "gamma" };
-const DAY_MS = 24 * 60 * 60 * 1000;
+const TOKENS = { alpha: "alpha-token", beta: "beta-token" };
+
+/** One `roach.recording` metric that the Worker sent to Sentry. */
+interface RecordingMetric {
+  key: string;
+  result: string;
+  run: string;
+  tenant: string;
+}
 
 let harness: TestHarness;
+let sentry: Server;
+const metrics: RecordingMetric[] = [];
 let workerUrl: string;
 let env: TestEnv;
 let upstream: Server;
@@ -41,7 +46,40 @@ let origin: string;
 let liveRequests: number;
 const proxies: Array<{ proxy: RoachServer; agent: ProxyAgent }> = [];
 
+/** Keep the `roach.recording` metrics of a Sentry envelope. */
+function readEnvelope(envelope: string) {
+  for (const line of envelope.split("\n")) {
+    if (!line.includes('"roach.recording"')) continue;
+    const { items } = JSON.parse(line) as {
+      items: Array<{ attributes: Record<string, { value: string }> }>;
+    };
+    for (const { attributes } of items) {
+      metrics.push({
+        key: attributes.key?.value ?? "",
+        result: attributes.result?.value ?? "",
+        run: attributes.run?.value ?? "",
+        tenant: attributes.tenant?.value ?? "",
+      });
+    }
+  }
+}
+
 beforeAll(async () => {
+  // A local Sentry that keeps the metrics of the Worker.
+  sentry = createServer((incoming, outgoing) => {
+    let envelope = "";
+    incoming.setEncoding("utf8");
+    incoming.on("data", (chunk: string) => (envelope += chunk));
+    incoming.on("end", () => {
+      readEnvelope(envelope);
+      outgoing.end("{}");
+    });
+  });
+  await new Promise<void>((resolve) => sentry.listen(0, "127.0.0.1", resolve));
+  const sentryAddress = sentry.address();
+  if (!sentryAddress || typeof sentryAddress === "string") {
+    throw new Error("No port");
+  }
   harness = createTestHarness({
     workers: [
       {
@@ -55,17 +93,19 @@ beforeAll(async () => {
               ]),
             ),
           ),
+          SENTRY_DSN: `http://public@127.0.0.1:${sentryAddress.port}/1`,
         },
       },
     ],
   });
   workerUrl = (await harness.listen()).url.href;
-  const worker = harness.getWorker();
-  await worker.applyD1Migrations("DB");
-  env = (await worker.getEnv()) as TestEnv;
+  env = (await harness.getWorker().getEnv()) as TestEnv;
 }, 60_000);
 
-afterAll(() => harness.close());
+afterAll(async () => {
+  await harness.close();
+  await new Promise<void>((resolve) => sentry.close(() => resolve()));
+});
 
 beforeEach(async () => {
   liveRequests = 0;
@@ -96,7 +136,7 @@ afterEach(async () => {
 /** Start a proxy that keeps its recordings in the Worker. */
 async function start(mode: RecordingMode, token: string) {
   const proxy = await startRoach({
-    store: { url: workerUrl, token },
+    store: { url: workerUrl, token, run: "run-1" },
     mode,
     allow: [origin],
     rules: [{ name: "model", match: { method: "POST", url: `${origin}/v1/` } }],
@@ -126,18 +166,10 @@ async function session(
   return sources;
 }
 
-/** Run a query on the D1 database of the Worker. */
-async function query<Row>(sql: string, ...values: unknown[]): Promise<Row[]> {
-  const { results } = await env.DB.prepare(sql)
-    .bind(...values)
-    .all();
-  return results as Row[];
-}
-
-const keysOf = (tenant: string) =>
-  query<{ key: string; last_used: number }>(
-    "SELECT key, last_used FROM recordings WHERE tenant = ? ORDER BY key",
-    tenant,
+/** The keys that `tenant` has in R2. */
+const keysOf = async (tenant: string) =>
+  (await env.RECORDINGS.list({ prefix: `${tenant}/` })).objects.map((object) =>
+    object.key.slice(tenant.length + 1),
   );
 
 const callWorker = (
@@ -157,10 +189,10 @@ const RECORDING = {
 };
 
 describe("worker", () => {
-  it("records, replays, and finds the closest recording of a miss", async () => {
+  it("records, replays, and fails a miss in replay mode", async () => {
     const recording = await start("auto", TOKENS.alpha);
     await session(recording, [{ model: "m", messages: ["a", "b"] }]);
-    const [stored] = await keysOf("alpha");
+    const stored = await keysOf("alpha");
 
     const running = await start("replay", TOKENS.alpha);
     const sources = await session(running, [
@@ -170,9 +202,24 @@ describe("worker", () => {
 
     expect(sources).toEqual(["replayed", "missed"]);
     expect(liveRequests).toBe(1);
+    expect(stored).toHaveLength(1);
+    // Each read and write of the recording is one metric in Sentry.
+    await expect
+      .poll(() => metrics.filter((metric) => metric.key === stored[0]))
+      .toEqual(
+        expect.arrayContaining(
+          ["missed", "written", "replayed"].map((result) => ({
+            key: stored[0],
+            result,
+            run: "run-1",
+            tenant: "alpha",
+          })),
+        ),
+      );
+    // The Worker keeps no index, so a miss has no closest recording.
     await expect(connectRoach(running.proxy).stats()).resolves.toMatchObject({
       counts: { model: { live: 0, missed: 1, replayed: 1 } },
-      misses: [{ closest: stored!.key, differs: ["messages[1]"] }],
+      misses: [{ file: expect.stringMatching(/^model\//), differs: [] }],
     });
   });
 
@@ -199,39 +246,5 @@ describe("worker", () => {
       status(`/v1/recordings/${key}`, TOKENS.beta, { method: "PUT", body });
     expect(await putBody("{}")).toBe(400);
     expect(await putBody("x".repeat(10 * 1024 * 1024 + 1))).toBe(413);
-  });
-
-  it("deletes recordings that nobody used within the TTL", async () => {
-    const keys = ["c", "d"].map((c) => `model/${c.repeat(64)}.json`);
-    for (const key of keys) {
-      await callWorker(`/v1/recordings/${key}`, TOKENS.gamma, {
-        method: "PUT",
-        body: JSON.stringify(RECORDING),
-      });
-    }
-    const old = Date.now() - 40 * DAY_MS;
-    await query(
-      "UPDATE recordings SET last_used = ? WHERE tenant = ?",
-      old,
-      "gamma",
-    );
-
-    // A replay is a use.
-    await (await callWorker(`/v1/recordings/${keys[0]}`, TOKENS.gamma)).text();
-    await vi.waitFor(async () => {
-      const rows = await keysOf("gamma");
-      expect(rows[0]!.last_used).toBeGreaterThan(old);
-    });
-    await harness
-      .getWorker()
-      .scheduled({ cron: "17 4 * * *", scheduledTime: new Date() });
-
-    expect((await keysOf("gamma")).map((row) => row.key)).toEqual([keys[0]]);
-    await expect(env.RECORDINGS.head(`gamma/${keys[1]}`)).resolves.toBeNull();
-    const parts = await query<{ key: string }>(
-      "SELECT DISTINCT key FROM parts WHERE tenant = ?",
-      "gamma",
-    );
-    expect(parts.map((row) => row.key)).toEqual([keys[0]]);
   });
 });

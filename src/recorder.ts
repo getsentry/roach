@@ -228,7 +228,7 @@ export function createRecorder(config: RoachConfig) {
     keyed: KeyedRequest,
     owner: Session | undefined,
   ) => {
-    const closest = await store.closest(rule.name, keyed.parts, owner?.name);
+    const closest = await store.closest?.(rule.name, keyed.parts, owner?.name);
     const miss: RecordingMiss = {
       rule: rule.name,
       session: owner?.name,

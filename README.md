@@ -8,16 +8,17 @@ it rules and tells it when each test starts and ends.
 The recordings are in one of two stores:
 
 - **Files** (`directory`): JSON files that you commit to git.
-- **A Roach Worker** (`store`): a Cloudflare Worker with R2 and D1. Many
-  repositories and CI runs can use it. It deletes recordings that nobody
-  used for 30 days. See [Worker](#worker).
+- **A Roach Worker** (`store`): a Cloudflare Worker with R2. Many
+  repositories and CI runs can use it. R2 deletes each recording 30 days
+  after it was written. See [Worker](#worker).
 
 The proxy always runs in the process tree of the test run. Only the
 recordings move to the Worker.
 
 Roach started in
 [`getsentry/junior`](https://github.com/getsentry/junior/tree/main/packages/junior-evals/src/roach).
-The proxy uses only Node built-ins and the `openssl` command.
+The proxy uses only Node built-ins and the `openssl` command. The Worker
+uses the Sentry SDK (`@sentry/cloudflare`).
 
 ## Use
 
@@ -65,9 +66,11 @@ await proxy.close();
 `src/types.ts` has the full types.
 
 - `directory`: where the recordings are. Each rule has a subdirectory.
-- `store`: `{ url, token }` of a Roach Worker, in place of `directory`.
-  Set one of the two. The proxy calls the Worker directly, and never writes
-  the token to a recording.
+- `store`: `{ url, token, run }` of a Roach Worker, in place of
+  `directory`. Set one of the two. The proxy calls the Worker directly, and
+  never writes the token to a recording. `run` is optional. It names the CI
+  run in the Sentry metrics of the Worker, such as
+  `${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}`.
 - `mode`: `auto` replays recordings and records misses. `replay` replays
   recordings and fails a miss with HTTP 412, so nothing goes live. `record`
   sends every request live and records it again. `off` records and replays
@@ -158,17 +161,16 @@ real way use the same recording.
 
 The parts of a request are the method, the URL, each key header, each
 top-level field of a JSON body, and each item of a top-level array, such as
-`messages[3]`. For a request without a recording, the proxy finds the
-recording with the most equal parts, from the same session if it can. It
-logs the parts that differ and adds the miss to `stats().misses`.
-`describeRecordingMisses()` in `report.ts` gives the first miss of each
-test, which is the one to fix.
+`messages[3]`. The proxy adds each request without a recording to
+`stats().misses`. `describeRecordingMisses()` in `report.ts` gives the
+first miss of each test, which is the one to fix.
 
-- The file store reads all recordings of a rule on the first miss of that
-  rule in a run, and then keeps them in memory.
-- The Worker keeps the hash of each part in a D1 index. A miss is one
-  query that reads only the rows with an equal part. It does not read the
-  recordings in R2.
+With the file store, the proxy also finds the recording with the most
+equal parts, from the same session if it can, and logs the parts that
+differ. This is only a hint to debug a miss. It never makes a replay. To
+find it, the file store reads all recordings of a rule on the first miss of
+that rule in a run, and then keeps them in memory. The Worker does not give
+this hint, because it keeps no index of the parts.
 
 ## Command line
 
@@ -198,67 +200,70 @@ All calls need `Authorization: Bearer <token>`. `client.ts` calls them.
 `wrangler.jsonc` is its config.
 
 - **R2** (`RECORDINGS`) keeps each recording at `<tenant>/<key>`.
-- **D1** (`DB`) keeps one row for each recording: its rule, its session,
-  the time of its last use, and the hash of each request part.
 - **Tenants**: each tenant has a token. The secret `ROACH_TENANTS` maps
   each tenant name to the SHA-256 hex of its token. A tenant sees only its
   own recordings. Give each repository its own tenant. Tenants do not
   share recordings, because a key does not include credentials: a shared
   key would replay one tenant's private response to another.
-- **Expiry**: a replay or a write sets the time of last use. A replay
-  writes to D1 at most once a day for each recording. Once a day, the cron
-  trigger deletes recordings that nobody used for `RECORDING_TTL_DAYS`
-  (30). It deletes up to 10,000 in each run.
+- **Expiry**: an R2 lifecycle rule deletes each recording 30 days after it
+  was written. A replay does not extend this time, and a write of the same
+  recording does not either. So a recording that replays each day still
+  expires, and its next request goes live in `auto` mode. In `replay` mode,
+  that request fails with HTTP 412. R2 can take up to a day more to delete
+  an expired recording.
+- **Sentry**: with the secret `SENTRY_DSN`, each read and write sends the
+  metric `roach.recording`. Its attributes are `tenant`, `rule`, `key`,
+  `run`, and `result`: `replayed`, `missed`, `written`, or `unchanged`.
+  Group by `key` and `run` to find recordings that only one run uses. Those
+  never replay, which often means a value that changes on each run. The
+  `key` and `run` attributes have a different value for each recording and
+  run.
 
 ### Set up
 
 ```sh
 pnpm exec wrangler r2 bucket create roach-recordings
-# Add a backstop for objects that lost their D1 row (see Limits).
-pnpm exec wrangler r2 bucket lifecycle add roach-recordings backstop --expire-days 180
-pnpm exec wrangler d1 create roach    # put the database_id in wrangler.jsonc
+pnpm exec wrangler r2 bucket lifecycle add roach-recordings expire --expire-days 30
 # Each tenant token is a random secret. Keep only its hash in the Worker.
 token=$(openssl rand -hex 32); hash=$(printf %s "$token" | sha256sum | cut -d' ' -f1)
 printf '{"junior":"%s"}' "$hash" | pnpm exec wrangler secret put ROACH_TENANTS
-pnpm worker:deploy   # apply D1 migrations, then deploy
+pnpm exec wrangler secret put SENTRY_DSN   # optional
+pnpm worker:deploy
 ```
 
 Then give the proxy `store: { url: "https://roach.<account>.workers.dev",
-token }`. Keep the token in a CI secret.
+token, run }`. Keep the token in a CI secret.
 
 ### Routes
 
 All routes need `Authorization: Bearer <token>`. `src/remote-store.ts`
-calls them.
+calls them. The optional header `X-Roach-Run` names the run in the Sentry
+metrics.
 
 - `GET /v1/recordings/<key>`: the recording, or HTTP 404.
 - `PUT /v1/recordings/<key>` with the recording: write it. Returns
   `{"changed": true}` when it was new or changed. A body over 10 MiB gets
   HTTP 413.
-- `POST /v1/closest` with `{"rule", "parts", "session"}`: returns
-  `{"closest": {"key", "differs"}}`, or `{"closest": null}`.
 
 A bad token gets HTTP 401. A bad key or body gets HTTP 400.
 
 ### Limits
 
-- A write puts the R2 object first, then the D1 row. If D1 fails, the
-  object has no row, so the cron trigger cannot delete it. The R2
-  lifecycle rule above deletes it later.
 - A tenant can write as many recordings as it wants. There is no quota.
 - To add or remove a tenant, change `ROACH_TENANTS`.
+- Without `SENTRY_DSN`, the Worker sends nothing to Sentry.
 
 ### Run it locally
 
 ```sh
 cp .dev.vars.example .dev.vars   # the tenant "local" with token "local-token"
-pnpm exec wrangler d1 migrations apply DB --local
 pnpm worker:dev
 ```
 
 `tests/worker.test.ts` runs the Worker from `wrangler.jsonc` with local R2
-and D1 (`createTestHarness` of Wrangler). It tests record and replay
-through a real proxy, misses, tenants, limits, and expiry.
+(`createTestHarness` of Wrangler) and a local Sentry server. It tests
+record and replay through a real proxy, misses, tenants, limits, and the
+Sentry metrics.
 
 ## Development
 
@@ -281,7 +286,7 @@ The proxy is in `src/`. The Worker is in `worker/`. Tests are in `tests/`.
 - `store.ts`: the recording format and the store contract.
 - `recordings.ts`: the file store and prune.
 - `remote-store.ts`: the store that calls the Worker.
-- `parts.ts`: compares the parts of requests for miss diagnosis.
+- `parts.ts`: compares the parts of requests to debug a miss.
 - `values.ts`: changing values and their placeholders.
 - `streams.ts`: merges the deltas of a recorded model stream.
 - `certificates.ts`: the certificate authority for HTTPS.
@@ -289,4 +294,4 @@ The proxy is in `src/`. The Worker is in `worker/`. Tests are in `tests/`.
   API.
 - `report.ts`: text reports of a run.
 - `cli.ts`: the command line.
-- `worker/index.ts`: the Worker. `worker/migrations/` has the D1 schema.
+- `worker/index.ts`: the Worker.

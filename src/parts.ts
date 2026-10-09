@@ -4,11 +4,9 @@
  * The parts are the method, the URL, each key header, each top-level field
  * of a JSON body, and each item of a top-level array, such as
  * `messages[3]`. A recording keeps a short hash of each part
- * (`request-key.ts`). When a request has no recording, the store finds the
- * recording with the most equal parts and reports the parts that differ.
- *
- * This file uses no Node built-ins, because the Worker (`worker/`) uses it
- * too.
+ * (`request-key.ts`). When a request has no recording, the file store
+ * finds the recording with the most equal parts and reports the parts that
+ * differ. This only helps a person debug a miss. It never makes a replay.
  */
 
 /** A short hash of each part of a request, by part name. */
@@ -21,7 +19,7 @@ const countEqualParts = (parts: RequestParts, other: RequestParts) =>
   Object.keys(parts).filter((name) => other[name] === parts[name]).length;
 
 /** The parts that are in only one of `a` and `b`, or differ, in order. */
-export function differingParts(a: RequestParts, b: RequestParts): string[] {
+function differingParts(a: RequestParts, b: RequestParts): string[] {
   const names = new Set([...Object.keys(a), ...Object.keys(b)]);
   return [...names].filter((name) => a[name] !== b[name]).toSorted(partOrder);
 }

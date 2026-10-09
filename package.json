@@ -32,7 +32,10 @@
     "test:coverage": "vitest run --coverage",
     "typecheck": "tsc -p . && tsc -p worker",
     "worker:dev": "wrangler dev",
-    "worker:deploy": "wrangler d1 migrations apply DB --remote && wrangler deploy"
+    "worker:deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "@sentry/cloudflare": "11.6.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261008.1",

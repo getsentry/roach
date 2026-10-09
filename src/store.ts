@@ -32,7 +32,7 @@ export interface Recording {
 }
 
 /** The recording with the most equal parts, and the parts that differ. */
-export interface ClosestRecording {
+interface ClosestRecording {
   key: string;
   differs: string[];
 }
@@ -46,9 +46,10 @@ export interface RecordingStore {
   /**
    * The recording of `rule` with the most equal parts. Recordings of the
    * same session come first, because a test usually sends the same
-   * requests as the last time it ran.
+   * requests as the last time it ran. Only the file store has this: it is a
+   * hint for debugging a miss, and the Worker keeps no index for it.
    */
-  closest(
+  closest?(
     rule: string,
     parts: RequestParts,
     session: string | undefined,

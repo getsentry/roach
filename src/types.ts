@@ -51,6 +51,12 @@ export interface RemoteStoreConfig {
    * writes it to a recording.
    */
   token: string;
+  /**
+   * The run of this proxy, such as the GitHub Actions run id. The Worker
+   * counts the runs that use each recording, so a recording that only one
+   * run uses shows up in Sentry.
+   */
+  run?: string;
 }
 
 /** The configuration of one proxy. Set `directory` or `store`. */
