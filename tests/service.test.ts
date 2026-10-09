@@ -219,6 +219,8 @@ describe("roach service", () => {
     const runsUrl = `${service.url}/__roach/runs`;
     const notJson = await fetch(runsUrl, { method: "POST", body: "{" });
     expect(notJson.status).toBe(400);
+    const notObject = await fetch(runsUrl, { method: "POST", body: "null" });
+    expect(notObject.status).toBe(400);
     const tooLarge = await fetch(runsUrl, {
       method: "POST",
       body: "x".repeat(65 * 1024 * 1024),

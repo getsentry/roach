@@ -109,14 +109,20 @@ function readBody(
   });
 }
 
-/** Read a JSON request body. A body that is not JSON fails with HTTP 400. */
+/** Read a JSON object request body. Any other body fails with HTTP 400. */
 export async function readJson<T>(incoming: http.IncomingMessage): Promise<T> {
   const text = (await readBody(incoming, MAX_BODY_BYTES)).toString("utf8");
+  let value: unknown;
   try {
-    return JSON.parse(text || "{}") as T;
+    value = JSON.parse(text || "{}");
   } catch {
     throw httpError(400, "body is not JSON");
   }
+  // Callers read fields, so `null`, a list, or a single value is a bad body.
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw httpError(400, "body is not a JSON object");
+  }
+  return value as T;
 }
 
 /** Compare tokens in constant time. */
