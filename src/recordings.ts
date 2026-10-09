@@ -161,7 +161,10 @@ export async function pruneRecordings(
   const recordings = (await readdir(directory, { recursive: true })).filter(
     (file) => file.endsWith(".json"),
   );
-  const unused = recordings.filter((file) => !used.has(file));
+  // Used files list keys, which use `/`. On Windows, `readdir` uses `\`.
+  const unused = recordings.filter(
+    (file) => !used.has(file.split(path.sep).join("/")),
+  );
   await Promise.all(unused.map((file) => rm(path.join(directory, file))));
   return unused.length;
 }
