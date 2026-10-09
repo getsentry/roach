@@ -281,7 +281,7 @@ export async function startRoach(config: RoachConfig): Promise<RoachServer> {
       return;
     }
     control(recorder, token, incoming, outgoing).catch((error: unknown) => {
-      process.stderr.write(`[roach] Control failed: ${error}\n`);
+      process.stderr.write(`[roach] Control failed: ${String(error)}\n`);
       if (!outgoing.headersSent) outgoing.writeHead(500);
       outgoing.end();
     });

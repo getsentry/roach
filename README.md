@@ -170,10 +170,18 @@ All calls need `Authorization: Bearer <token>`. `client.ts` calls them.
   Returns HTTP 409 when the session is not open.
 - `GET /__roach/stats`: the totals of the run.
 
+## Development
+
+```sh
+pnpm install
+pnpm check   # format, lint, types, unused code, and tests, as CI runs them
+```
+
+`AGENTS.md` has the conventions and the commands for one file.
+
 ## Files
 
 All source files are in `src/`. Tests are in `tests/`.
-
 
 - `types.ts`: the configuration and the results.
 - `server.ts`: sockets, HTTPS interception, the allow list, and the control

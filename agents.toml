@@ -1,0 +1,31 @@
+version = 1
+# Skills always fetch the latest version; the lockfile tracks names only.
+agents = ["claude", "codex", "cursor"]
+
+[[skills]]
+name = "commit"
+source = "getsentry/skills"
+
+[[skills]]
+name = "pr-writer"
+source = "getsentry/skills"
+
+[[skills]]
+name = "code-review"
+source = "getsentry/skills"
+
+[[skills]]
+name = "find-bugs"
+source = "getsentry/skills"
+
+[[skills]]
+name = "security-review"
+source = "getsentry/skills"
+
+[[skills]]
+name = "gha-security-review"
+source = "getsentry/skills"
+
+[[skills]]
+name = "agents-md"
+source = "getsentry/skills"

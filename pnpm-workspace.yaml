@@ -1,0 +1,5 @@
+# Install only versions that are at least one day old, so a bad release
+# has time to be pulled before it reaches us.
+minimumReleaseAge: 1440
+allowBuilds:
+  simple-git-hooks: true

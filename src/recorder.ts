@@ -387,7 +387,7 @@ export function createRecorder(config: RoachConfig) {
     async close(): Promise<void> {
       await finish(false);
       if (config.usedFile) {
-        const files = [...used].map(relative).sort();
+        const files = [...used].map(relative).toSorted();
         await writeFile(config.usedFile, files.map((f) => `${f}\n`).join(""));
       }
     },
