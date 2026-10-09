@@ -203,7 +203,8 @@ give this hint, because it would have to read every recording.
   recordings of a tenant are under `<tenant>/` in the bucket. Tenants never
   share recordings.
 - **Reads are public.** Anyone can start a `replay` run of a tenant, so CI
-  jobs of forks replay without a secret. Such a run never writes. Every
+  jobs of forks replay without a secret. Such a run never writes, and it
+  refuses a request that no rule records, so nothing goes live. Every
   other mode needs the tenant token. So treat each recording as readable by
   anyone who can make its request. Do not record responses that must stay
   private.

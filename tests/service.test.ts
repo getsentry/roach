@@ -130,6 +130,12 @@ describe("roach service", () => {
       status: 412,
       source: "missed",
     });
+    // A request that no rule records would go live, so a public run refuses it.
+    const agent = new ProxyAgent({ uri: reader.url, proxyTunnel: true });
+    agents.push(agent);
+    const unmatched = await request(`${origin}/other`, { dispatcher: agent });
+    expect(unmatched.statusCode).toBe(403);
+    await unmatched.body.dump();
     // Without the token, no mode that can write.
     for (const mode of ["auto", "record", "off"] as const) {
       await expect(startRun(undefined, mode)).rejects.toThrow(/401/);

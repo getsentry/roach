@@ -173,8 +173,7 @@ function sendUpstream(
 
 /** Proxy one request to an allowed origin, through the recorder. */
 async function proxyRequest(
-  recorder: Recorder,
-  origins: Map<string, URL>,
+  { recorder, origins, replayOnly }: ProxyTarget,
   incoming: http.IncomingMessage,
   outgoing: http.ServerResponse,
   tunnelOrigin: string | undefined,
@@ -197,6 +196,14 @@ async function proxyRequest(
   };
   const rule = recorder.ruleFor(request);
 
+  if (!rule && replayOnly) {
+    // Without this, anyone could send live traffic through a public run.
+    outgoing.writeHead(403, { "content-type": "text/plain" });
+    outgoing.end(
+      "Roach: this run can only replay, and no rule records this request\n",
+    );
+    return;
+  }
   if (!rule) {
     recorder.countPassthrough(origin.origin, request.headers);
     const upstream = await sendUpstream(origin, request);
@@ -308,6 +315,11 @@ async function control(
 export interface ProxyTarget {
   origins: Map<string, URL>;
   recorder: Recorder;
+  /**
+   * Refuse requests that no rule matches, so nothing goes live. The
+   * service sets this for a run without the tenant token.
+   */
+  replayOnly?: boolean;
   /** Set when the target stops. Its tunnels then refuse new requests. */
   closed?: boolean;
 }
@@ -366,21 +378,17 @@ function serveProxied(
     outgoing.end("Roach: this run has ended\n");
     return;
   }
-  proxyRequest(
-    target.recorder,
-    target.origins,
-    incoming,
-    outgoing,
-    tunnelOrigin,
-  ).catch((error: unknown) => {
-    if (!outgoing.headersSent) {
-      const status = (error as { status?: number }).status ?? 502;
-      outgoing.writeHead(status, { "content-type": "text/plain" });
-    }
-    outgoing.end(
-      `Roach error: ${error instanceof Error ? error.message : String(error)}\n`,
-    );
-  });
+  proxyRequest(target, incoming, outgoing, tunnelOrigin).catch(
+    (error: unknown) => {
+      if (!outgoing.headersSent) {
+        const status = (error as { status?: number }).status ?? 502;
+        outgoing.writeHead(status, { "content-type": "text/plain" });
+      }
+      outgoing.end(
+        `Roach error: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+    },
+  );
 }
 
 /**

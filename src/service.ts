@@ -302,6 +302,8 @@ export async function startRoachService(
       token,
       started: Date.now(),
       origins: parseOrigins(allow.map((origin) => origin.replace(/\/$/, ""))),
+      // A public run must not be an open proxy to the allowed origins.
+      replayOnly: !canWrite,
       // Each run learns only the credentials of its own requests.
       recorder: createRecorder(
         {
