@@ -4,7 +4,8 @@
  * `server.ts` owns the sockets. It gives the recorder each request that a
  * rule matches, with a function that sends the request live. The recorder
  * decides whether to replay, send live, or fail the request, and it owns
- * every read and write of the recordings.
+ * every read and write of the recordings. A store keeps them: the file
+ * store (`recordings.ts`) or a Roach Worker (`remote-store.ts`).
  *
  * A session groups the requests of one test. One session is open at a
  * time. The recorder keeps the new recordings of a session in memory until
@@ -19,14 +20,17 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import type { IncomingHttpHeaders } from "node:http";
 import path from "node:path";
-import {
-  createRecordingIndex,
-  readRecording,
-  writeRecordings,
-  type Recording,
-} from "./recordings.ts";
-import { describeParts, keyRequest, type KeyedRequest } from "./request-key.ts";
+import { describeParts } from "./parts.ts";
+import { createFileStore } from "./recordings.ts";
+import { createRemoteStore } from "./remote-store.ts";
+import { keyRequest, type KeyedRequest } from "./request-key.ts";
 import { createSecrets } from "./secrets.ts";
+import {
+  recordingKey,
+  RULE_NAME,
+  type Recording,
+  type RecordingStore,
+} from "./store.ts";
 import {
   isEventStream,
   mapStreamEvents,
@@ -60,9 +64,9 @@ export type ResponseSource = "live" | "missed" | "replayed";
 
 interface Session {
   name: string;
-  /** New recordings, by file. */
+  /** New recordings, by key. */
   recorded: Map<string, Recording>;
-  /** Files that the session replayed. They stay used if it fails. */
+  /** Keys that the session replayed. They stay used if it fails. */
   replayed: Set<string>;
   /** Requests that `replay` mode failed. */
   missed: number;
@@ -144,20 +148,42 @@ function fromRecording(
   return { status: response.status, headers: response.headers, body };
 }
 
+/** The store of a config. Throws when the config does not name one. */
+function storeOf(config: RoachConfig): RecordingStore {
+  if ((config.directory === undefined) === (config.store === undefined)) {
+    throw new Error("Roach config must set directory or store, not both");
+  }
+  for (const rule of config.rules) {
+    if (!RULE_NAME.test(rule.name)) {
+      throw new Error(`Roach rule name is not valid: ${rule.name}`);
+    }
+  }
+  if (config.store) {
+    if (config.usedFile) throw new Error("usedFile needs directory");
+    return createRemoteStore(config.store);
+  }
+  return createFileStore(config.directory!);
+}
+
 /** Create the recorder of one proxy run. */
 export function createRecorder(config: RoachConfig) {
+  const store = storeOf(config);
   const missDirectory = config.missDirectory
     ? path.resolve(config.missDirectory)
     : undefined;
   if (
     missDirectory &&
+    config.directory !== undefined &&
     !path.relative(config.directory, missDirectory).startsWith("..")
   ) {
     // Miss files hold request bodies. Keep them out of the committed files.
     throw new Error("missDirectory must not be inside directory");
   }
   let session: Session | undefined;
-  const secrets = createSecrets(config.secrets);
+  const secrets = createSecrets([
+    ...(config.secrets ?? []),
+    ...(config.store ? [config.store.token] : []),
+  ]);
   /** Recordings that passed sessions, or requests outside one, used. */
   const used = new Set<string>();
   const stats: RecordingStats = {
@@ -172,55 +198,42 @@ export function createRecorder(config: RoachConfig) {
     discarded: 0,
     passthrough: {},
   };
-  const indexes = new Map(
-    config.rules.map((rule) => [
-      rule.name,
-      createRecordingIndex(path.join(config.directory, rule.name)),
-    ]),
-  );
-  const relative = (file: string) => path.relative(config.directory, file);
-
   const write = async (recordings: Array<[string, Recording]>) => {
-    stats.written += await writeRecordings(recordings);
-    for (const [file, recording] of recordings) {
-      indexes.get(path.basename(path.dirname(file)))!.add(file, recording);
-    }
+    stats.written += await store.write(recordings);
   };
 
-  const markReplayed = (owner: Session | undefined, file: string) => {
-    if (owner && owner.passed === undefined) owner.replayed.add(file);
-    else used.add(file);
+  const markReplayed = (owner: Session | undefined, key: string) => {
+    if (owner && owner.passed === undefined) owner.replayed.add(key);
+    else used.add(key);
   };
 
   const record = async (
     owner: Session | undefined,
-    file: string,
+    key: string,
     recording: Recording,
   ) => {
     if (owner && owner.passed === undefined) {
-      owner.recorded.set(file, recording);
+      owner.recorded.set(key, recording);
     } else if (owner?.passed === false) {
       stats.discarded += 1;
     } else {
-      used.add(file);
-      await write([[file, recording]]);
+      used.add(key);
+      await write([[key, recording]]);
     }
   };
 
   const reportMiss = async (
     rule: RecordingRule,
-    file: string,
+    key: string,
     keyed: KeyedRequest,
     owner: Session | undefined,
   ) => {
-    const closest = await indexes
-      .get(rule.name)!
-      .closest(keyed.parts, owner?.name);
+    const closest = await store.closest(rule.name, keyed.parts, owner?.name);
     const miss: RecordingMiss = {
       rule: rule.name,
       session: owner?.name,
-      file: relative(file),
-      closest: closest && relative(closest.file),
+      file: key,
+      closest: closest?.key,
       differs: closest?.differs ?? [],
     };
     if (stats.misses.length < MAX_MISSES) stats.misses.push(miss);
@@ -248,17 +261,17 @@ export function createRecorder(config: RoachConfig) {
     session = undefined;
     ended.passed = passed;
     // A failed test can still show that a recording is in use.
-    for (const file of ended.replayed) used.add(file);
+    for (const key of ended.replayed) used.add(key);
     if (passed) {
-      for (const file of ended.recorded.keys()) used.add(file);
+      for (const key of ended.recorded.keys()) used.add(key);
       await write([...ended.recorded]);
     } else {
       stats.discarded += ended.recorded.size;
       // A failed test stops early, so it does not replay all of its
       // recordings. Keep every recording that it made before, so that a
       // prune does not delete them.
-      for (const index of indexes.values()) {
-        for (const file of await index.filesOf(ended.name)) used.add(file);
+      for (const key of (await store.keysOf?.(ended.name)) ?? []) {
+        used.add(key);
       }
     }
     return ended.missed;
@@ -308,19 +321,19 @@ export function createRecorder(config: RoachConfig) {
           }
         }
       }
-      const file = path.join(config.directory, rule.name, `${keyed.key}.json`);
+      const key = recordingKey(rule.name, keyed.key);
 
       if (config.mode !== "record") {
-        const recording = await readRecording(file);
+        const recording = await store.read(key);
         if (recording) {
           counts.replayed += 1;
-          markReplayed(owner, file);
+          markReplayed(owner, key);
           return {
             ...fromRecording(recording, keyed.values),
             source: "replayed",
           };
         }
-        await reportMiss(rule, file, keyed, owner);
+        await reportMiss(rule, key, keyed, owner);
         if (config.mode === "replay") {
           counts.missed += 1;
           if (owner) owner.missed += 1;
@@ -346,7 +359,7 @@ export function createRecorder(config: RoachConfig) {
         ),
       ) as Recording;
       if (!isTemporaryStatus(recording.response.status)) {
-        await record(owner, file, recording);
+        await record(owner, key, recording);
       }
       return { ...fromRecording(recording, keyed.values), source: "live" };
     },
@@ -387,8 +400,11 @@ export function createRecorder(config: RoachConfig) {
     async close(): Promise<void> {
       await finish(false);
       if (config.usedFile) {
-        const files = [...used].map(relative).toSorted();
-        await writeFile(config.usedFile, files.map((f) => `${f}\n`).join(""));
+        const keys = [...used].toSorted();
+        await writeFile(
+          config.usedFile,
+          keys.map((key) => `${key}\n`).join(""),
+        );
       }
     },
   };

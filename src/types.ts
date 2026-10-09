@@ -16,7 +16,10 @@ export type RecordingMode = "auto" | "off" | "record" | "replay";
 
 /** One kind of traffic that the proxy records. */
 export interface RecordingRule {
-  /** The name of the rule. Its recordings are in `<directory>/<name>/`. */
+  /**
+   * The name of the rule, such as `model`. Its keys start with
+   * `<name>/`. Use letters, digits, `_`, `.`, and `-`.
+   */
   name: string;
   /** The requests of the rule. Each field that is set must match. */
   match: {
@@ -39,10 +42,23 @@ export interface RecordingRule {
   values?: ValuePatterns;
 }
 
-/** The configuration of one proxy. */
+/** A Roach Worker (`worker/`) that keeps the recordings. */
+export interface RemoteStoreConfig {
+  /** The URL of the Worker, such as `https://roach.example.workers.dev`. */
+  url: string;
+  /**
+   * The token of the tenant. The proxy sends it only to `url`, and never
+   * writes it to a recording.
+   */
+  token: string;
+}
+
+/** The configuration of one proxy. Set `directory` or `store`. */
 export interface RoachConfig {
   /** The directory of the recordings. Each rule has a subdirectory. */
-  directory: string;
+  directory?: string;
+  /** The Worker that keeps the recordings, in place of `directory`. */
+  store?: RemoteStoreConfig;
   mode: RecordingMode;
   /**
    * The only origins that the proxy sends requests to, such as
@@ -53,7 +69,8 @@ export interface RoachConfig {
   /**
    * When the proxy stops, it lists here the recordings that sessions used.
    * A failed session uses all recordings that it recorded before. Give these
-   * files to the `prune` command.
+   * files to the `prune` command. Only for `directory`: the Worker deletes
+   * recordings that nobody used for some time.
    */
   usedFile?: string;
   /**
@@ -77,9 +94,9 @@ export interface RecordingMiss {
   rule: string;
   /** The session of the request. */
   session?: string | undefined;
-  /** The recording file that the request needed, relative to `directory`. */
+  /** The key of the recording that the request needed. */
   file: string;
-  /** The recording with the most equal parts, relative to `directory`. */
+  /** The key of the recording with the most equal parts. */
   closest?: string | undefined;
   /** The parts that differ from `closest`, such as `messages[3]`. */
   differs: string[];

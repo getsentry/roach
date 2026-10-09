@@ -30,9 +30,12 @@
     "skills:install": "dotagents --project install",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
-    "typecheck": "tsc -p ."
+    "typecheck": "tsc -p . && tsc -p worker",
+    "worker:dev": "wrangler dev",
+    "worker:deploy": "wrangler d1 migrations apply DB --remote && wrangler deploy"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261008.1",
     "@sentry/dotagents": "^3.3.0",
     "@types/node": "^24.19.1",
     "@vitest/coverage-v8": "^5.0.3",
@@ -44,7 +47,8 @@
     "simple-git-hooks": "^2.14.0",
     "typescript": "^7.0.2",
     "undici": "^8.11.2",
-    "vitest": "^5.0.3"
+    "vitest": "^5.0.3",
+    "wrangler": "^4.149.0"
   },
   "simple-git-hooks": {
     "pre-commit": "pnpm exec lint-staged",

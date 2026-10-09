@@ -1,7 +1,7 @@
 /**
  * Text reports of a Roach run, for logs and CI summaries.
  */
-import { describeParts } from "./request-key.ts";
+import { describeParts } from "./parts.ts";
 import type { RecordingMiss, RecordingStats } from "./types.ts";
 
 /** Describe the totals of a run in one line. */

@@ -2,4 +2,6 @@
 # has time to be pulled before it reaches us.
 minimumReleaseAge: 1440
 allowBuilds:
+  esbuild: true
   simple-git-hooks: true
+  workerd: true

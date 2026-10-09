@@ -1,0 +1,28 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  // The Roach Worker: a remote store for recordings. See "Worker" in
+  // README.md.
+  "name": "roach",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": true,
+  "observability": { "enabled": true },
+  "vars": {
+    // Days that a recording stays after its last use.
+    "RECORDING_TTL_DAYS": 30,
+  },
+  // ROACH_TENANTS is a secret: `wrangler secret put ROACH_TENANTS`.
+  "secrets": { "required": ["ROACH_TENANTS"] },
+  "r2_buckets": [
+    { "binding": "RECORDINGS", "bucket_name": "roach-recordings" },
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "roach",
+      "migrations_dir": "worker/migrations",
+    },
+  ],
+  // Delete expired recordings once a day.
+  "triggers": { "crons": ["17 4 * * *"] },
+}

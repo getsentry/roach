@@ -13,21 +13,25 @@
 | Test case        | `pnpm exec vitest run tests/roach.test.ts -t "…"` |
 | Lint file        | `pnpm exec oxlint --deny-warnings src/server.ts`  |
 | Format           | `pnpm format`                                     |
-| Typecheck        | `pnpm typecheck`                                  |
+| Typecheck        | `pnpm typecheck` (proxy and Worker)               |
+| Worker tests     | `pnpm exec vitest run tests/worker.test.ts`       |
 | Unused code/deps | `pnpm knip`                                       |
 | Everything (CI)  | `pnpm check`                                      |
 
 ## External References
 
-| Need                                   | File                   |
-| -------------------------------------- | ---------------------- |
-| Usage, config, recordings, control API | `README.md`            |
-| Public types                           | `src/types.ts`         |
-| Map of source files                    | "Files" in `README.md` |
+| Need                                   | File                    |
+| -------------------------------------- | ----------------------- |
+| Usage, config, recordings, control API | `README.md`             |
+| Worker setup, routes, and limits       | "Worker" in `README.md` |
+| Public types                           | `src/types.ts`          |
+| Map of source files                    | "Files" in `README.md`  |
 
 ## Key Conventions
 
 - Add no runtime dependencies. Use Node built-ins and the `openssl` command only.
+- `worker/` runs on Cloudflare Workers, with `worker/tsconfig.json`. The `src/` files that it imports (`parts.ts`, `store.ts`) must not use Node built-ins.
+- Change the D1 schema only with a new file in `worker/migrations/`.
 - Node runs `src/` as TypeScript with type stripping. Use only erasable syntax, and import local files with the `.ts` extension.
 - Use functions and plain objects, not classes.
 - Start each source file with a comment that says what the file owns. Give each export a short JSDoc.
