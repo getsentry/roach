@@ -221,10 +221,22 @@ resource "google_compute_backend_service" "roach" {
   }
 }
 
+# A new domain needs a new certificate. The proxy uses the old one until
+# the new one exists, so each certificate gets its own name.
+resource "random_id" "certificate" {
+  byte_length = 4
+  keepers = {
+    domain = var.domain
+  }
+}
+
 resource "google_compute_managed_ssl_certificate" "roach" {
-  name = "roach"
+  name = "roach-${random_id.certificate.hex}"
   managed {
     domains = [var.domain]
+  }
+  lifecycle {
+    create_before_destroy = true
   }
 }
 
