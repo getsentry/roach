@@ -2,14 +2,17 @@
  * Roach as a shared service. See "Service" in `README.md`.
  *
  * One process serves the runs of many tenants on one port. A tenant is a
- * project, such as Junior. A run is one test run of a tenant, such as one
- * CI job. It has its own mode, rules, sessions, and stats, as one local
- * proxy (`server.ts`) has.
+ * GitHub repository, named `owner/repo`, such as `getsentry/junior`. The
+ * service has no list of tenants: a run names its tenant. A run is one test
+ * run of a tenant, such as one CI job. It has its own mode, rules,
+ * sessions, and stats, as one local proxy (`server.ts`) has.
  *
  * - Anyone can create a `replay` run of a tenant, so CI jobs of forks
  *   replay recordings without a secret. Such a run never writes.
- * - A run in another mode needs the token of the tenant, because it
- *   writes recordings. The service keeps only the SHA-256 of each token.
+ * - A run in another mode needs the write token, because it writes
+ *   recordings. All tenants share one write token, and the service keeps
+ *   only its SHA-256. The tenant name is a label, not proof of identity:
+ *   a holder of the token can write the recordings of any tenant.
  * - The service gives each run its own id and token. A proxied request
  *   names its run in `Proxy-Authorization`, as `Basic base64(<id>:<token>)`.
  *   The proxy URL of the run has them, so `HTTPS_PROXY` sends them.
@@ -63,10 +66,10 @@ export interface RoachServiceConfig {
   /** The only origins that runs can reach. A run can allow fewer. */
   allow: string[];
   /**
-   * The tenants, by name. Each value is the SHA-256 of the token of the
-   * tenant, in hex.
+   * The SHA-256 of the write token, in hex. All tenants share the token.
+   * Give it only to CI jobs that you trust.
    */
-  tenants: Record<string, string>;
+  writeTokenHash: string;
   /**
    * More regular expression sources that rules can use in `values`, in
    * addition to `VALUE_PATTERNS`. A slow pattern blocks all runs, so check
@@ -87,7 +90,10 @@ export interface RoachServiceConfig {
 
 /** The configuration of one run. The client sends it. */
 export interface RunConfig {
-  /** The tenant of the run. */
+  /**
+   * The tenant of the run, as `owner/repo`, such as
+   * `process.env.GITHUB_REPOSITORY`.
+   */
   tenant: string;
   mode: RecordingMode;
   rules: RecordingRule[];
@@ -124,7 +130,6 @@ export interface RoachService {
 
 interface Run extends ProxyTarget {
   id: string;
-  tenant: string;
   token: string;
   started: number;
 }
@@ -133,27 +138,28 @@ const MODES = new Set<RecordingMode>(["auto", "off", "record", "replay"]);
 /** A run that is open longer than this ends as failed, such as a dead job. */
 const RUN_TIMEOUT_MS = 6 * 60 * 60 * 1000;
 /**
- * The open runs without a token that one tenant can have. Anyone can start
- * them, so the cap keeps memory bounded. Runs with the token have no cap.
+ * The open runs without a token that the service can have, for all tenants.
+ * Anyone can start them with any tenant name, so the cap is not per tenant.
+ * It keeps memory bounded. Runs with the token have no cap.
  */
-const MAX_PUBLIC_RUNS = 50;
+const MAX_PUBLIC_RUNS = 100;
 const MAX_RUN_NAME = 128;
+/**
+ * A tenant name: `owner/repo`, with the characters of GitHub names. It is a
+ * path in the store, so each part starts with a letter, digit, or `_`, and
+ * there are always two parts. Then no tenant is in the directory of another.
+ */
+const TENANT_NAME = /^[A-Za-z0-9_][\w.-]{0,99}\/[A-Za-z0-9_][\w.-]{0,99}$/;
 
 const sha256 = (value: string) => createHash("sha256").update(value).digest();
 
-/** Check that `token` is the token of `tenant`, in constant time. */
-function isTenantToken(
-  tenants: Record<string, string>,
-  tenant: string,
+/** Check that `authorization` has the write token, in constant time. */
+function isWriteToken(
+  expected: Buffer,
   authorization: string | undefined,
 ): boolean {
   const token = /^Bearer (\S+)$/.exec(authorization ?? "")?.[1];
-  const expected = Object.hasOwn(tenants, tenant)
-    ? Buffer.from(tenants[tenant]!, "hex")
-    : undefined;
-  if (!token || !expected) return false;
-  const actual = sha256(token);
-  return expected.length === actual.length && timingSafeEqual(expected, actual);
+  return token !== undefined && timingSafeEqual(expected, sha256(token));
 }
 
 /** The run id and token in a `Proxy-Authorization` header. */
@@ -263,14 +269,10 @@ export async function startRoachService(
   if ((config.directory === undefined) === (config.bucket === undefined)) {
     throw new Error("Roach service config must set directory or bucket");
   }
-  for (const [tenant, hash] of Object.entries(config.tenants)) {
-    if (!RULE_NAME.test(tenant)) {
-      throw new Error(`Roach tenant name must match ${RULE_NAME}: ${tenant}`);
-    }
-    if (!/^[0-9a-f]{64}$/i.test(hash)) {
-      throw new Error(`Roach tenant ${tenant} needs a SHA-256 token hash`);
-    }
+  if (!/^[0-9a-f]{64}$/i.test(config.writeTokenHash ?? "")) {
+    throw new Error("Roach service config needs writeTokenHash, a SHA-256");
   }
+  const writeTokenHash = Buffer.from(config.writeTokenHash, "hex");
   if (config.sentryDsn) {
     Sentry.init({ dsn: config.sentryDsn, tracesSampleRate: 0 });
   }
@@ -305,7 +307,6 @@ export async function startRoachService(
     );
     const run: Run = {
       id,
-      tenant: runConfig.tenant,
       token,
       started: Date.now(),
       origins: parseOrigins(allow.map((origin) => origin.replace(/\/$/, ""))),
@@ -361,11 +362,8 @@ export async function startRoachService(
     if (incoming.method === "POST" && pathname === `${CONTROL_PATH}/runs`) {
       const runConfig = await readJson<Partial<RunConfig>>(incoming);
       const tenant = runConfig.tenant;
-      if (
-        typeof tenant !== "string" ||
-        !Object.hasOwn(config.tenants, tenant)
-      ) {
-        sendJson(outgoing, 400, { error: "tenant is not known" });
+      if (typeof tenant !== "string" || !TENANT_NAME.test(tenant)) {
+        sendJson(outgoing, 400, { error: "tenant must be owner/repo" });
         return;
       }
       const error = invalidRunConfig(runConfig, serviceOrigins, valuePatterns);
@@ -373,26 +371,25 @@ export async function startRoachService(
         sendJson(outgoing, 400, { error });
         return;
       }
-      const canWrite = isTenantToken(
-        config.tenants,
-        tenant,
+      const canWrite = isWriteToken(
+        writeTokenHash,
         incoming.headers.authorization,
       );
       // Reads are public. Every other mode can write, so it needs the token.
       if (!canWrite && runConfig.mode !== "replay") {
         sendJson(outgoing, 401, {
-          error: `${runConfig.mode} mode needs the token of ${tenant}`,
+          error: `${runConfig.mode} mode needs the write token`,
         });
         return;
       }
       if (!canWrite) {
         let open = 0;
         for (const other of runs.values()) {
-          if (other.replayOnly && other.tenant === tenant) open += 1;
+          if (other.replayOnly) open += 1;
         }
         if (open >= MAX_PUBLIC_RUNS) {
           sendJson(outgoing, 429, {
-            error: `${tenant} has ${MAX_PUBLIC_RUNS} open runs without a token`,
+            error: `The service has ${MAX_PUBLIC_RUNS} open runs without a token`,
           });
           return;
         }

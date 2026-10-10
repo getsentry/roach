@@ -26,7 +26,8 @@ import type { RoachServiceConfig, RunConfig } from "../src/service.ts";
 
 const execFileAsync = promisify(execFile);
 const ROOT = path.join(import.meta.dirname, "..");
-const TOKEN = "junior-write-token";
+const TOKEN = "roach-write-token";
+const TENANT = "getsentry/junior";
 const BUCKET = "roach-recordings";
 const GCS_TOKEN = "vm-access-token";
 
@@ -78,7 +79,7 @@ function readEnvelope(envelope: string) {
 /** Run one CI job, and return what it printed. */
 async function ciJob(token: string | undefined, mode: RunConfig["mode"]) {
   const config: RunConfig = {
-    tenant: "junior",
+    tenant: TENANT,
     mode,
     name: `${mode}-run`,
     rules: [{ name: "model", match: { method: "POST" } }],
@@ -234,7 +235,7 @@ beforeAll(async () => {
     publicUrl: frontUrl,
     bucket: BUCKET,
     allow: [upstreamOrigin],
-    tenants: { junior: createHash("sha256").update(TOKEN).digest("hex") },
+    writeTokenHash: createHash("sha256").update(TOKEN).digest("hex"),
     ca: { cert: caCert, key: await readFile(caKeyFile, "utf8") },
     sentryDsn: `http://public@127.0.0.1:${sentryPort}/1`,
   };
@@ -289,7 +290,7 @@ describe("deployed roach", () => {
     // A restart keeps the authority that clients trust.
     expect(writer.caCert).toBe(caCert);
     expect([...objects.keys()]).toEqual([
-      expect.stringMatching(/^junior\/model\/[0-9a-f]{64}\.json$/),
+      expect.stringMatching(/^getsentry\/junior\/model\/[0-9a-f]{64}\.json$/),
     ]);
 
     const fork = await ciJob(undefined, "replay");
@@ -313,22 +314,22 @@ describe("deployed roach", () => {
       })),
     ).toEqual([
       {
-        tenant: "junior",
+        tenant: TENANT,
         run: "auto-run",
         result: "missed",
-        key: key!.slice(7),
+        key: key!.slice(`${TENANT}/`.length),
       },
       {
-        tenant: "junior",
+        tenant: TENANT,
         run: "auto-run",
         result: "written",
-        key: key!.slice(7),
+        key: key!.slice(`${TENANT}/`.length),
       },
       {
-        tenant: "junior",
+        tenant: TENANT,
         run: "replay-run",
         result: "replayed",
-        key: key!.slice(7),
+        key: key!.slice(`${TENANT}/`.length),
       },
     ]);
   });

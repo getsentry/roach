@@ -13,8 +13,8 @@ output "ca_cert" {
   value       = tls_self_signed_cert.ca.cert_pem
 }
 
-output "tenant_tokens" {
-  description = "The write token of each tenant. Keep each one in a CI secret of its project, such as ROACH_TOKEN."
-  value       = { for name, token in random_password.tenant : name => token.result }
+output "write_token" {
+  description = "The write token of all tenants. Keep it in one organization secret, ROACH_TOKEN, for the repositories that you trust."
+  value       = random_password.write_token.result
   sensitive   = true
 }

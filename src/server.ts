@@ -323,7 +323,7 @@ export interface ProxyTarget {
   recorder: Recorder;
   /**
    * Refuse requests that no rule matches, so nothing goes live. The
-   * service sets this for a run without the tenant token.
+   * service sets this for a run without the write token.
    */
   replayOnly?: boolean;
   /** Set when the target stops. Its tunnels then refuse new requests. */

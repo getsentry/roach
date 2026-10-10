@@ -32,11 +32,6 @@ variable "machine_type" {
   default     = "e2-small"
 }
 
-variable "tenants" {
-  description = "The names of the projects that use Roach, such as junior. Terraform makes a write token for each one."
-  type        = set(string)
-}
-
 variable "allow" {
   description = "The only origins that runs can reach, such as https://ai-gateway.vercel.sh."
   type        = list(string)

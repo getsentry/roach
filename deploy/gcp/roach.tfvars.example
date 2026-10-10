@@ -3,8 +3,6 @@
 project = "my-gcp-project"
 domain  = "roach.example.com"
 
-tenants = ["junior"]
-
 # The origins of Junior's evals (packages/junior-evals/src/recording-rules.ts).
 allow = [
   "https://ai-gateway.vercel.sh",
