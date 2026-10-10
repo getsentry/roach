@@ -10,12 +10,14 @@
  * A recording also keeps a short hash of each part of its request: the
  * method, the URL, each key header, each top-level field of a JSON body,
  * and each item of a top-level array, such as `messages[3]`. When a request
- * has no recording, the proxy finds the recording with the most equal parts
- * and reports the parts that differ.
+ * has no recording, the file store finds the recording with the most equal
+ * parts and reports the parts that differ. This only helps a person debug a
+ * miss. It never makes a replay.
  */
 import { createHash } from "node:crypto";
 import type { IncomingHttpHeaders } from "node:http";
 import { THINKING_BLOCK_TYPES } from "./streams.ts";
+import type { RequestParts } from "./store.ts";
 import type { RecordingRule } from "./types.ts";
 import {
   extractValues,
@@ -26,9 +28,6 @@ import {
 
 /** Change this to make every recording a miss. */
 const KEY_VERSION = "http-v1";
-
-/** A short hash of each part of a request, by part name. */
-export type RequestParts = Record<string, string>;
 
 /** A request as the key sees it. */
 export interface KeyedRequest {

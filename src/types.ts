@@ -16,7 +16,10 @@ export type RecordingMode = "auto" | "off" | "record" | "replay";
 
 /** One kind of traffic that the proxy records. */
 export interface RecordingRule {
-  /** The name of the rule. Its recordings are in `<directory>/<name>/`. */
+  /**
+   * The name of the rule, such as `model`. Its keys start with
+   * `<name>/`. Use letters, digits, `_`, `.`, and `-`.
+   */
   name: string;
   /** The requests of the rule. Each field that is set must match. */
   match: {
@@ -39,7 +42,10 @@ export interface RecordingRule {
   values?: ValuePatterns;
 }
 
-/** The configuration of one proxy. */
+/**
+ * The configuration of one local proxy (`server.ts`). The shared service
+ * (`service.ts`) has its own configuration.
+ */
 export interface RoachConfig {
   /** The directory of the recordings. Each rule has a subdirectory. */
   directory: string;
@@ -77,9 +83,9 @@ export interface RecordingMiss {
   rule: string;
   /** The session of the request. */
   session?: string | undefined;
-  /** The recording file that the request needed, relative to `directory`. */
+  /** The key of the recording that the request needed. */
   file: string;
-  /** The recording with the most equal parts, relative to `directory`. */
+  /** The key of the recording with the most equal parts. */
   closest?: string | undefined;
   /** The parts that differ from `closest`, such as `messages[3]`. */
   differs: string[];
@@ -111,6 +117,8 @@ export interface RoachAddress {
   url: string;
   /** The bearer token of the control API. */
   token: string;
+  /** The base URL of the control API. Default: `<url>/__roach`. */
+  controlUrl?: string;
   /** The PEM certificate of the authority that signs intercepted hosts. */
   caCert: string;
 }

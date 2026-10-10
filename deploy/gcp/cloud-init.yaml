@@ -1,0 +1,31 @@
+#cloud-config
+# Container-Optimized OS runs this at each boot. The roach unit reads the
+# config secret into memory (/run is tmpfs), pulls the image, and runs it.
+write_files:
+  - path: /etc/systemd/system/roach.service
+    permissions: "0644"
+    owner: root
+    content: |
+      [Unit]
+      Description=Roach
+      Wants=network-online.target
+      After=network-online.target docker.service
+
+      [Service]
+      Environment=HOME=/run/roach-home
+      ExecStartPre=/bin/mkdir -p /run/roach /run/roach-home
+      ExecStartPre=/bin/sh -c 'iptables -w -C INPUT -p tcp --dport ${port} -j ACCEPT || iptables -w -A INPUT -p tcp --dport ${port} -j ACCEPT'
+      ExecStartPre=/bin/sh -c 'umask 077 && docker run --rm --network host gcr.io/google.com/cloudsdktool/google-cloud-cli:alpine gcloud secrets versions access latest --secret=${secret} --project=${project} > /run/roach/roach.json && chown 1000 /run/roach/roach.json'
+      ExecStartPre=-/usr/bin/docker rm -f roach
+      ExecStartPre=/usr/bin/docker pull ${image}
+      ExecStart=/usr/bin/docker run --rm --name roach --network host -v /run/roach:/config:ro ${image}
+      ExecStop=/usr/bin/docker stop roach
+      Restart=always
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - systemctl daemon-reload
+  - systemctl start roach.service

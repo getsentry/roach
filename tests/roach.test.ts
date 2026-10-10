@@ -329,6 +329,8 @@ describe("roach", () => {
   });
 
   it("writes nothing for a failed session", async () => {
+    // A file next to the rule directories is not a rule.
+    await writeFile(path.join(directory, ".DS_Store"), "");
     const running = await start("auto");
     await session(running, [{ model: "m" }], false);
     await session(running, [{ model: "m" }], false);

@@ -19,12 +19,17 @@ import http from "node:http";
 import https from "node:https";
 import { isIP, type Socket } from "node:net";
 import tls from "node:tls";
-import { createCertificateAuthority } from "./certificates.ts";
+import {
+  createCertificateAuthority,
+  type CertificateAuthority,
+} from "./certificates.ts";
 import {
   createRecorder,
   type ProxyRequest,
   type Recorder,
 } from "./recorder.ts";
+import path from "node:path";
+import { createFileStore } from "./recordings.ts";
 import type { RoachAddress, RoachConfig } from "./types.ts";
 
 /** The path prefix of the control API. */
@@ -48,9 +53,15 @@ const HOP_HEADERS = new Set([
   "upgrade",
 ]);
 const AUTHORITY = /^(\[[0-9a-f:.]+\]|[a-z0-9.-]+):(\d{1,5})$/i;
+/** A request body over this size gets HTTP 413. */
+const MAX_BODY_BYTES = 64 * 1024 * 1024;
+
+/** An error that answers a request with its own status. */
+const httpError = (status: number, message: string) =>
+  Object.assign(new Error(message), { status });
 
 /** Parse the allowed origins, by origin. A value that is not one throws. */
-function parseOrigins(values: string[]): Map<string, URL> {
+export function parseOrigins(values: string[]): Map<string, URL> {
   return new Map(
     values.map((value) => {
       const origin = new URL(value);
@@ -71,21 +82,54 @@ function authorityOf(origin: URL): string {
   return `${origin.hostname}:${port}`;
 }
 
-function readBody(stream: http.IncomingMessage): Promise<Buffer> {
+/**
+ * Read a whole body. A body over `maxBytes` fails with HTTP 413. Only
+ * request bodies have a limit: the client sends them, and a large upstream
+ * response is not the fault of the client.
+ */
+function readBody(
+  stream: http.IncomingMessage,
+  maxBytes = Infinity,
+): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    stream.on("data", (chunk: Buffer) => chunks.push(chunk));
+    let size = 0;
+    stream.on("data", (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > maxBytes) {
+        // Read the rest without keeping it, so the client gets the 413.
+        chunks.length = 0;
+        reject(httpError(413, `body is over ${maxBytes} bytes`));
+        return;
+      }
+      chunks.push(chunk);
+    });
     stream.on("end", () => resolve(Buffer.concat(chunks)));
     stream.on("error", reject);
   });
 }
 
-async function readJson<T>(incoming: http.IncomingMessage): Promise<T> {
-  return JSON.parse((await readBody(incoming)).toString("utf8") || "{}") as T;
+/** Read a JSON object request body. Any other body fails with HTTP 400. */
+export async function readJson<T>(incoming: http.IncomingMessage): Promise<T> {
+  const text = (await readBody(incoming, MAX_BODY_BYTES)).toString("utf8");
+  let value: unknown;
+  try {
+    value = JSON.parse(text || "{}");
+  } catch {
+    throw httpError(400, "body is not JSON");
+  }
+  // Callers read fields, so `null`, a list, or a single value is a bad body.
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw httpError(400, "body is not a JSON object");
+  }
+  return value as T;
 }
 
 /** Compare tokens in constant time. */
-function sameToken(actual: string | undefined, expected: string): boolean {
+export function sameToken(
+  actual: string | undefined,
+  expected: string,
+): boolean {
   if (actual === undefined) return false;
   const a = Buffer.from(actual);
   const b = Buffer.from(expected);
@@ -135,8 +179,7 @@ function sendUpstream(
 
 /** Proxy one request to an allowed origin, through the recorder. */
 async function proxyRequest(
-  recorder: Recorder,
-  origins: Map<string, URL>,
+  { recorder, origins, replayOnly }: ProxyTarget,
   incoming: http.IncomingMessage,
   outgoing: http.ServerResponse,
   tunnelOrigin: string | undefined,
@@ -155,10 +198,18 @@ async function proxyRequest(
     method: incoming.method ?? "GET",
     url,
     headers: incoming.headers,
-    body: await readBody(incoming),
+    body: await readBody(incoming, MAX_BODY_BYTES),
   };
   const rule = recorder.ruleFor(request);
 
+  if (!rule && replayOnly) {
+    // Without this, anyone could send live traffic through a public run.
+    outgoing.writeHead(403, { "content-type": "text/plain" });
+    outgoing.end(
+      "Roach: this run can only replay, and no rule records this request\n",
+    );
+    return;
+  }
   if (!rule) {
     recorder.countPassthrough(origin.origin, request.headers);
     const upstream = await sendUpstream(origin, request);
@@ -190,7 +241,60 @@ async function proxyRequest(
   outgoing.end(response.body);
 }
 
-/** Answer one request to the control API. See `README.md`. */
+/** Write a JSON response. */
+export function sendJson(
+  outgoing: http.ServerResponse,
+  status: number,
+  body: unknown,
+): void {
+  outgoing.writeHead(status, { "content-type": "application/json" });
+  outgoing.end(JSON.stringify(body));
+}
+
+/**
+ * Answer a session or stats call of one recorder. `route` is the method
+ * and the path after the prefix of the run, such as `POST /session`.
+ * Returns `false` when the route is not one of them.
+ */
+export async function controlRecorder(
+  recorder: Recorder,
+  route: string,
+  incoming: http.IncomingMessage,
+  outgoing: http.ServerResponse,
+): Promise<boolean> {
+  switch (route) {
+    case "GET /stats":
+      sendJson(outgoing, 200, recorder.stats());
+      return true;
+    case "POST /session": {
+      const { name } = await readJson<{ name?: unknown }>(incoming);
+      if (typeof name !== "string" || name === "") {
+        sendJson(outgoing, 400, { error: "name must be a string" });
+        return true;
+      }
+      await recorder.startSession(name);
+      outgoing.writeHead(204).end();
+      return true;
+    }
+    case "POST /session/end": {
+      const { name, passed } = await readJson<{
+        name?: unknown;
+        passed?: unknown;
+      }>(incoming);
+      try {
+        const missed = await recorder.endSession(String(name), passed === true);
+        sendJson(outgoing, 200, { missed });
+      } catch (error) {
+        sendJson(outgoing, 409, { error: (error as Error).message });
+      }
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
+/** Answer one request to the control API of a local proxy. */
 async function control(
   recorder: Recorder,
   token: string,
@@ -201,161 +305,267 @@ async function control(
     outgoing.writeHead(401).end();
     return;
   }
-  const route = `${incoming.method} ${new URL(incoming.url ?? "/", "http://proxy").pathname}`;
-  const json = (status: number, body: unknown) => {
-    outgoing.writeHead(status, { "content-type": "application/json" });
-    outgoing.end(JSON.stringify(body));
-  };
-  switch (route) {
-    case `GET ${CONTROL_PATH}/stats`:
-      json(200, recorder.stats());
-      return;
-    case `POST ${CONTROL_PATH}/session`: {
-      const { name } = await readJson<{ name?: unknown }>(incoming);
-      if (typeof name !== "string" || name === "") {
-        json(400, { error: "name must be a string" });
-        return;
-      }
-      await recorder.startSession(name);
-      outgoing.writeHead(204).end();
-      return;
-    }
-    case `POST ${CONTROL_PATH}/session/end`: {
-      const { name, passed } = await readJson<{
-        name?: unknown;
-        passed?: unknown;
-      }>(incoming);
-      try {
-        const missed = await recorder.endSession(String(name), passed === true);
-        json(200, { missed });
-      } catch (error) {
-        json(409, { error: (error as Error).message });
-      }
-      return;
-    }
-    default:
-      outgoing.writeHead(404).end();
-  }
+  const pathname = new URL(incoming.url ?? "/", "http://proxy").pathname;
+  const handled =
+    pathname.startsWith(`${CONTROL_PATH}/`) &&
+    (await controlRecorder(
+      recorder,
+      `${incoming.method} ${pathname.slice(CONTROL_PATH.length)}`,
+      incoming,
+      outgoing,
+    ));
+  if (!handled) outgoing.writeHead(404).end();
 }
 
-/** Start the proxy in this process, on a free port of `127.0.0.1`. */
-export async function startRoach(config: RoachConfig): Promise<RoachServer> {
-  const origins = parseOrigins(config.allow);
-  const allowedAuthorities = new Set([...origins.values()].map(authorityOf));
-  const recorder = createRecorder(config);
-  const authority = await createCertificateAuthority();
-  const token = randomBytes(24).toString("hex");
-  // The origin of each tunnel. Absolute-form requests have no tunnel.
-  const tunnelOrigins = new WeakMap<Socket, string>();
+/** Where a proxied request goes: the allowed origins and the recorder. */
+export interface ProxyTarget {
+  origins: Map<string, URL>;
+  recorder: Recorder;
+  /**
+   * Refuse requests that no rule matches, so nothing goes live. The
+   * service sets this for a run without the tenant token.
+   */
+  replayOnly?: boolean;
+  /** Set when the target stops. Its tunnels then refuse new requests. */
+  closed?: boolean;
+}
+
+/** A target, or the HTTP status that refuses the request. */
+export type TargetResult = ProxyTarget | { status: 403 | 407 };
+
+/** The options of `listenProxy()`. */
+export interface ListenOptions {
+  host: string;
+  port: number;
+  authority: CertificateAuthority;
+  /**
+   * The target of a proxied request. It reads `Proxy-Authorization` of a
+   * `CONNECT` or an absolute-form request.
+   */
+  targetFor(incoming: http.IncomingMessage): TargetResult;
+  /** Answer a request to the proxy itself, such as the control API. */
+  control(
+    incoming: http.IncomingMessage,
+    outgoing: http.ServerResponse,
+  ): Promise<void>;
+}
+
+/** A listening proxy socket. */
+export interface ListeningProxy {
+  port: number;
+  close(): Promise<void>;
+}
+
+/** Refuse a proxied request that has no target. */
+function refuse(status: 403 | 407, outgoing: http.ServerResponse): void {
+  outgoing.writeHead(
+    status,
+    status === 407
+      ? {
+          "proxy-authenticate": 'Basic realm="roach"',
+          "content-type": "text/plain",
+        }
+      : { "content-type": "text/plain" },
+  );
+  outgoing.end(
+    `Roach: ${status === 407 ? "proxy credentials required" : "forbidden"}\n`,
+  );
+}
+
+/** Proxy one request through its target, and answer errors with 502. */
+function serveProxied(
+  target: ProxyTarget,
+  incoming: http.IncomingMessage,
+  outgoing: http.ServerResponse,
+  tunnelOrigin: string | undefined,
+): void {
+  if (target.closed) {
+    outgoing.writeHead(410, { "content-type": "text/plain" });
+    outgoing.end("Roach: this run has ended\n");
+    return;
+  }
+  proxyRequest(target, incoming, outgoing, tunnelOrigin).catch(
+    (error: unknown) => {
+      if (!outgoing.headersSent) {
+        const status = (error as { status?: number }).status ?? 502;
+        outgoing.writeHead(status, { "content-type": "text/plain" });
+      }
+      outgoing.end(
+        `Roach error: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+    },
+  );
+}
+
+/**
+ * Listen for proxied requests and control requests on one port. The
+ * caller decides the target of each proxied request, so one port can serve
+ * one run (`startRoach()`) or many runs (`service.ts`).
+ */
+export async function listenProxy(
+  options: ListenOptions,
+): Promise<ListeningProxy> {
+  const { authority } = options;
+  // The origin and target of each tunnel. Absolute-form requests have none.
+  const tunnels = new WeakMap<
+    Socket,
+    { origin: string; target: ProxyTarget }
+  >();
   const sockets = new Set<Socket>();
 
-  const serve =
-    (originOf: (incoming: http.IncomingMessage) => string | undefined) =>
-    (incoming: http.IncomingMessage, outgoing: http.ServerResponse) => {
-      proxyRequest(
-        recorder,
-        origins,
-        incoming,
-        outgoing,
-        originOf(incoming),
-      ).catch((error: unknown) => {
-        if (!outgoing.headersSent) {
-          outgoing.writeHead(502, { "content-type": "text/plain" });
-        }
-        outgoing.end(
-          `Roach error: ${error instanceof Error ? error.message : String(error)}\n`,
-        );
-      });
-    };
-
   // Requests inside a CONNECT tunnel. The tunnel gives the origin.
-  const tunnelServer = http.createServer(
-    serve((incoming) => tunnelOrigins.get(incoming.socket)),
-  );
-  const proxyAbsolute = serve(() => undefined);
+  const tunnelServer = http.createServer((incoming, outgoing) => {
+    const tunnel = tunnels.get(incoming.socket);
+    if (!tunnel) {
+      outgoing.writeHead(400).end();
+      return;
+    }
+    serveProxied(tunnel.target, incoming, outgoing, tunnel.origin);
+  });
   const server = http.createServer((incoming, outgoing) => {
     // A request to the proxy itself has a path. A proxied plain HTTP
     // request has an absolute URL.
     if (!incoming.url?.startsWith("/")) {
-      proxyAbsolute(incoming, outgoing);
+      const target = options.targetFor(incoming);
+      if ("status" in target) refuse(target.status, outgoing);
+      else serveProxied(target, incoming, outgoing, undefined);
       return;
     }
-    control(recorder, token, incoming, outgoing).catch((error: unknown) => {
+    options.control(incoming, outgoing).catch((error: unknown) => {
       process.stderr.write(`[roach] Control failed: ${String(error)}\n`);
-      if (!outgoing.headersSent) outgoing.writeHead(500);
-      outgoing.end();
+      // An error with a status, such as 413 from readBody, is the fault of
+      // the client. Any other error is a bug of the proxy.
+      const status = (error as { status?: number }).status ?? 500;
+      if (outgoing.headersSent) {
+        outgoing.end();
+        return;
+      }
+      sendJson(outgoing, status, {
+        error: status === 500 ? "internal error" : (error as Error).message,
+      });
     });
   });
   server.on("connection", (socket: Socket) => {
     sockets.add(socket);
     socket.on("close", () => sockets.delete(socket));
   });
-  server.on("connect", (request, socket: Socket, head: Buffer) => {
-    socket.on("error", () => socket.destroy());
-    const match = AUTHORITY.exec(request.url ?? "");
-    if (!match) {
-      socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
-      return;
-    }
-    const [, host, port] = match as unknown as [string, string, string];
-    if (!allowedAuthorities.has(`${host.toLowerCase()}:${port}`)) {
-      process.stderr.write(`[roach] Refused ${host}:${port}\n`);
-      socket.end("HTTP/1.1 403 Forbidden\r\n\r\n");
-      return;
-    }
-    socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
-    const open = async (first: Buffer) => {
-      socket.unshift(first);
-      // A TLS handshake starts with byte 0x16. Anything else is plain HTTP.
-      if (first[0] !== 0x16) {
-        tunnelOrigins.set(
-          socket,
-          `http://${host}${port === "80" ? "" : `:${port}`}`,
+  server.on(
+    "connect",
+    (request: http.IncomingMessage, socket: Socket, head: Buffer) => {
+      socket.on("error", () => socket.destroy());
+      const target = options.targetFor(request);
+      if ("status" in target) {
+        socket.end(
+          target.status === 407
+            ? 'HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="roach"\r\n\r\n'
+            : "HTTP/1.1 403 Forbidden\r\n\r\n",
         );
-        tunnelServer.emit("connection", socket);
-        socket.resume();
         return;
       }
-      const secure = new tls.TLSSocket(socket, {
-        isServer: true,
-        secureContext: await authority.contextFor(host),
-        ALPNProtocols: ["http/1.1"],
-      });
-      secure.on("error", () => secure.destroy());
-      tunnelOrigins.set(
-        secure,
-        `https://${host}${port === "443" ? "" : `:${port}`}`,
+      const match = AUTHORITY.exec(request.url ?? "");
+      if (!match) {
+        socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
+        return;
+      }
+      const [, host, port] = match as unknown as [string, string, string];
+      const allowed = [...target.origins.values()].some(
+        (origin) => authorityOf(origin) === `${host.toLowerCase()}:${port}`,
       );
-      tunnelServer.emit("connection", secure);
-    };
-    const onFirst = (first: Buffer) => {
-      socket.pause();
-      open(first).catch(() => socket.destroy());
-    };
-    if (head.length > 0) onFirst(head);
-    else socket.once("data", onFirst);
-  });
+      if (!allowed) {
+        process.stderr.write(`[roach] Refused ${host}:${port}\n`);
+        socket.end("HTTP/1.1 403 Forbidden\r\n\r\n");
+        return;
+      }
+      socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      const open = async (first: Buffer) => {
+        socket.unshift(first);
+        // A TLS handshake starts with byte 0x16. Anything else is plain HTTP.
+        if (first[0] !== 0x16) {
+          tunnels.set(socket, {
+            origin: `http://${host}${port === "80" ? "" : `:${port}`}`,
+            target,
+          });
+          tunnelServer.emit("connection", socket);
+          socket.resume();
+          return;
+        }
+        const secure = new tls.TLSSocket(socket, {
+          isServer: true,
+          secureContext: await authority.contextFor(host),
+          ALPNProtocols: ["http/1.1"],
+        });
+        secure.on("error", () => secure.destroy());
+        tunnels.set(secure, {
+          origin: `https://${host}${port === "443" ? "" : `:${port}`}`,
+          target,
+        });
+        tunnelServer.emit("connection", secure);
+      };
+      const onFirst = (first: Buffer) => {
+        socket.pause();
+        open(first).catch(() => socket.destroy());
+      };
+      if (head.length > 0) onFirst(head);
+      else socket.once("data", onFirst);
+    },
+  );
 
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => resolve());
+    server.listen(options.port, options.host, () => resolve());
   });
   const address = server.address();
   if (!address || typeof address === "string") {
     throw new Error("Roach did not bind to a TCP port");
   }
-
   return {
-    url: `http://127.0.0.1:${address.port}`,
-    token,
-    caCert: authority.caCert,
+    port: address.port,
     async close() {
       await new Promise<void>((resolve) => {
         server.close(() => resolve());
         for (const socket of sockets) socket.destroy();
       });
       tunnelServer.close();
-      await recorder.close();
+    },
+  };
+}
+
+/** Start the proxy in this process, on a free port of `127.0.0.1`. */
+export async function startRoach(config: RoachConfig): Promise<RoachServer> {
+  if (
+    config.missDirectory &&
+    !path
+      .relative(config.directory, path.resolve(config.missDirectory))
+      .startsWith("..")
+  ) {
+    // Miss files hold request bodies. Keep them out of the committed files.
+    throw new Error("missDirectory must not be inside directory");
+  }
+  const target: ProxyTarget = {
+    origins: parseOrigins(config.allow),
+    recorder: createRecorder(config, createFileStore(config.directory)),
+  };
+  const authority = await createCertificateAuthority();
+  const token = randomBytes(24).toString("hex");
+  // Only local processes reach this port, so proxied requests need no
+  // credentials.
+  const listening = await listenProxy({
+    host: "127.0.0.1",
+    port: 0,
+    authority,
+    targetFor: () => target,
+    control: (incoming, outgoing) =>
+      control(target.recorder, token, incoming, outgoing),
+  });
+
+  return {
+    url: `http://127.0.0.1:${listening.port}`,
+    token,
+    caCert: authority.caCert,
+    async close() {
+      target.closed = true;
+      await listening.close();
+      await target.recorder.close();
       await authority.close();
     },
   };

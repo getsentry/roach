@@ -1,136 +1,132 @@
 /**
- * The recording files of Roach.
+ * The file store, and prune.
  *
- * A recording is one JSON file, `<directory>/<rule>/<key>.json`. It keeps
- * the response of one request, the session (test) that recorded it, and
- * the parts of the request (`request-key.ts`). It does not keep the request
- * body, so prompts and other inputs are not committed.
+ * The file store keeps each recording (`store.ts`) in `<directory>/<key>`,
+ * so recordings can be committed.
  */
 import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { closestRequest, type RequestParts } from "./request-key.ts";
-
-/** One recorded response. */
-export interface Recording {
-  /** The session (test) that recorded the response. */
-  session?: string | undefined;
-  request: { method: string; url: string; parts: RequestParts };
-  response: {
-    status: number;
-    headers: Record<string, string>;
-    /**
-     * A text body keeps each changing value of its request as a
-     * placeholder (`values.ts`).
-     */
-    body: string;
-    /** `base64` for a body that is not text, such as an image. */
-    bodyEncoding: "base64" | "utf8";
-  };
-}
+import { closestRequest } from "./request-key.ts";
+import {
+  formatRecording,
+  type Recording,
+  type RecordingStore,
+  type RequestParts,
+} from "./store.ts";
 
 const isMissing = (error: unknown) =>
   (error as NodeJS.ErrnoException).code === "ENOENT";
 
-/** Read a recording. Returns `undefined` when there is none. */
-export async function readRecording(
-  file: string,
-): Promise<Recording | undefined> {
-  try {
-    return JSON.parse(await readFile(file, "utf8")) as Recording;
-  } catch (error) {
+const readText = (file: string) =>
+  readFile(file, "utf8").catch((error: unknown) => {
     if (isMissing(error)) return undefined;
     throw error;
-  }
-}
+  });
 
-/** Write recordings. Returns how many were new or changed. */
-export async function writeRecordings(
-  recordings: Iterable<[string, Recording]>,
-): Promise<number> {
-  const changed = await Promise.all(
-    [...recordings].map(async ([file, recording]) => {
-      const content = `${JSON.stringify(recording, null, 2)}\n`;
-      const previous = await readFile(file, "utf8").catch((error) => {
-        if (isMissing(error)) return undefined;
-        throw error;
-      });
-      if (previous === content) return false;
-      await mkdir(path.dirname(file), { recursive: true });
-      await writeFile(file, content);
-      return true;
-    }),
-  );
-  return changed.filter(Boolean).length;
-}
+/** The rule of a key, `<rule>/<hash>.json`. */
+const ruleOf = (key: string) => key.slice(0, key.indexOf("/"));
 
 interface IndexEntry {
-  file: string;
+  key: string;
   session?: string | undefined;
   parts: RequestParts;
 }
 
-/** The recordings of one rule, for miss diagnosis. */
-export interface RecordingIndex {
-  /** Add or replace a recording that the proxy wrote. */
-  add(file: string, recording: Recording): void;
-  /**
-   * The recording with the most equal parts, and the parts that differ.
-   * Recordings of the same session come first, because a test usually
-   * sends the same requests as the last time it ran.
-   */
-  closest(
-    parts: RequestParts,
-    session: string | undefined,
-  ): Promise<{ file: string; differs: string[] } | undefined>;
-  /** The recordings that the session `session` recorded. */
-  filesOf(session: string): Promise<string[]>;
-}
-
-const entryOf = (file: string, recording: Recording): IndexEntry => ({
-  file,
-  session: recording.session,
-  parts: recording.request.parts,
-});
-
-/** Index the recordings of one rule directory. It reads them on first use. */
-export function createRecordingIndex(directory: string): RecordingIndex {
-  const entries = new Map<string, IndexEntry>();
-  let loaded: Promise<void> | undefined;
-  const load = async () => {
-    const names = await readdir(directory).catch((error: unknown) => {
-      if (isMissing(error)) return [];
-      throw error;
-    });
-    for (const name of names.filter((entry) => entry.endsWith(".json"))) {
-      const file = path.join(directory, name);
-      const recording = await readRecording(file);
-      if (recording && !entries.has(file)) {
-        entries.set(file, entryOf(file, recording));
-      }
+/**
+ * The store of the recordings in `directory`. To find the closest
+ * recording of a miss, it reads all recordings of the rule on the first
+ * miss of that rule, and then keeps them in memory.
+ */
+export function createFileStore(directory: string): RecordingStore {
+  const indexes = new Map<string, Promise<Map<string, IndexEntry>>>();
+  const indexOf = (rule: string) => {
+    let index = indexes.get(rule);
+    if (!index) {
+      index = loadIndex(directory, rule);
+      indexes.set(rule, index);
     }
+    return index;
   };
 
   return {
-    add(file, recording) {
-      entries.set(file, entryOf(file, recording));
+    async read(key) {
+      const text = await readText(path.join(directory, key));
+      return text === undefined ? undefined : (JSON.parse(text) as Recording);
     },
-    async closest(parts, session) {
-      await (loaded ??= load());
-      const all = [...entries.values()];
+
+    async write(recordings) {
+      const changed = await Promise.all(
+        recordings.map(async ([key, recording]) => {
+          const file = path.join(directory, key);
+          const content = formatRecording(recording);
+          // Keep a loaded index current, so later misses compare with it.
+          if (indexes.has(ruleOf(key))) {
+            (await indexOf(ruleOf(key))).set(key, entryOf(key, recording));
+          }
+          if ((await readText(file)) === content) return false;
+          await mkdir(path.dirname(file), { recursive: true });
+          await writeFile(file, content);
+          return true;
+        }),
+      );
+      return changed.filter(Boolean).length;
+    },
+
+    async closest(rule, parts, session) {
+      const all = [...(await indexOf(rule)).values()];
       const same = all.filter((entry) => entry.session === session);
       const found = closestRequest(
         parts,
         session !== undefined && same.length > 0 ? same : all,
       );
-      return found && { file: found.candidate.file, differs: found.differs };
+      return found && { key: found.candidate.key, differs: found.differs };
     },
-    async filesOf(session) {
-      await (loaded ??= load());
-      return [...entries.values()]
-        .filter((entry) => entry.session === session)
-        .map((entry) => entry.file);
+
+    async keysOf(session) {
+      const entries = await readdir(directory, { withFileTypes: true }).catch(
+        (error: unknown) => {
+          if (isMissing(error)) return [];
+          throw error;
+        },
+      );
+      const keys: string[] = [];
+      // Each rule is a directory. Skip other files, such as `.DS_Store`.
+      for (const rule of entries.filter((entry) => entry.isDirectory())) {
+        for (const entry of (await indexOf(rule.name)).values()) {
+          if (entry.session === session) keys.push(entry.key);
+        }
+      }
+      return keys;
     },
   };
+}
+
+const entryOf = (key: string, recording: Recording): IndexEntry => ({
+  key,
+  session: recording.session,
+  parts: recording.request.parts,
+});
+
+/** Read every recording of one rule, by key. */
+async function loadIndex(
+  directory: string,
+  rule: string,
+): Promise<Map<string, IndexEntry>> {
+  const names = await readdir(path.join(directory, rule)).catch(
+    (error: unknown) => {
+      if (isMissing(error)) return [];
+      throw error;
+    },
+  );
+  const index = new Map<string, IndexEntry>();
+  for (const name of names.filter((entry) => entry.endsWith(".json"))) {
+    const key = `${rule}/${name}`;
+    const text = await readText(path.join(directory, key));
+    if (text !== undefined) {
+      index.set(key, entryOf(key, JSON.parse(text) as Recording));
+    }
+  }
+  return index;
 }
 
 /**
@@ -152,7 +148,10 @@ export async function pruneRecordings(
   const recordings = (await readdir(directory, { recursive: true })).filter(
     (file) => file.endsWith(".json"),
   );
-  const unused = recordings.filter((file) => !used.has(file));
+  // Used files list keys, which use `/`. On Windows, `readdir` uses `\`.
+  const unused = recordings.filter(
+    (file) => !used.has(file.split(path.sep).join("/")),
+  );
   await Promise.all(unused.map((file) => rm(path.join(directory, file))));
   return unused.length;
 }
