@@ -8,7 +8,7 @@
  * process, such as a test worker.
  */
 import { spawn } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
 import https from "node:https";
 import { tmpdir } from "node:os";
@@ -238,7 +238,11 @@ export async function startRemoteRun(
   };
 }
 
-/** The proxy variables of a process, with the CA certificate in a file. */
+/**
+ * The proxy variables of a process, with the CA certificate in a file. The
+ * file also has the certificates of `NODE_EXTRA_CA_CERTS` of this process,
+ * so the process still trusts them.
+ */
 async function createProxyEnv(
   address: Pick<RoachAddress, "caCert" | "url">,
   noProxy: string,
@@ -246,7 +250,13 @@ async function createProxyEnv(
   // `NODE_EXTRA_CA_CERTS` takes a file.
   const caDirectory = await mkdtemp(path.join(tmpdir(), "roach-"));
   const caFile = path.join(caDirectory, "ca.pem");
-  await writeFile(caFile, address.caCert);
+  const extra = process.env.NODE_EXTRA_CA_CERTS;
+  await writeFile(
+    caFile,
+    extra
+      ? `${address.caCert.trimEnd()}\n${await readFile(extra, "utf8")}`
+      : address.caCert,
+  );
   return {
     env: {
       HTTP_PROXY: address.url,

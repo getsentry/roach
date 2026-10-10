@@ -61,6 +61,45 @@ console.log(describeRecordingStats(await run.close()));
 A client that does not use `client.ts` can do the same with plain HTTP. See
 [Control API](#control-api).
 
+## Use the GitHub Action
+
+A repository adds one step and a `roach.json` file:
+
+```yaml
+- uses: getsentry/roach@main
+  with:
+    token: ${{ secrets.ROACH_TOKEN }} # without it, the run can only replay
+    run: pnpm test
+```
+
+`roach.json` is at the root of the repository. It has the `rules` of the
+run, and can have `allow` (`RunConfig` in `src/service.ts`):
+
+```json
+{
+  "rules": [
+    {
+      "name": "model",
+      "match": { "method": "POST", "url": "https://ai-gateway.vercel.sh/" },
+      "keyHeaders": ["ai-model-id"]
+    }
+  ]
+}
+```
+
+The action (`src/action.ts`) starts a run of the tenant
+`GITHUB_REPOSITORY`, in `auto` mode with the token or `replay` mode without
+it. It runs `run` in bash with the proxy variables of the run, then ends
+the run and writes its stats to the job summary.
+
+- Only `run` uses the proxy. Later steps, such as cache and artifact
+  uploads, do not. `run` does not get the write token.
+- `run` is one session. When it fails, the run drops its new recordings. A
+  miss in `replay` mode fails the step. The summary names the job, not the
+  test, of each miss.
+- `NODE_EXTRA_CA_CERTS` works only for Node. Python and `curl` need a CA
+  bundle that also has the system certificates.
+
 ## Use a local proxy
 
 ```ts
@@ -80,7 +119,8 @@ await proxy.close();
 
 - `env` has `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `NODE_USE_ENV_PROXY`,
   and `NODE_EXTRA_CA_CERTS`. Node 24 reads the last two only at startup. A
-  process that is already running must set its own agents.
+  process that is already running must set its own agents. The CA file
+  also has the certificates of `NODE_EXTRA_CA_CERTS` of the caller.
 - `spawnRoach(config, { launcher })` runs the proxy with a command
   prefix, such as `sudo`. Use it when the caller cannot reach the network,
   but the proxy must.
@@ -357,7 +397,8 @@ pnpm check   # format, lint, types, unused code, and tests, as CI runs them
 - `tests/deployed.test.ts` runs the service as it runs in production: from
   the command line, behind a TLS server that does what the load balancer
   does, with a local GCS server, metadata server, and Sentry server. Each
-  CI job (`tests/ci-job.ts`) sets only the proxy variables of its run.
+  CI job runs the GitHub Action, and its command has only the proxy
+  variables of its run.
 
 ## Files
 
@@ -380,4 +421,5 @@ The proxy is in `src/`. Tests are in `tests/`. The production setup is in
 - `client.ts`: starts a remote run or a local proxy, and calls the control
   API.
 - `report.ts`: text reports of a run.
+- `action.ts`: the GitHub Action (`action.yml` at the root).
 - `cli.ts`: the command line.

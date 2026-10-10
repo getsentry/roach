@@ -1,0 +1,20 @@
+name: Roach
+description: Run a command with its HTTPS traffic recorded and replayed by the Roach service.
+
+inputs:
+  run:
+    description: The command to run, in bash. Only this command uses the proxy.
+    required: true
+  token:
+    description: >-
+      The write token of the service. Without it, the run can only replay,
+      as in jobs of forks. Give it only to workflows that you trust.
+    required: false
+  url:
+    description: The URL of the Roach service.
+    required: false
+    default: https://roach-proxy.getsentry.net
+
+runs:
+  using: node24
+  main: src/action.ts
