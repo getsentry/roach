@@ -4,7 +4,8 @@
 # and keeps them only in the state bucket (see versions.tf).
 project = "roach-511216"
 # Point an A record of this name at the ip_address output.
-domain = "roach-proxy.sentry.dev"
+# The record is in getsentry/ops (getsentry/ops#24232).
+domain = "roach-proxy.getsentry.net"
 
 # The origins of Junior's evals (packages/junior-evals/src/recording-rules.ts).
 allow = [
