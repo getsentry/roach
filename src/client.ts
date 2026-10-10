@@ -208,7 +208,7 @@ export interface RemoteRoach extends RemoteRun, RoachControl {
 /**
  * Start a run on a Roach service, such as `https://roach.example.com`.
  *
- * `token` is the token of the tenant. Only this call uses it. Without it,
+ * `token` is the write token of the service. Only this call uses it. Without it,
  * the service only allows `replay` mode, so CI jobs of forks can replay
  * without a secret. The run and its workers use the run token.
  */

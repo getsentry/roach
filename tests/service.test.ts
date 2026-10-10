@@ -33,7 +33,7 @@ async function startRun(
   const run = await startRemoteRun(
     { url: service.url, token },
     {
-      tenant: "alpha",
+      tenant: "acme/alpha",
       mode,
       rules: [
         { name: "model", match: { method: "POST", url: `${origin}/v1/` } },
@@ -99,7 +99,7 @@ beforeEach(async () => {
   service = await startRoachService({
     directory,
     allow: [origin],
-    tenants: { alpha: hash("alpha-token"), beta: hash("beta-token") },
+    writeTokenHash: hash("write-token"),
     secrets: ["service-secret-value-123"],
   });
 });
@@ -113,8 +113,8 @@ afterEach(async () => {
 });
 
 describe("roach service", () => {
-  it("writes with the tenant token and replays for anyone", async () => {
-    const writer = await startRun("alpha-token", "auto");
+  it("writes with the write token and replays for anyone", async () => {
+    const writer = await startRun("write-token", "auto");
     expect(await send(writer.url, { prompt: "hi" })).toMatchObject({
       source: "live",
     });
@@ -140,22 +140,31 @@ describe("roach service", () => {
     for (const mode of ["auto", "record", "off"] as const) {
       await expect(startRun(undefined, mode)).rejects.toThrow(/401/);
     }
-    // The token of another tenant does not count.
-    await expect(startRun("beta-token", "auto")).rejects.toThrow(/401/);
+    // A wrong token does not count.
+    await expect(startRun("not-the-token", "auto")).rejects.toThrow(/401/);
 
-    // Another tenant has its own recordings.
-    const beta = await startRun(undefined, "replay", { tenant: "beta" });
+    // Another tenant has its own recordings. The service has no list of
+    // tenants, so the write token works for a new one too.
+    const beta = await startRun(undefined, "replay", { tenant: "acme/beta" });
     expect(await send(beta.url, { prompt: "hi" })).toMatchObject({
       status: 412,
     });
-    expect(liveRequests).toBe(1);
-    expect(await recordings("alpha")).toHaveLength(1);
-    expect(await recordings("beta")).toEqual([]);
+    const newTenant = await startRun("write-token", "auto", {
+      tenant: "other-org/new.repo",
+    });
+    expect(await send(newTenant.url, { prompt: "hi" })).toMatchObject({
+      source: "live",
+    });
+    expect(await newTenant.close()).toMatchObject({ written: 1 });
+    expect(liveRequests).toBe(2);
+    expect(await recordings("acme/alpha")).toHaveLength(1);
+    expect(await recordings("acme/beta")).toEqual([]);
+    expect(await recordings("other-org/new.repo")).toHaveLength(1);
   });
 
   it("keeps the sessions of concurrent runs apart", async () => {
-    const first = await startRun("alpha-token", "auto");
-    const second = await startRun("alpha-token", "auto");
+    const first = await startRun("write-token", "auto");
+    const second = await startRun("write-token", "auto");
     const failing = await first.startSession("test");
     const passing = await second.startSession("test");
 
@@ -165,10 +174,13 @@ describe("roach service", () => {
     await failing.end(false);
     await passing.end(true);
 
-    expect(await recordings("alpha")).toHaveLength(1);
-    const [file] = await recordings("alpha");
+    expect(await recordings("acme/alpha")).toHaveLength(1);
+    const [file] = await recordings("acme/alpha");
     const recording = JSON.parse(
-      await readFile(path.join(directory, "alpha", "model", file!), "utf8"),
+      await readFile(
+        path.join(directory, "acme/alpha", "model", file!),
+        "utf8",
+      ),
     );
     expect(recording.session).toBe("test");
     expect(JSON.parse(recording.response.body).n).toBe(2);
@@ -177,7 +189,7 @@ describe("roach service", () => {
   });
 
   it("refuses callers without the right credentials", async () => {
-    const run = await startRun("alpha-token", "auto");
+    const run = await startRun("write-token", "auto");
     const bare = new URL(run.url);
     bare.username = "";
     bare.password = "";
@@ -192,24 +204,27 @@ describe("roach service", () => {
     wrong.password = "not-the-token";
     await expect(send(wrong.href, { prompt: "hi" })).rejects.toThrow(/407/);
 
+    // The tenant is a path in the store, so it must be owner/repo.
+    for (const tenant of ["junior", "acme/..", "../acme", "a/b/c", "acme/"]) {
+      await expect(startRun("write-token", "auto", { tenant })).rejects.toThrow(
+        /tenant must be owner\/repo/,
+      );
+    }
     await expect(
-      startRun("alpha-token", "auto", { tenant: "nobody" }),
-    ).rejects.toThrow(/tenant is not known/);
-    await expect(
-      startRun("alpha-token", "auto", { allow: ["https://example.com"] }),
+      startRun("write-token", "auto", { allow: ["https://example.com"] }),
     ).rejects.toThrow(/does not allow/);
     await expect(
-      startRun("alpha-token", "auto", {
+      startRun("write-token", "auto", {
         rules: [{ name: "../escape", match: {} }],
       }),
     ).rejects.toThrow(/rule name/);
     // A pattern runs for all runs, so only known patterns are allowed.
     await expect(
-      startRun("alpha-token", "auto", {
+      startRun("write-token", "auto", {
         rules: [{ name: "model", match: {}, values: { slow: "(a+)+$" } }],
       }),
     ).rejects.toThrow(/not a pattern that the service allows/);
-    await startRun("alpha-token", "auto", {
+    await startRun("write-token", "auto", {
       rules: [
         { name: "model", match: {}, values: { id: VALUE_PATTERNS.uuid } },
       ],
@@ -227,14 +242,17 @@ describe("roach service", () => {
     });
     expect(tooLarge.status).toBe(413);
 
-    // Anyone can start a run without a token, so a tenant has a cap on them.
+    // Anyone can start a run without a token, so the service has a cap on
+    // them. Another tenant name does not get around it.
     const open = await Promise.all(
-      Array.from({ length: 50 }, () => startRun(undefined, "replay")),
+      Array.from({ length: 100 }, () => startRun(undefined, "replay")),
     );
     await expect(startRun(undefined, "replay")).rejects.toThrow(/429/);
-    // The cap is per tenant, and runs with the token have none.
-    await startRun(undefined, "replay", { tenant: "beta" });
-    await startRun("alpha-token", "auto");
+    await expect(
+      startRun(undefined, "replay", { tenant: "acme/beta" }),
+    ).rejects.toThrow(/429/);
+    // Runs with the token have no cap.
+    await startRun("write-token", "auto");
     // An ended run frees its place.
     await open[0]!.close();
     await startRun(undefined, "replay");
@@ -255,7 +273,7 @@ describe("roach service", () => {
   });
 
   it("redacts request credentials and the secrets of the service", async () => {
-    const run = await startRun("alpha-token", "auto");
+    const run = await startRun("write-token", "auto");
     const response = await send(
       run.url,
       { prompt: "hi" },
@@ -268,9 +286,9 @@ describe("roach service", () => {
       key: "<<redacted>>",
       serviceSecret: "<<redacted>>",
     });
-    const [file] = await recordings("alpha");
+    const [file] = await recordings("acme/alpha");
     const text = await readFile(
-      path.join(directory, "alpha", "model", file!),
+      path.join(directory, "acme/alpha", "model", file!),
       "utf8",
     );
     expect(text).not.toContain("sk-live-request-key-456");

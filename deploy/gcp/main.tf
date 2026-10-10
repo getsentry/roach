@@ -58,11 +58,12 @@ resource "tls_self_signed_cert" "ca" {
   }
 }
 
-# One write token for each tenant. A run without a token can only replay.
-resource "random_password" "tenant" {
-  for_each = var.tenants
-  length   = 48
-  special  = false
+# The write token. All tenants share it, so a new project needs no change
+# here. A run without it can only replay. To change it:
+#   terraform apply -replace=random_password.write_token
+resource "random_password" "write_token" {
+  length  = 48
+  special = false
 }
 
 # The service config (`RoachServiceConfig` in src/service.ts). The VM reads
@@ -79,13 +80,13 @@ resource "google_secret_manager_secret_version" "config" {
   secret = google_secret_manager_secret.config.id
   secret_data = jsonencode(merge(
     {
-      host          = "0.0.0.0"
-      port          = local.port
-      publicUrl     = "https://${var.domain}"
-      bucket        = google_storage_bucket.recordings.name
-      allow         = var.allow
-      tenants       = { for name, token in random_password.tenant : name => sha256(token.result) }
-      valuePatterns = var.value_patterns
+      host           = "0.0.0.0"
+      port           = local.port
+      publicUrl      = "https://${var.domain}"
+      bucket         = google_storage_bucket.recordings.name
+      allow          = var.allow
+      writeTokenHash = sha256(random_password.write_token.result)
+      valuePatterns  = var.value_patterns
       ca = {
         cert = tls_self_signed_cert.ca.cert_pem
         key  = tls_private_key.ca.private_key_pem

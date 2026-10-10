@@ -14,7 +14,7 @@ terraform {
       version = "~> 4.4"
     }
   }
-  # The state holds the CA key and the tenant tokens. Keep it in a private
+  # The state holds the CA key and the write token. Keep it in a private
   # bucket, for example:
   # backend "gcs" {
   #   bucket = "my-terraform-state"

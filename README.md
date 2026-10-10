@@ -31,7 +31,7 @@ import { VALUE_PATTERNS } from "@sentry/roach/values";
 const run = await startRemoteRun(
   { url: "https://roach.example.com", token: process.env.ROACH_TOKEN },
   {
-    tenant: "junior",
+    tenant: process.env.GITHUB_REPOSITORY!, // such as getsentry/junior
     mode: "auto",
     name: `${process.env.GITHUB_RUN_ID}-${process.env.GITHUB_RUN_ATTEMPT}`,
     rules: [
@@ -198,14 +198,20 @@ give this hint, because it would have to read every recording.
 `cli.ts service <config.json>` starts the service. The config is
 `RoachServiceConfig` in `src/service.ts`. `deploy/gcp/` writes it for you.
 
-- **Tenants.** A tenant is a project, such as `junior`. Each tenant has a
-  write token. The config keeps only the SHA-256 of each token. The
-  recordings of a tenant are under `<tenant>/` in the bucket. Tenants never
-  share recordings.
+- **Tenants.** A tenant is a GitHub repository, as `owner/repo`, such as
+  `getsentry/junior`. In GitHub Actions, use `GITHUB_REPOSITORY`. The
+  service has no list of tenants, so a new project needs no change to the
+  service. The recordings of a tenant are under `<owner>/<repo>/` in the
+  bucket. Tenants never share recordings.
+- **One write token.** All tenants share one write token. The config keeps
+  only its SHA-256, in `writeTokenHash`. The tenant name is only a label,
+  not proof of identity: a job with the token can write the recordings of
+  any tenant. So give the token only to repositories and workflows that
+  you trust, and never to a workflow that runs code from a fork.
 - **Reads are public.** Anyone can start a `replay` run of a tenant, so CI
   jobs of forks replay without a secret. Such a run never writes, and it
   refuses a request that no rule records, so nothing goes live. Every
-  other mode needs the tenant token. So treat each recording as readable by
+  other mode needs the write token. So treat each recording as readable by
   anyone who can make its request. Do not record responses that must stay
   private.
 - **Runs.** Each run has its own id, token, mode, rules, sessions, and
@@ -229,8 +235,9 @@ give this hint, because it would have to read every recording.
 
 - Runs live in memory in one process. A restart ends the open runs, and
   their CI jobs fail. A run that is open for 6 hours ends as failed.
-- A tenant can have 50 open runs without a token. Another one gets HTTP
-  429 until one ends. Runs with the token have no cap.
+- The service can have 100 open runs without a token, for all tenants
+  together. Another one gets HTTP 429 until one ends. Runs with the token
+  have no cap.
 - A request body over 64 MiB gets HTTP 413.
 - GCS deletes each recording 30 days after it was written, also when runs
   still replay it. Then `auto` mode records it again, and `replay` mode
@@ -242,7 +249,7 @@ give this hint, because it would have to read every recording.
 `deploy/gcp/` is the production setup, in Terraform. It makes:
 
 - a GCS bucket that deletes each recording after `recording_days` (30),
-- the certificate authority and one write token for each tenant,
+- the certificate authority and the write token,
 - the service config, in Secret Manager,
 - one Container-Optimized OS VM that runs the image
   `ghcr.io/getsentry/roach:main`, with a service account that can only use
@@ -260,7 +267,7 @@ The `Image` workflow builds the image on each pull request and pushes it on
 2. Copy `deploy/gcp/roach.tfvars.example` to `roach.tfvars` and fill it in.
    `allow` and `value_patterns` must cover the rules of every tenant.
 3. Keep the Terraform state in a private bucket. It holds the CA key and the
-   tenant tokens. See the `backend "gcs"` comment in `versions.tf`.
+   write token. See the `backend "gcs"` comment in `versions.tf`.
 4. Apply:
 
    ```sh
@@ -271,15 +278,32 @@ The `Image` workflow builds the image on each pull request and pushes it on
 
 5. Point an A record of `domain` at the `ip_address` output. The
    certificate works some minutes after DNS does.
-6. Give each tenant its token as a CI secret, such as `ROACH_TOKEN`:
-   `terraform output -json tenant_tokens`.
+6. Put the write token in one GitHub organization secret, `ROACH_TOKEN`.
+   Give it access only to the repositories that you trust. This command
+   does not show the token:
+
+   ```sh
+   terraform output -raw write_token \
+     | gh secret set ROACH_TOKEN --org getsentry --visibility selected \
+         --repos getsentry/junior
+   ```
+
 7. Check it: `curl https://<domain>/__roach/ca.pem` returns the CA
    certificate.
 
 To deploy a new image, restart the VM:
-`gcloud compute instances reset roach --zone <zone>`. To add a tenant,
-add it to `tenants` and apply again. Terraform writes a new config version,
-and the VM reads it at its next start.
+`gcloud compute instances reset roach --zone <zone>`.
+
+To add a project, add its repository to the repositories of the
+`ROACH_TOKEN` organization secret, in the GitHub settings of the
+organization. Its CI jobs set `tenant` to `GITHUB_REPOSITORY`. When the
+project calls origins or uses value patterns that are not in
+`roach.tfvars` yet, add them and apply again. Terraform writes a new config version, and the
+VM reads it at its next start.
+
+To change the write token, run
+`terraform apply -var-file=roach.tfvars -replace=random_password.write_token`,
+set the secret again, and restart the VM.
 
 ## Command line
 
@@ -310,7 +334,7 @@ the run token or the token of the local proxy. `client.ts` calls them.
 The service also has:
 
 - `POST /__roach/runs` with a `RunConfig`: start a run. Send
-  `Authorization: Bearer <tenant token>` for any mode but `replay`. Returns
+  `Authorization: Bearer <write token>` for any mode but `replay`. Returns
   the `id`, `token`, proxy `url`, `controlUrl`, and `caCert` of the run.
 - `DELETE /__roach/runs/<id>`: end the run. Returns its stats.
 - `GET /__roach/ca.pem`: the CA certificate. No token.
