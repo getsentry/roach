@@ -1,5 +1,5 @@
 /**
- * The server of Roach. See `README.md`.
+ * The proxy sockets of the service (`service.ts`).
  *
  * The proxy is a forward proxy. It intercepts HTTPS with its own
  * certificate authority (`certificates.ts`). It gives each request that a
@@ -14,32 +14,16 @@
  * `missed` (`replay` mode had no recording), or `passthrough` (no rule
  * matched).
  */
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { timingSafeEqual } from "node:crypto";
 import http from "node:http";
 import https from "node:https";
 import { isIP, type Socket } from "node:net";
 import tls from "node:tls";
-import {
-  createCertificateAuthority,
-  type CertificateAuthority,
-} from "./certificates.ts";
-import {
-  createRecorder,
-  type ProxyRequest,
-  type Recorder,
-} from "./recorder.ts";
-import path from "node:path";
-import { createFileStore } from "./recordings.ts";
-import type { RoachAddress, RoachConfig } from "./types.ts";
+import type { CertificateAuthority } from "./certificates.ts";
+import type { ProxyRequest, Recorder } from "./recorder.ts";
 
 /** The path prefix of the control API. */
 export const CONTROL_PATH = "/__roach";
-
-/** A proxy that runs in this process. Most callers use `client.ts`. */
-export interface RoachServer extends RoachAddress {
-  /** Stop the proxy. A session that is still open fails. */
-  close(): Promise<void>;
-}
 
 /** Headers for one connection, which the proxy must not forward. */
 const HOP_HEADERS = new Set([
@@ -294,29 +278,6 @@ export async function controlRecorder(
   }
 }
 
-/** Answer one request to the control API of a local proxy. */
-async function control(
-  recorder: Recorder,
-  token: string,
-  incoming: http.IncomingMessage,
-  outgoing: http.ServerResponse,
-): Promise<void> {
-  if (!sameToken(incoming.headers.authorization, `Bearer ${token}`)) {
-    outgoing.writeHead(401).end();
-    return;
-  }
-  const pathname = new URL(incoming.url ?? "/", "http://proxy").pathname;
-  const handled =
-    pathname.startsWith(`${CONTROL_PATH}/`) &&
-    (await controlRecorder(
-      recorder,
-      `${incoming.method} ${pathname.slice(CONTROL_PATH.length)}`,
-      incoming,
-      outgoing,
-    ));
-  if (!handled) outgoing.writeHead(404).end();
-}
-
 /** Where a proxied request goes: the allowed origins and the recorder. */
 export interface ProxyTarget {
   origins: Map<string, URL>;
@@ -399,8 +360,8 @@ function serveProxied(
 
 /**
  * Listen for proxied requests and control requests on one port. The
- * caller decides the target of each proxied request, so one port can serve
- * one run (`startRoach()`) or many runs (`service.ts`).
+ * caller decides the target of each proxied request, so one port serves
+ * many runs.
  */
 export async function listenProxy(
   options: ListenOptions,
@@ -526,47 +487,6 @@ export async function listenProxy(
         for (const socket of sockets) socket.destroy();
       });
       tunnelServer.close();
-    },
-  };
-}
-
-/** Start the proxy in this process, on a free port of `127.0.0.1`. */
-export async function startRoach(config: RoachConfig): Promise<RoachServer> {
-  if (
-    config.missDirectory &&
-    !path
-      .relative(config.directory, path.resolve(config.missDirectory))
-      .startsWith("..")
-  ) {
-    // Miss files hold request bodies. Keep them out of the committed files.
-    throw new Error("missDirectory must not be inside directory");
-  }
-  const target: ProxyTarget = {
-    origins: parseOrigins(config.allow),
-    recorder: createRecorder(config, createFileStore(config.directory)),
-  };
-  const authority = await createCertificateAuthority();
-  const token = randomBytes(24).toString("hex");
-  // Only local processes reach this port, so proxied requests need no
-  // credentials.
-  const listening = await listenProxy({
-    host: "127.0.0.1",
-    port: 0,
-    authority,
-    targetFor: () => target,
-    control: (incoming, outgoing) =>
-      control(target.recorder, token, incoming, outgoing),
-  });
-
-  return {
-    url: `http://127.0.0.1:${listening.port}`,
-    token,
-    caCert: authority.caCert,
-    async close() {
-      target.closed = true;
-      await listening.close();
-      await target.recorder.close();
-      await authority.close();
     },
   };
 }

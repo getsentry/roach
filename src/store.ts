@@ -1,23 +1,19 @@
 /**
  * Recordings, and the contract of a store that keeps them.
  *
- * A recording keeps the response of one request, the session (test) that
- * recorded it, and the parts of the request (`request-key.ts`). It does not keep
- * the request body, so prompts and other inputs are not stored.
+ * A recording keeps the response of one request, and the session (test)
+ * that recorded it. It does not keep the request body, so prompts and other
+ * inputs are not stored.
  *
- * A store keeps recordings by key, `<rule>/<hash>.json`. The file store
- * (`recordings.ts`) keeps them in a directory that can be committed. The
- * GCS store (`gcs.ts`) keeps them in a bucket, for the shared service
- * (`service.ts`).
+ * A store keeps recordings by key, `<rule>/<hash>.json`. The GCS store
+ * (`gcs.ts`) keeps them in a bucket. The file store (`recordings.ts`) keeps
+ * them in a directory, for tests and development.
  */
-/** A short hash of each part of a request, by part name. */
-export type RequestParts = Record<string, string>;
-
 /** One recorded response. */
 export interface Recording {
   /** The session (test) that recorded the response. */
   session?: string | undefined;
-  request: { method: string; url: string; parts: RequestParts };
+  request: { method: string; url: string };
   response: {
     status: number;
     headers: Record<string, string>;
@@ -31,34 +27,12 @@ export interface Recording {
   };
 }
 
-/** The recording with the most equal parts, and the parts that differ. */
-interface ClosestRecording {
-  key: string;
-  differs: string[];
-}
-
-/** Where the recordings of a proxy are. */
+/** Where the recordings of a tenant are. */
 export interface RecordingStore {
   /** The recording of `key`, or `undefined` when there is none. */
   read(key: string): Promise<Recording | undefined>;
   /** Write recordings by key. Returns how many were new or changed. */
   write(recordings: Array<[string, Recording]>): Promise<number>;
-  /**
-   * The recording of `rule` with the most equal parts. Recordings of the
-   * same session come first, because a test usually sends the same
-   * requests as the last time it ran. Only the file store has this: it is a
-   * hint for debugging a miss, and a bucket has no index for it.
-   */
-  closest?(
-    rule: string,
-    parts: RequestParts,
-    session: string | undefined,
-  ): Promise<ClosestRecording | undefined>;
-  /**
-   * The keys that `session` recorded. Only the file store has this,
-   * because only it supports `usedFile` and prune.
-   */
-  keysOf?(session: string): Promise<string[]>;
 }
 
 /** A rule name that a store accepts. It is a directory name. */

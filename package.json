@@ -2,7 +2,7 @@
   "name": "@sentry/roach",
   "version": "0.0.0",
   "private": true,
-  "description": "A recording HTTPS proxy for tests, as a shared service or a local process.",
+  "description": "A recording HTTPS proxy for tests, as a shared service.",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
@@ -15,7 +15,6 @@
   "exports": {
     "./client": "./src/client.ts",
     "./report": "./src/report.ts",
-    "./server": "./src/server.ts",
     "./service": "./src/service.ts",
     "./types": "./src/types.ts",
     "./values": "./src/values.ts"

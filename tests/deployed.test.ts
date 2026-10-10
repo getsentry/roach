@@ -353,7 +353,7 @@ describe("deployed roach", () => {
     const miss = await ciJob({ runId: "miss", prompt: "bye" });
     expect(miss.response.status).toBe(412);
     expect(miss.exitCode).toBe(1);
-    expect(miss.summary).toMatch(/^- test: model model\/[0-9a-f]{64}\.json /m);
+    expect(miss.summary).toMatch(/^- test: model\/[0-9a-f]{64}\.json$/m);
     expect(liveRequests).toBe(1);
 
     // The service sends its metrics when it stops.

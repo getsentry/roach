@@ -1,6 +1,6 @@
 /**
- * The public types of Roach: its configuration and its
- * results. See `README.md`.
+ * The public types of Roach: rules, modes, and the results of a run. See
+ * `README.md`.
  */
 import type { ValuePatterns } from "./values.ts";
 
@@ -42,42 +42,6 @@ export interface RecordingRule {
   values?: ValuePatterns;
 }
 
-/**
- * The configuration of one local proxy (`server.ts`). The shared service
- * (`service.ts`) has its own configuration.
- */
-export interface RoachConfig {
-  /** The directory of the recordings. Each rule has a subdirectory. */
-  directory: string;
-  mode: RecordingMode;
-  /**
-   * The only origins that the proxy sends requests to, such as
-   * `https://ai-gateway.vercel.sh`. The proxy refuses all other origins.
-   */
-  allow: string[];
-  rules: RecordingRule[];
-  /**
-   * When the proxy stops, it lists here the recordings that sessions used.
-   * A failed session uses all recordings that it recorded before. Give these
-   * files to the `prune` command.
-   */
-  usedFile?: string;
-  /**
-   * For each miss, the proxy writes the request as the key sees it to
-   * `<missDirectory>/<rule>/<key>.json`. These files contain request
-   * bodies, such as prompts, so do not commit them. It must not be inside
-   * `directory`.
-   */
-  missDirectory?: string;
-  /**
-   * Credentials that the proxy must never write, such as API keys. The
-   * proxy also learns the values of headers that can carry credentials,
-   * such as `authorization`, from each request. It redacts them in
-   * recordings and miss files.
-   */
-  secrets?: string[];
-}
-
 /** A request that a rule matched, but that had no recording. */
 export interface RecordingMiss {
   rule: string;
@@ -85,13 +49,9 @@ export interface RecordingMiss {
   session?: string | undefined;
   /** The key of the recording that the request needed. */
   file: string;
-  /** The key of the recording with the most equal parts. */
-  closest?: string | undefined;
-  /** The parts that differ from `closest`, such as `messages[3]`. */
-  differs: string[];
 }
 
-/** The totals of a proxy run. */
+/** The totals of a run. */
 export interface RecordingStats {
   /**
    * Requests by rule name. `missed` counts the requests that `replay` mode
@@ -109,16 +69,4 @@ export interface RecordingStats {
    * recorded. Use this to find traffic that a rule misses.
    */
   passthrough: Record<string, number>;
-}
-
-/** The address of a running proxy. Give it to the processes that use it. */
-export interface RoachAddress {
-  /** The proxy URL, such as `http://127.0.0.1:1234`. */
-  url: string;
-  /** The bearer token of the control API. */
-  token: string;
-  /** The base URL of the control API. Default: `<url>/__roach`. */
-  controlUrl?: string;
-  /** The PEM certificate of the authority that signs intercepted hosts. */
-  caCert: string;
 }
