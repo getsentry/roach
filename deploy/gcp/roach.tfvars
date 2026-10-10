@@ -1,7 +1,10 @@
-# Copy to roach.tfvars, fill in, then:
+# The production deployment of Roach for Sentry. Apply with:
 #   terraform init && terraform apply -var-file=roach.tfvars
-project = "my-gcp-project"
-domain  = "roach.example.com"
+# This file holds no secrets. Terraform makes the CA key and the write token,
+# and keeps them only in the state bucket (see versions.tf).
+project = "roach-511216"
+# Point an A record of this name at the ip_address output.
+domain = "roach-proxy.sentry.dev"
 
 # The origins of Junior's evals (packages/junior-evals/src/recording-rules.ts).
 allow = [
@@ -18,4 +21,4 @@ value_patterns = [
   "(?<=event_id=)[0-9a-f]{32}(?![0-9A-Za-z])",
 ]
 
-# sentry_dsn = "https://...@o1.ingest.sentry.io/..."
+# To send metrics to Sentry, set TF_VAR_sentry_dsn when you apply.
