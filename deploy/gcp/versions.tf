@@ -14,12 +14,12 @@ terraform {
       version = "~> 4.4"
     }
   }
-  # The state holds the CA key and the write token. Keep it in a private
-  # bucket, for example:
-  # backend "gcs" {
-  #   bucket = "my-terraform-state"
-  #   prefix = "roach"
-  # }
+  # The state holds the CA key and the write token. It is in a private
+  # bucket of the project. Another deployment changes the bucket here.
+  backend "gcs" {
+    bucket = "roach-511216-tfstate-dc-k4m9v2qx"
+    prefix = "roach"
+  }
 }
 
 provider "google" {

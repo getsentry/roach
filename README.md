@@ -264,11 +264,15 @@ The `Image` workflow builds the image on each pull request and pushes it on
 
 1. Make the package `ghcr.io/getsentry/roach` public once, after the first
    push to `main`, so the VM can pull it without credentials.
-2. Copy `deploy/gcp/roach.tfvars.example` to `roach.tfvars` and fill it in.
-   `allow` and `value_patterns` must cover the rules of every tenant.
-3. Keep the Terraform state in a private bucket. It holds the CA key and the
-   write token. See the `backend "gcs"` comment in `versions.tf`.
-4. Apply:
+2. `deploy/gcp/roach.tfvars` has the values of the Sentry deployment: the
+   GCP project `roach-511216`, the domain, `allow`, and `value_patterns`.
+   `allow` and `value_patterns` must cover the rules of every tenant. Another
+   deployment changes these values.
+3. The Terraform state is in the private bucket that `backend "gcs"` in
+   `versions.tf` names. The state holds the CA key and the write token, so
+   the bucket must stay private. Make the bucket before the first
+   `terraform init`.
+4. Log in with `gcloud auth application-default login`, then apply:
 
    ```sh
    cd deploy/gcp
