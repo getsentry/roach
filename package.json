@@ -38,7 +38,7 @@
   },
   "devDependencies": {
     "@sentry/dotagents": "^3.3.0",
-    "@types/node": "^24.19.1",
+    "@types/node": "^26.6.4",
     "@vitest/coverage-v8": "^5.0.3",
     "knip": "^6.40.0",
     "lint-staged": "^17.6.0",
