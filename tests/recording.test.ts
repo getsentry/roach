@@ -1,5 +1,10 @@
+/**
+ * Recording and replay: modes, sessions, changing values, and misses. Each
+ * test starts runs on a service with a local upstream.
+ */
+import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
-import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { ProxyAgent, request } from "undici";
@@ -11,11 +16,13 @@ import {
   it,
   onTestFinished,
 } from "vitest";
-import { connectRoach } from "../src/client.ts";
-import { pruneRecordings } from "../src/recordings.ts";
-import { startRoach, type RoachServer } from "../src/server.ts";
-import type { RecordingMode, RoachConfig } from "../src/types.ts";
+import { startRemoteRun, type RemoteRoach } from "../src/client.ts";
+import { startRoachService, type RoachService } from "../src/service.ts";
+import type { RecordingMode } from "../src/types.ts";
 import { VALUE_PATTERNS } from "../src/values.ts";
+
+const TOKEN = "write-token";
+const TENANT = "acme/alpha";
 
 let upstream: Server;
 let origin: string;
@@ -25,33 +32,35 @@ let respond: (body: string) => string;
 /** The upstream answers when this settles. */
 let upstreamGate: Promise<void>;
 let directory: string;
-let proxy: RoachServer | undefined;
+let service: RoachService;
+const runs: RemoteRoach[] = [];
 let agent: ProxyAgent | undefined;
 
-async function start(
-  mode: RecordingMode,
-  options: Pick<RoachConfig, "missDirectory" | "secrets" | "usedFile"> = {},
-): Promise<RoachServer> {
-  proxy = await startRoach({
-    directory,
-    mode,
-    allow: [origin],
-    rules: [
-      {
-        name: "model",
-        match: { method: "POST", url: `${origin}/v1/` },
-        values: {
-          uuid: VALUE_PATTERNS.uuid,
-          time: VALUE_PATTERNS.isoTime,
-          commit: VALUE_PATTERNS.gitCommit,
+/** Start a run with the write token. Later requests go through it. */
+async function start(mode: RecordingMode): Promise<RemoteRoach> {
+  const run = await startRemoteRun(
+    { url: service.url, token: TOKEN },
+    {
+      tenant: TENANT,
+      mode,
+      rules: [
+        {
+          name: "model",
+          match: { method: "POST", url: `${origin}/v1/` },
+          values: {
+            uuid: VALUE_PATTERNS.uuid,
+            time: VALUE_PATTERNS.isoTime,
+            commit: VALUE_PATTERNS.gitCommit,
+          },
         },
-      },
-    ],
-    ...options,
-  });
+      ],
+    },
+  );
+  runs.push(run);
+  await agent?.close();
   // Tunnel plain HTTP too, so the tests use `CONNECT` as HTTPS clients do.
-  agent = new ProxyAgent({ uri: proxy.url, proxyTunnel: true });
-  return proxy;
+  agent = new ProxyAgent({ uri: run.url, proxyTunnel: true });
+  return run;
 }
 
 /** One delta event of an Anthropic Messages stream. */
@@ -76,15 +85,15 @@ async function send(bodies: unknown[], target = `${origin}/v1/messages`) {
 }
 
 /** Send the requests of one test session, then end it. */
-async function session(running: RoachServer, bodies: unknown[], passed = true) {
-  const opened = await connectRoach(running).startSession("test");
+async function session(running: RemoteRoach, bodies: unknown[], passed = true) {
+  const opened = await running.startSession("test");
   const responses = await send(bodies);
   const { missed } = await opened.end(passed);
   return Object.assign(responses, { missed });
 }
 
 async function files(): Promise<string[]> {
-  return readdir(path.join(directory, "model")).catch(() => []);
+  return readdir(path.join(directory, TENANT, "model")).catch(() => []);
 }
 
 beforeEach(async () => {
@@ -108,24 +117,28 @@ beforeEach(async () => {
   if (!address || typeof address === "string") throw new Error("No port");
   origin = `http://127.0.0.1:${address.port}`;
   directory = await mkdtemp(path.join(tmpdir(), "roach-"));
+  service = await startRoachService({
+    directory,
+    allow: [origin],
+    writeTokenHash: createHash("sha256").update(TOKEN).digest("hex"),
+  });
 });
 
 afterEach(async () => {
   await agent?.close();
   agent = undefined;
-  await proxy?.close();
-  proxy = undefined;
+  await Promise.all(runs.splice(0).map((run) => run.close().catch(() => {})));
+  await service.close();
   await new Promise<void>((resolve) => upstream.close(() => resolve()));
   await rm(directory, { recursive: true, force: true });
 });
 
-describe("roach", () => {
+describe("recording", () => {
   it("replays a passed session for the same requests in auto mode", async () => {
     const running = await start("auto");
     await session(running, [
       { model: "m", messages: [{ content: "hi", at: "2026-10-07T03:18:03Z" }] },
     ]);
-    const [first] = await files();
 
     // Same request with other key order and another clock time.
     const replay = await session(running, [
@@ -141,18 +154,14 @@ describe("roach", () => {
       { body: "data: 2\n\n", source: "live" },
     ]);
     expect(liveRequests).toBe(2);
-    await expect(connectRoach(running).stats()).resolves.toEqual({
+    await expect(running.stats()).resolves.toEqual({
       counts: { model: { live: 2, missed: 0, replayed: 1 } },
-      // The miss names the closest recording of the test and the part
-      // of the request that differs from it.
       misses: [
         expect.objectContaining({ session: "test" }),
         {
           rule: "model",
           session: "test",
           file: expect.stringMatching(/^model\/[0-9a-f]{64}\.json$/),
-          closest: `model/${first}`,
-          differs: ["messages[0]"],
         },
       ],
       written: 2,
@@ -208,7 +217,7 @@ describe("roach", () => {
     ]);
     const [file] = await files();
     const recording = await readFile(
-      path.join(directory, "model", file!),
+      path.join(directory, TENANT, "model", file!),
       "utf8",
     );
     expect(recording).toContain("<<uuid:1>>");
@@ -261,48 +270,10 @@ describe("roach", () => {
     expect(replay.missed).toBe(1);
     expect(liveRequests).toBe(1);
     await expect(files()).resolves.toEqual(recorded);
-    await expect(connectRoach(running).stats()).resolves.toMatchObject({
+    await expect(running.stats()).resolves.toMatchObject({
       counts: { model: { live: 0, missed: 1, replayed: 1 } },
-      misses: [{ closest: `model/${recorded[0]}`, differs: ["model"] }],
+      misses: [{ rule: "model", session: "test" }],
     });
-  });
-
-  it("redacts credentials in recordings and miss files", async () => {
-    // Miss files must not be inside the recordings directory.
-    const missDirectory = `${directory}-misses`;
-    onTestFinished(() => rm(missDirectory, { recursive: true, force: true }));
-    const running = await start("auto", {
-      missDirectory,
-      // Each part of this value is short, so only the whole value matches.
-      secrets: ["cfg-secret=012345"],
-    });
-    // The upstream repeats the credential of the request header.
-    respond = () => `data: key-from-header-0123456789\n\n`;
-    const opened = await connectRoach(running).startSession("test");
-    const response = await request(`${origin}/v1/messages`, {
-      body: JSON.stringify({ model: "m", note: "cfg-secret=012345" }),
-      dispatcher: agent!,
-      // Any header whose name can mean a credential is learned.
-      headers: { "x-custom-auth": "Bearer key-from-header-0123456789" },
-      method: "POST",
-    });
-    await opened.end(true);
-
-    expect(await response.body.text()).toBe("data: <<redacted>>\n\n");
-    const [recorded] = await files();
-    const recording = await readFile(
-      path.join(directory, "model", recorded!),
-      "utf8",
-    );
-    expect(recording).toContain("<<redacted>>");
-    expect(recording).not.toContain("key-from-header-0123456789");
-    const [miss] = await readdir(path.join(missDirectory, "model"));
-    const text = await readFile(
-      path.join(missDirectory, "model", miss!),
-      "utf8",
-    );
-    expect(text).toContain("<<redacted>>");
-    expect(text).not.toContain("cfg-secret=012345");
   });
 
   it("sends no request to another origin", async () => {
@@ -312,7 +283,7 @@ describe("roach", () => {
     // refuses it in a tunnel and as an absolute-form request.
     const other = `${origin.replace("127.0.0.1", "localhost")}/v1/messages`;
     await expect(send([{}], other)).rejects.toThrow("403");
-    const absolute = new ProxyAgent({ uri: proxy!.url, proxyTunnel: false });
+    const absolute = new ProxyAgent({ uri: runs[0]!.url, proxyTunnel: false });
     onTestFinished(() => absolute.close());
     const response = await request(other, { dispatcher: absolute });
     await response.body.dump();
@@ -320,30 +291,11 @@ describe("roach", () => {
     expect(liveRequests).toBe(0);
   });
 
-  it("refuses control requests without the token", async () => {
-    const running = await start("auto");
-
-    await expect(
-      connectRoach({ url: running.url, token: "wrong" }).stats(),
-    ).rejects.toThrow("HTTP 401");
-  });
-
-  it("writes nothing for a failed session", async () => {
-    // A file next to the rule directories is not a rule.
-    await writeFile(path.join(directory, ".DS_Store"), "");
-    const running = await start("auto");
-    await session(running, [{ model: "m" }], false);
-    await session(running, [{ model: "m" }], false);
-
-    expect(liveRequests).toBe(2);
-    await expect(files()).resolves.toEqual([]);
-  });
-
   it("writes a request that ends after its passed session", async () => {
     const running = await start("auto");
     let open!: () => void;
     upstreamGate = new Promise((resolve) => (open = resolve));
-    const opened = await connectRoach(running).startSession("test");
+    const opened = await running.startSession("test");
     const pending = send([{ model: "m" }]);
     // Wait until the request reaches the upstream, then end the test.
     // The upstream server changes `liveRequests`, not this loop.
@@ -356,46 +308,6 @@ describe("roach", () => {
     const [replayed] = await session(running, [{ model: "m" }]);
     expect(replayed!.source).toBe("replayed");
     expect(liveRequests).toBe(1);
-  });
-
-  it("lists used recordings and prunes the others", async () => {
-    const usedFile = path.join(
-      directory,
-      "..",
-      `${path.basename(directory)}.used`,
-    );
-    const running = await start("auto", { usedFile });
-    await session(running, [{ model: "m" }, { model: "n" }]);
-    const recorded = (await files()).toSorted();
-    const contents = await Promise.all(
-      recorded.map((file) => readFile(path.join(directory, "model", file))),
-    );
-    const stale = JSON.parse(contents[0]!.toString("utf8"));
-    await writeFile(
-      path.join(directory, "model", "stale.json"),
-      JSON.stringify({ ...stale, session: "removed test" }),
-    );
-
-    // A replay neither writes a file again nor makes it unused. The test
-    // fails before its second request, and its recordings stay in use.
-    await session(running, [{ model: "m" }], false);
-    await running.close();
-    proxy = undefined;
-
-    await expect(readFile(usedFile, "utf8")).resolves.toBe(
-      recorded.map((file) => `model/${file}\n`).join(""),
-    );
-    await expect(pruneRecordings(directory, [usedFile])).resolves.toBe(1);
-    await expect(files().then((names) => names.toSorted())).resolves.toEqual(
-      recorded,
-    );
-    await expect(
-      Promise.all(
-        recorded.map((file) => readFile(path.join(directory, "model", file))),
-      ),
-    ).resolves.toEqual(contents);
-    expect(liveRequests).toBe(2);
-    await rm(usedFile);
   });
 
   it("records again in record mode", async () => {

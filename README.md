@@ -5,15 +5,11 @@ replays them, so a second run of a test suite makes no live calls. The
 proxy owns every read and write of the recordings. A test runner only gives
 it rules and tells it when each test starts and ends.
 
-Roach runs in one of two ways:
-
-- **A shared service** (`service.ts`): one deployed proxy for many
-  projects and CI runs. A client points `HTTPS_PROXY` at it and trusts its
-  certificate authority. It installs nothing else. The recordings are in a
-  GCS bucket, which deletes each one 30 days after it was written. See
-  [Service](#service) and [Deploy](#deploy).
-- **A local proxy** (`server.ts`): a process in the process tree of the
-  test run, with the recordings in JSON files that you commit to git.
+Roach is a shared service (`service.ts`): one deployed proxy for many
+projects and CI runs. A client points `HTTPS_PROXY` at it and trusts its
+certificate authority. It installs nothing else. The recordings are in a
+GCS bucket, which deletes each one 30 days after it was written. See
+[Service](#service) and [Deploy](#deploy).
 
 Roach started in
 [`getsentry/junior`](https://github.com/getsentry/junior/tree/main/packages/junior-evals/src/roach).
@@ -46,9 +42,9 @@ const run = await startRemoteRun(
 );
 spawn("vitest", { env: { ...process.env, ...run.env } });
 
-// Once per test, in a worker that has the `url`, `controlUrl`, and `token`
-// of the run.
-const session = await connectRoach({ url, controlUrl, token }).startSession(
+// Once per test, in a worker that has the `controlUrl` and `token` of the
+// run.
+const session = await connectRoach({ controlUrl, token }).startSession(
   testName,
 );
 const { missed } = await session.end(passed);
@@ -58,40 +54,56 @@ const { missed } = await session.end(passed);
 console.log(describeRecordingStats(await run.close()));
 ```
 
+`run.env` has `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `NODE_USE_ENV_PROXY`,
+and `NODE_EXTRA_CA_CERTS`. Node 24 reads the last two only at startup. The
+CA file also has the certificates of `NODE_EXTRA_CA_CERTS` of the caller.
 A client that does not use `client.ts` can do the same with plain HTTP. See
 [Control API](#control-api).
 
-## Use a local proxy
+## Use the GitHub Action
 
-```ts
-import { spawnRoach } from "@sentry/roach/client";
+A repository adds one step and a `roach.json` file:
 
-const proxy = await spawnRoach({
-  directory: "recordings",
-  mode: "auto",
-  allow: ["https://ai-gateway.vercel.sh"],
-  rules: [/* as above */],
-});
-spawn("vitest", { env: { ...process.env, ...proxy.env } });
-// Sessions as above, with connectRoach({ url: proxy.url, token: proxy.token }).
-console.log(describeRecordingStats(await proxy.stats()));
-await proxy.close();
+```yaml
+- uses: getsentry/roach@v0
+  with:
+    token: ${{ secrets.ROACH_TOKEN }} # without it, the run can only replay
+    run: pnpm test
 ```
 
-- `env` has `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `NODE_USE_ENV_PROXY`,
-  and `NODE_EXTRA_CA_CERTS`. Node 24 reads the last two only at startup. A
-  process that is already running must set its own agents.
-- `spawnRoach(config, { launcher })` runs the proxy with a command
-  prefix, such as `sudo`. Use it when the caller cannot reach the network,
-  but the proxy must.
+`roach.json` is at the root of the repository. It has the `rules` of the
+run, and can have `allow` (`RunConfig` in `src/service.ts`):
+
+```json
+{
+  "rules": [
+    {
+      "name": "model",
+      "match": { "method": "POST", "url": "https://ai-gateway.vercel.sh/" },
+      "keyHeaders": ["ai-model-id"]
+    }
+  ]
+}
+```
+
+The action (`src/action.ts`) starts a run of the tenant
+`GITHUB_REPOSITORY`, in `auto` mode with the token or `replay` mode without
+it. It runs `run` in bash with the proxy variables of the run, then ends
+the run and writes its stats to the job summary.
+
+- Only `run` uses the proxy. Later steps, such as cache and artifact
+  uploads, do not. `run` does not get the write token.
+- `run` is one session. When it fails, the run drops its new recordings. A
+  miss in `replay` mode fails the step. The summary names the job, not the
+  test, of each miss.
+- `NODE_EXTRA_CA_CERTS` works only for Node. Python and `curl` need a CA
+  bundle that also has the system certificates.
 
 ## Config
 
-A local proxy takes `RoachConfig` (`src/types.ts`). A run on the service
-takes `RunConfig` (`src/service.ts`): `tenant`, `mode`, `rules`, `allow`,
-and `name`. The fields below mean the same in both.
+A run takes `RunConfig` (`src/service.ts`): `tenant`, `mode`, `rules`,
+`allow`, and `name`.
 
-- `directory`: where the recordings are. Each rule has a subdirectory.
 - `mode`: `auto` replays recordings and records misses. `replay` replays
   recordings and fails a miss with HTTP 412, so nothing goes live. `record`
   sends every request live and records it again. `off` records and replays
@@ -103,20 +115,11 @@ and `name`. The fields below mean the same in both.
   and `-`. `match` has `method`, `url` (a prefix),
   and `headers`. `keyHeaders` adds request headers to the key. `values`
   names the values that change from run to run.
-- `usedFile`: when the proxy stops, it lists here the recordings that
-  sessions used. A failed session uses all recordings that it recorded
-  before, because it stops early. `cli.ts prune` takes these files. Only
-  for `directory`.
-- `missDirectory`: for each miss, the proxy writes the request as the key
-  sees it, and its diagnosis, to `<missDirectory>/<rule>/<key>.json`. These
-  files contain request bodies, but no request headers except `keyHeaders`.
-  Do not commit them. The proxy refuses a `missDirectory` inside
-  `directory`.
-- `secrets`: credentials that the proxy must never write. The proxy also
-  learns the value of each request header whose name can mean a credential,
+- Credentials: the proxy never writes the `secrets` of the service config.
+  It also learns the value of each request header whose name can mean a credential,
   such as one with `auth`, `token`, `key`, `secret`, `cookie`, or `session`.
-  The match is broad on purpose. Recordings and miss files show
-  `<<redacted>>` in place of each known value.
+  The match is broad on purpose. Recordings show `<<redacted>>` in place of
+  each known value.
 
 Requests that match no rule go live without a change, and their responses
 stream. Each response has an `x-roach` header: `replayed`, `live`,
@@ -124,11 +127,10 @@ stream. Each response has an `x-roach` header: `replayed`, `live`,
 
 ## Recordings
 
-The key of a recording is `<rule>/<hash>.json`. The file store keeps it at
-`<directory>/<key>`. The hash is the hash of the
-rule, the method, the URL, the key headers, and the body. A JSON body has
-sorted keys. A recording keeps the response, the session that recorded it,
-and a short hash of each part of the request. It does not keep the request
+The key of a recording is `<rule>/<hash>.json`, under `<tenant>/` in the
+store. The hash is the hash of the rule, the method, the URL, the key
+headers, and the body. A JSON body has sorted keys. A recording keeps the
+response and the session that recorded it. It does not keep the request
 body.
 
 - One session is open at a time. The proxy keeps the new recordings of a
@@ -180,18 +182,9 @@ real way use the same recording.
 
 ## Misses
 
-The parts of a request are the method, the URL, each key header, each
-top-level field of a JSON body, and each item of a top-level array, such as
-`messages[3]`. The proxy adds each request without a recording to
-`stats().misses`. `describeRecordingMisses()` in `report.ts` gives the
+The proxy adds each request without a recording to `stats().misses`, with
+its session and key. `describeRecordingMisses()` in `report.ts` gives the
 first miss of each test, which is the one to fix.
-
-With the file store, the proxy also finds the recording with the most
-equal parts, from the same session if it can, and logs the parts that
-differ. This is only a hint to debug a miss. It never makes a replay. To
-find it, the file store reads all recordings of a rule on the first miss of
-that rule in a run, and then keeps them in memory. The GCS store does not
-give this hint, because it would have to read every recording.
 
 ## Service
 
@@ -313,21 +306,14 @@ set the secret again, and restart the VM.
 
 ```sh
 node src/cli.ts service <config.json>
-node src/cli.ts serve < config.json
-node src/cli.ts prune <directory> <used-file>...
 ```
 
-`service` starts the shared service. `serve` starts a local proxy and prints
-its address as one JSON line. `client.ts` runs it. `prune` deletes the
-recordings that no used file lists. Give it the used files of every run
-that shares the directory, or it deletes recordings that another run
-needs.
+It starts the service and prints its URL as one JSON line.
 
 ## Control API
 
-The calls of a run are under `/__roach/runs/<id>` on the service, and under
-`/__roach` on a local proxy. They need `Authorization: Bearer <token>`, with
-the run token or the token of the local proxy. `client.ts` calls them.
+The calls of a run are under `/__roach/runs/<id>`. They need
+`Authorization: Bearer <run token>`. `client.ts` calls them.
 
 - `POST /session` with `{"name": "..."}`: open a session.
 - `POST /session/end` with `{"name": "...", "passed": true}`: end it.
@@ -343,6 +329,20 @@ The service also has:
 - `DELETE /__roach/runs/<id>`: end the run. Returns its stats.
 - `GET /__roach/ca.pem`: the CA certificate. No token.
 
+## Release
+
+Run the `Release` workflow, and choose `minor`, `patch`, or `major`. Craft
+(`.craft.yml`) makes a `release/<version>` branch and asks for approval in
+[getsentry/publish](https://github.com/getsentry/publish). When a release
+manager accepts it, Craft:
+
+- copies the image `ghcr.io/getsentry/roach:<sha>` to `:<version>`.
+- makes the GitHub release `v<version>`, with the changelog, and moves the
+  `v<major>` tag. Repositories use the action as `getsentry/roach@v<major>`.
+
+The action runs `src/action.ts` from the tag, so a release has no build
+step.
+
 ## Development
 
 ```sh
@@ -352,32 +352,34 @@ pnpm check   # format, lint, types, unused code, and tests, as CI runs them
 
 `AGENTS.md` has the conventions and the commands for one file.
 
-- `tests/roach.test.ts` tests a local proxy.
+- `tests/recording.test.ts` tests modes, sessions, changing values, and
+  misses.
 - `tests/service.test.ts` tests the service in the test process.
 - `tests/deployed.test.ts` runs the service as it runs in production: from
   the command line, behind a TLS server that does what the load balancer
   does, with a local GCS server, metadata server, and Sentry server. Each
-  CI job (`tests/ci-job.ts`) sets only the proxy variables of its run.
+  CI job runs the GitHub Action, and its command has only the proxy
+  variables of its run.
 
 ## Files
 
 The proxy is in `src/`. Tests are in `tests/`. The production setup is in
 `deploy/gcp/` and `Dockerfile`.
 
-- `types.ts`: the configuration and the results of a local proxy.
+- `types.ts`: rules, modes, and the results of a run.
 - `server.ts`: sockets, HTTPS interception, the allow list, and the control
   API.
 - `service.ts`: the shared service: tenants, runs, access, and metrics.
 - `recorder.ts`: modes, sessions, replay, and misses.
-- `request-key.ts`: the key and the part hashes of a request.
+- `request-key.ts`: the key of a request.
 - `store.ts`: the recording format and the store contract.
-- `recordings.ts`: the file store and prune.
+- `recordings.ts`: the file store, for tests and development.
 - `gcs.ts`: the GCS store.
 - `values.ts`: changing values and their placeholders.
 - `streams.ts`: merges the deltas of a recorded model stream.
 - `secrets.ts`: redaction of credentials.
 - `certificates.ts`: the certificate authority for HTTPS.
-- `client.ts`: starts a remote run or a local proxy, and calls the control
-  API.
+- `client.ts`: starts a run and calls the control API.
 - `report.ts`: text reports of a run.
+- `action.ts`: the GitHub Action (`action.yml` at the root).
 - `cli.ts`: the command line.

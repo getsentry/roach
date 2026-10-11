@@ -1,10 +1,12 @@
 name: Image
 
-# Build the service image on each pull request. On main, also push it to
-# ghcr.io/getsentry/roach, where deploy/gcp pulls it from.
+# Build the service image on each pull request. On main and release
+# branches, also push it to ghcr.io/getsentry/roach as `:<sha>`. On main,
+# also push `:main`, which deploy/gcp pulls. A release copies `:<sha>` to
+# `:<version>` (`.craft.yml`).
 on:
   push:
-    branches: [main]
+    branches: [main, "release/**"]
   pull_request:
 
 permissions:
@@ -27,7 +29,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      - if: github.ref == 'refs/heads/main'
+      - if: github.event_name == 'push'
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
@@ -36,10 +38,10 @@ jobs:
       - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
-          push: ${{ github.ref == 'refs/heads/main' }}
+          push: ${{ github.event_name == 'push' }}
           tags: |
-            ghcr.io/getsentry/roach:main
             ghcr.io/getsentry/roach:${{ github.sha }}
+            ${{ github.ref == 'refs/heads/main' && 'ghcr.io/getsentry/roach:main' || '' }}
 
   terraform:
     name: terraform

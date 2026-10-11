@@ -2,7 +2,8 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # Craft publishes a release only when the checks of its branch pass.
+    branches: [main, "release/**"]
   pull_request:
 
 permissions:

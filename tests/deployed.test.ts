@@ -7,8 +7,8 @@
  *   TLS and passes the bytes to the service.
  * - A local server plays the GCS JSON API and the metadata server of the
  *   VM. Another one plays Sentry.
- * - Each CI job (`ci-job.ts`) sends HTTPS through the service with only the
- *   proxy variables of its run.
+ * - Each CI job runs the GitHub Action (`src/action.ts`). Its command sends
+ *   HTTPS through the service with only the proxy variables of its run.
  */
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -22,7 +22,7 @@ import path from "node:path";
 import tls from "node:tls";
 import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import type { RoachServiceConfig, RunConfig } from "../src/service.ts";
+import type { RoachServiceConfig } from "../src/service.ts";
 
 const execFileAsync = promisify(execFile);
 const ROOT = path.join(import.meta.dirname, "..");
@@ -76,34 +76,73 @@ function readEnvelope(envelope: string) {
   }
 }
 
-/** Run one CI job, and return what it printed. */
-async function ciJob(token: string | undefined, mode: RunConfig["mode"]) {
-  const config: RunConfig = {
-    tenant: TENANT,
-    mode,
-    name: `${mode}-run`,
-    rules: [{ name: "model", match: { method: "POST" } }],
-  };
-  const { stdout } = await execFileAsync(
+/**
+ * Run one CI job: the action (`src/action.ts`) with a command that sends
+ * one HTTPS request with plain `fetch`. Returns the exit code of the
+ * action, what the command saw, and the job summary.
+ */
+async function ciJob(job: {
+  token?: string;
+  runId: string;
+  prompt: string;
+}): Promise<{
+  exitCode: number;
+  response: { status: number; source: string | null; body: string };
+  token: string | null;
+  trusted: string;
+  summary: string;
+}> {
+  const workspace = await mkdtemp(path.join(directory, "job-"));
+  const config = { rules: [{ name: "model", match: { method: "POST" } }] };
+  await writeFile(path.join(workspace, "roach.json"), JSON.stringify(config));
+  await writeFile(
+    path.join(workspace, "job.mjs"),
+    `import { readFileSync } from "node:fs";
+const response = await fetch(${JSON.stringify(`${upstreamOrigin}/v1/messages`)}, {
+  method: "POST",
+  body: JSON.stringify({ prompt: ${JSON.stringify(job.prompt)} }),
+});
+console.log(JSON.stringify({
+  response: { status: response.status, source: response.headers.get("x-roach"), body: await response.text() },
+  token: process.env.INPUT_TOKEN ?? null,
+  trusted: readFileSync(process.env.NODE_EXTRA_CA_CERTS, "utf8"),
+}));
+`,
+  );
+  const summary = path.join(workspace, "summary.md");
+  const action = spawn(
     process.execPath,
     [
       "--experimental-strip-types",
       "--disable-warning=ExperimentalWarning",
-      path.join(ROOT, "tests/ci-job.ts"),
-      JSON.stringify({
-        service: frontUrl,
-        token,
-        config,
-        url: `${upstreamOrigin}/v1/messages`,
-        body: JSON.stringify({ prompt: "hi" }),
-      }),
+      path.join(ROOT, "src/action.ts"),
     ],
-    { env: childEnv({ NODE_EXTRA_CA_CERTS: hostCertFile }) },
+    {
+      cwd: workspace,
+      env: childEnv({
+        // The action trusts the TLS certificate of the service, as a CI job
+        // trusts a public one.
+        NODE_EXTRA_CA_CERTS: hostCertFile,
+        GITHUB_REPOSITORY: TENANT,
+        GITHUB_RUN_ID: job.runId,
+        GITHUB_RUN_ATTEMPT: "1",
+        GITHUB_JOB: "test",
+        GITHUB_STEP_SUMMARY: summary,
+        INPUT_RUN: "node job.mjs > result.json",
+        INPUT_URL: frontUrl,
+        INPUT_TOKEN: job.token ?? "",
+      }),
+      stdio: ["ignore", "ignore", "inherit"],
+    },
   );
-  return JSON.parse(stdout) as {
-    response: { status: number; source: string; body: string };
-    stats: { written: number };
-    caCert: string;
+  const [exitCode] = (await once(action, "exit")) as [number];
+  const result = JSON.parse(
+    await readFile(path.join(workspace, "result.json"), "utf8"),
+  );
+  return {
+    exitCode,
+    ...result,
+    summary: await readFile(summary, "utf8"),
   };
 }
 
@@ -280,20 +319,29 @@ afterAll(async () => {
 
 describe("deployed roach", () => {
   it("records with the token, replays for a fork, and counts in Sentry", async () => {
-    const writer = await ciJob(TOKEN, "auto");
+    const writer = await ciJob({ token: TOKEN, runId: "writer", prompt: "hi" });
+    expect(writer.exitCode).toBe(0);
     expect(writer.response).toEqual({
       status: 200,
       source: "live",
       body: JSON.stringify({ n: 1 }),
     });
-    expect(writer.stats.written).toBe(1);
-    // A restart keeps the authority that clients trust.
-    expect(writer.caCert).toBe(caCert);
+    expect(writer.summary).toContain("1 recordings new or changed");
+    // The command never sees the write token.
+    expect(writer.token).toBeNull();
+    // It trusts the authority of the service, which a restart keeps, and
+    // still trusts the certificates that the job trusted.
+    expect(writer.trusted).toContain(caCert.trim());
+    expect(writer.trusted).toContain(
+      (await readFile(hostCertFile, "utf8")).trim(),
+    );
     expect([...objects.keys()]).toEqual([
       expect.stringMatching(/^getsentry\/junior\/model\/[0-9a-f]{64}\.json$/),
     ]);
 
-    const fork = await ciJob(undefined, "replay");
+    // Without the token, the action only replays.
+    const fork = await ciJob({ runId: "fork", prompt: "hi" });
+    expect(fork.exitCode).toBe(0);
     expect(fork.response).toEqual({
       status: 200,
       source: "replayed",
@@ -301,10 +349,18 @@ describe("deployed roach", () => {
     });
     expect(liveRequests).toBe(1);
 
+    // A request without a recording fails the step, and the summary names it.
+    const miss = await ciJob({ runId: "miss", prompt: "bye" });
+    expect(miss.response.status).toBe(412);
+    expect(miss.exitCode).toBe(1);
+    expect(miss.summary).toMatch(/^- test: model\/[0-9a-f]{64}\.json$/m);
+    expect(liveRequests).toBe(1);
+
     // The service sends its metrics when it stops.
     service.kill("SIGTERM");
     expect(await once(service, "exit")).toEqual([0, null]);
     const [key] = objects.keys();
+    const relativeKey = key!.slice(`${TENANT}/`.length);
     expect(
       metrics.map(({ tenant, run, result, key: metricKey }) => ({
         tenant,
@@ -313,23 +369,14 @@ describe("deployed roach", () => {
         key: metricKey,
       })),
     ).toEqual([
+      { tenant: TENANT, run: "writer-1", result: "missed", key: relativeKey },
+      { tenant: TENANT, run: "writer-1", result: "written", key: relativeKey },
+      { tenant: TENANT, run: "fork-1", result: "replayed", key: relativeKey },
       {
         tenant: TENANT,
-        run: "auto-run",
+        run: "miss-1",
         result: "missed",
-        key: key!.slice(`${TENANT}/`.length),
-      },
-      {
-        tenant: TENANT,
-        run: "auto-run",
-        result: "written",
-        key: key!.slice(`${TENANT}/`.length),
-      },
-      {
-        tenant: TENANT,
-        run: "replay-run",
-        result: "replayed",
-        key: key!.slice(`${TENANT}/`.length),
+        key: expect.stringMatching(/^model\//),
       },
     ]);
   });

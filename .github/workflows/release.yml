@@ -1,0 +1,32 @@
+name: Release
+
+# Craft makes a release branch, and a release manager accepts it in
+# getsentry/publish. See "Release" in README.md.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version bump type
+        required: true
+        type: choice
+        default: minor
+        options:
+          - minor
+          - patch
+          - major
+      force:
+        description: Force release (bypass blockers)
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  release:
+    # The Craft workflow pushes the release branch.
+    permissions:
+      contents: write
+    uses: getsentry/craft/.github/workflows/release.yml@3f2abdc5703191d12ef2cc013f792f1bd220f44d # v2
+    with:
+      version: ${{ inputs.version }}
+      force: ${{ inputs.force && 'true' || 'false' }}
+    secrets: inherit

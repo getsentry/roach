@@ -5,7 +5,11 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { ProxyAgent, request } from "undici";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { startRemoteRun, type RemoteRoach } from "../src/client.ts";
+import {
+  connectRoach,
+  startRemoteRun,
+  type RemoteRoach,
+} from "../src/client.ts";
 import {
   startRoachService,
   type RoachService,
@@ -203,6 +207,11 @@ describe("roach service", () => {
     const wrong = new URL(run.url);
     wrong.password = "not-the-token";
     await expect(send(wrong.href, { prompt: "hi" })).rejects.toThrow(/407/);
+    // The control API of a run needs the run token. A wrong one gets the
+    // answer of a run that does not exist.
+    await expect(
+      connectRoach({ controlUrl: run.controlUrl, token: "wrong" }).stats(),
+    ).rejects.toThrow(/404/);
 
     // The tenant is a path in the store, so it must be owner/repo.
     for (const tenant of ["junior", "acme/..", "../acme", "a/b/c", "acme/"]) {

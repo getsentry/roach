@@ -3,9 +3,8 @@
  *
  * The proxy intercepts HTTPS. It signs one certificate for each host when a
  * client first connects to that host, and signs it again before it
- * expires. Clients must trust the authority certificate. A local proxy
- * creates a new authority when it starts. The shared service loads a fixed
- * one, so that clients can trust it across restarts.
+ * expires. Clients must trust the authority certificate. The service loads
+ * a fixed one, so that clients can trust it across restarts.
  */
 import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";

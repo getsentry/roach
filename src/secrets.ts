@@ -3,7 +3,7 @@
  *
  * The proxy learns the values of credential headers from each request that
  * it sees, and the config can add more values. It replaces each known value
- * with `<<redacted>>` before it writes a recording or a miss file.
+ * with `<<redacted>>` before it writes a recording.
  */
 import type { IncomingHttpHeaders } from "node:http";
 

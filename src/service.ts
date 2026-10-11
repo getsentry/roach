@@ -5,7 +5,7 @@
  * GitHub repository, named `owner/repo`, such as `getsentry/junior`. The
  * service has no list of tenants: a run names its tenant. A run is one test
  * run of a tenant, such as one CI job. It has its own mode, rules,
- * sessions, and stats, as one local proxy (`server.ts`) has.
+ * sessions, and stats.
  *
  * - Anyone can create a `replay` run of a tenant, so CI jobs of forks
  *   replay recordings without a secret. Such a run never writes.

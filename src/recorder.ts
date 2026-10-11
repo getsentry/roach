@@ -14,13 +14,10 @@
  * its session ended follows the result of that session. A request outside
  * a session is written at once.
  *
- * The recorder never writes a known credential (`secrets.ts`). It redacts
- * them in recordings and miss files.
+ * The recorder never writes a known credential (`secrets.ts`).
  */
-import { mkdir, writeFile } from "node:fs/promises";
 import type { IncomingHttpHeaders } from "node:http";
-import path from "node:path";
-import { describeParts, keyRequest, type KeyedRequest } from "./request-key.ts";
+import { keyRequest, type KeyedRequest } from "./request-key.ts";
 import { createSecrets } from "./secrets.ts";
 import {
   recordingKey,
@@ -35,7 +32,7 @@ import {
 } from "./streams.ts";
 import type {
   RecordingMiss,
-  RoachConfig,
+  RecordingMode,
   RecordingRule,
   RecordingStats,
 } from "./types.ts";
@@ -63,8 +60,6 @@ interface Session {
   name: string;
   /** New recordings, by key. */
   recorded: Map<string, Recording>;
-  /** Keys that the session replayed. They stay used if it fails. */
-  replayed: Set<string>;
   /** Requests that `replay` mode failed. */
   missed: number;
   /**
@@ -123,11 +118,7 @@ function toRecording(
   }
   return {
     session,
-    request: {
-      method: request.method,
-      url: request.url.href,
-      parts: keyed.parts,
-    },
+    request: { method: request.method, url: request.url.href },
     response: { status: response.status, headers, body, bodyEncoding },
   };
 }
@@ -145,26 +136,23 @@ function fromRecording(
   return { status: response.status, headers: response.headers, body };
 }
 
-/** The parts of a config that the recorder uses. */
-export type RecorderConfig = Pick<
-  RoachConfig,
-  "missDirectory" | "mode" | "rules" | "secrets" | "usedFile"
->;
+/** The config of a recorder. */
+export interface RecorderConfig {
+  mode: RecordingMode;
+  rules: RecordingRule[];
+  /** Credentials to redact, in addition to the ones that it learns. */
+  secrets?: string[];
+}
 
-/** Create the recorder of one proxy run, with the store of its recordings. */
+/** Create the recorder of one run, with the store of its recordings. */
 export function createRecorder(config: RecorderConfig, store: RecordingStore) {
   for (const rule of config.rules) {
     if (!RULE_NAME.test(rule.name)) {
       throw new Error(`Roach rule name is not valid: ${rule.name}`);
     }
   }
-  const missDirectory = config.missDirectory
-    ? path.resolve(config.missDirectory)
-    : undefined;
   let session: Session | undefined;
   const secrets = createSecrets(config.secrets);
-  /** Recordings that passed sessions, or requests outside one, used. */
-  const used = new Set<string>();
   const stats: RecordingStats = {
     counts: Object.fromEntries(
       config.rules.map((rule) => [
@@ -181,11 +169,6 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
     stats.written += await store.write(recordings);
   };
 
-  const markReplayed = (owner: Session | undefined, key: string) => {
-    if (owner && owner.passed === undefined) owner.replayed.add(key);
-    else used.add(key);
-  };
-
   const record = async (
     owner: Session | undefined,
     key: string,
@@ -196,41 +179,19 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
     } else if (owner?.passed === false) {
       stats.discarded += 1;
     } else {
-      used.add(key);
       await write([[key, recording]]);
     }
   };
 
-  const reportMiss = async (
-    rule: RecordingRule,
-    key: string,
-    keyed: KeyedRequest,
-    owner: Session | undefined,
-  ) => {
-    const closest = await store.closest?.(rule.name, keyed.parts, owner?.name);
+  const reportMiss = (rule: RecordingRule, key: string, owner?: Session) => {
     const miss: RecordingMiss = {
       rule: rule.name,
       session: owner?.name,
       file: key,
-      closest: closest?.key,
-      differs: closest?.differs ?? [],
     };
     if (stats.misses.length < MAX_MISSES) stats.misses.push(miss);
     const where = owner ? ` in "${owner.name}"` : "";
-    const why = closest
-      ? `closest is ${miss.closest}, which differs at ${describeParts(miss.differs)}`
-      : "no recording to compare";
-    process.stderr.write(`[roach] No ${rule.name} recording${where}: ${why}\n`);
-    if (missDirectory) {
-      const target = path.join(missDirectory, miss.file);
-      await mkdir(path.dirname(target), { recursive: true });
-      await writeFile(
-        target,
-        secrets.redact(
-          `${JSON.stringify({ ...miss, request: keyed.normalized }, null, 2)}\n`,
-        ),
-      );
-    }
+    process.stderr.write(`[roach] No ${rule.name} recording${where}: ${key}\n`);
   };
 
   /** End the open session. Returns its requests that `replay` mode failed. */
@@ -239,20 +200,8 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
     if (!ended) return 0;
     session = undefined;
     ended.passed = passed;
-    // A failed test can still show that a recording is in use.
-    for (const key of ended.replayed) used.add(key);
-    if (passed) {
-      for (const key of ended.recorded.keys()) used.add(key);
-      await write([...ended.recorded]);
-    } else {
-      stats.discarded += ended.recorded.size;
-      // A failed test stops early, so it does not replay all of its
-      // recordings. Keep every recording that it made before, so that a
-      // prune does not delete them.
-      for (const key of (await store.keysOf?.(ended.name)) ?? []) {
-        used.add(key);
-      }
-    }
+    if (passed) await write([...ended.recorded]);
+    else stats.discarded += ended.recorded.size;
     return ended.missed;
   };
 
@@ -306,13 +255,12 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
         const recording = await store.read(key);
         if (recording) {
           counts.replayed += 1;
-          markReplayed(owner, key);
           return {
             ...fromRecording(recording, keyed.values),
             source: "replayed",
           };
         }
-        await reportMiss(rule, key, keyed, owner);
+        reportMiss(rule, key, owner);
         if (config.mode === "replay") {
           counts.missed += 1;
           if (owner) owner.missed += 1;
@@ -354,7 +302,6 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
       session = {
         name,
         recorded: new Map(),
-        replayed: new Set(),
         missed: 0,
         known: new Map(),
       };
@@ -375,19 +322,12 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
       return stats;
     },
 
-    /** Fail the open session, and write `usedFile` of the config. */
+    /** Fail the open session. */
     async close(): Promise<void> {
       await finish(false);
-      if (config.usedFile) {
-        const keys = [...used].toSorted();
-        await writeFile(
-          config.usedFile,
-          keys.map((key) => `${key}\n`).join(""),
-        );
-      }
     },
   };
 }
 
-/** The recorder of one proxy run. */
+/** The recorder of one run. */
 export type Recorder = ReturnType<typeof createRecorder>;
