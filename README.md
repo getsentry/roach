@@ -65,7 +65,7 @@ A client that does not use `client.ts` can do the same with plain HTTP. See
 A repository adds one step and a `roach.json` file:
 
 ```yaml
-- uses: getsentry/roach@main
+- uses: getsentry/roach@v0
   with:
     token: ${{ secrets.ROACH_TOKEN }} # without it, the run can only replay
     run: pnpm test
@@ -328,6 +328,20 @@ The service also has:
   the `id`, `token`, proxy `url`, `controlUrl`, and `caCert` of the run.
 - `DELETE /__roach/runs/<id>`: end the run. Returns its stats.
 - `GET /__roach/ca.pem`: the CA certificate. No token.
+
+## Release
+
+Run the `Release` workflow, and choose `minor`, `patch`, or `major`. Craft
+(`.craft.yml`) makes a `release/<version>` branch and asks for approval in
+[getsentry/publish](https://github.com/getsentry/publish). When a release
+manager accepts it, Craft:
+
+- copies the image `ghcr.io/getsentry/roach:<sha>` to `:<version>`.
+- makes the GitHub release `v<version>`, with the changelog, and moves the
+  `v<major>` tag. Repositories use the action as `getsentry/roach@v<major>`.
+
+The action runs `src/action.ts` from the tag, so a release has no build
+step.
 
 ## Development
 

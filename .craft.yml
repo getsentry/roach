@@ -1,0 +1,18 @@
+minVersion: "2.21.0"
+changelog:
+  policy: auto
+# Nothing reads a version from a file. The git tag is the version.
+preReleaseCommand: ""
+artifactProvider:
+  name: none
+targets:
+  # The service image. The Image workflow pushes `:<sha>` for the release
+  # branch, and Craft copies it to `:<version>`.
+  - name: docker
+    source: ghcr.io/getsentry/roach
+    target: ghcr.io/getsentry/roach
+  # The action. Repositories use `getsentry/roach@v<major>`.
+  - name: github
+    tagPrefix: v
+    floatingTags:
+      - "v{major}"
