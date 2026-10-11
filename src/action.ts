@@ -12,7 +12,10 @@ import { startRemoteRun } from "./client.ts";
 import { describeRecordingMisses, describeRecordingStats } from "./report.ts";
 import type { RunConfig } from "./service.ts";
 
-/** Variables that the command must not get: the inputs, with the token. */
+/**
+ * Variables that the command does not get: the inputs, which have the token,
+ * and the proxy variables of the job.
+ */
 const HIDDEN_VARIABLE = /^(INPUT_.*|https?_proxy|no_proxy|all_proxy)$/i;
 
 /** Run the command in bash, and return its exit code. */
