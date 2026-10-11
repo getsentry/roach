@@ -135,7 +135,16 @@ export async function startRemoteRun(
     "runs",
     config,
   );
-  const proxyEnv = await createProxyEnv(run, noProxy);
+  let proxyEnv: Awaited<ReturnType<typeof createProxyEnv>>;
+  try {
+    proxyEnv = await createProxyEnv(run, noProxy);
+  } catch (error) {
+    // Without this, the run stays open until the service times it out.
+    await callControl(run.controlUrl, run.token, "DELETE", "").catch(
+      () => undefined,
+    );
+    throw error;
+  }
   return {
     ...run,
     ...connectRoach(run),

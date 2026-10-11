@@ -17,16 +17,31 @@ const HIDDEN_VARIABLE = /^(INPUT_.*|https?_proxy|no_proxy|all_proxy)$/i;
 
 /** Run the command in bash, and return its exit code. */
 function runCommand(command: string, env: NodeJS.ProcessEnv): Promise<number> {
+  // `detached` puts bash and its children in a new process group.
   const child = spawn("bash", ["-e", "-o", "pipefail", "-c", command], {
+    detached: true,
     env,
     stdio: "inherit",
   });
-  // A canceled job sends a signal. Stop the command, then end the run.
-  process.on("SIGINT", () => child.kill("SIGINT"));
-  process.on("SIGTERM", () => child.kill("SIGTERM"));
+  // A canceled job sends a signal. Bash does not pass it to its children, so
+  // send it to the whole process group. Then end the run.
+  const stop = (signal: NodeJS.Signals) => {
+    try {
+      process.kill(-child.pid!, signal);
+    } catch {
+      // The process group has already stopped.
+    }
+  };
+  process.on("SIGINT", stop);
+  process.on("SIGTERM", stop);
   return new Promise((resolve, reject) => {
     child.once("error", reject);
-    child.once("exit", (code) => resolve(code ?? 1));
+    child.once("exit", (code) => {
+      // Stop what the command left in the background, such as `cmd &`. Bash
+      // makes it ignore `SIGINT`, and the run ends next.
+      stop("SIGTERM");
+      resolve(code ?? 1);
+    });
   });
 }
 
