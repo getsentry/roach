@@ -16,9 +16,11 @@ allow = [
   "https://docs.slack.dev",
 ]
 
-# Junior's own value patterns, in addition to the built-in ones.
+# Junior's own value patterns, in addition to the built-in ones. Each one must
+# be equal to its source in packages/junior-evals/src/recording-rules.ts, or
+# the service refuses the run.
 value_patterns = [
-  "(?<![\\w-])(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) {1,2}\\d{1,2}(?:, \\d{4}, \\d{1,2}:\\d{2}\\s?[AP]M| \\d{2}:\\d{2})\\b",
+  "(?<!(?:^|[^\\\\])[0-9A-Za-z])(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) {1,2}\\d{1,2}(?:, \\d{4}, \\d{1,2}:\\d{2}\\s?[AP]M| \\d{2}:\\d{2})\\b",
   "(?<=event_id=)[0-9a-f]{32}(?![0-9A-Za-z])",
 ]
 
