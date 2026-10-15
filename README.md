@@ -343,6 +343,10 @@ manager accepts it, Craft:
 The action runs `src/action.ts` from the tag, so a release has no build
 step.
 
+The `Release` workflow uses the token of Sentry Release Bot. A push with
+`GITHUB_TOKEN` starts no workflows, so the release branch gets no checks and
+no image, and Craft cannot publish it.
+
 ## Development
 
 ```sh

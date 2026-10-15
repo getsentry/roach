@@ -20,13 +20,36 @@ on:
         type: boolean
         default: false
 
+permissions:
+  contents: read
+
 jobs:
   release:
-    # The Craft workflow pushes the release branch.
-    permissions:
-      contents: write
-    uses: getsentry/craft/.github/workflows/release.yml@3f2abdc5703191d12ef2cc013f792f1bd220f44d # v2
-    with:
-      version: ${{ inputs.version }}
-      force: ${{ inputs.force && 'true' || 'false' }}
-    secrets: inherit
+    name: Release a new version
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Use the token of Sentry Release Bot, not GITHUB_TOKEN. A push with
+      # GITHUB_TOKEN starts no workflows, so the release branch would get no
+      # CI checks and no image. GITHUB_TOKEN also cannot open the issue in
+      # getsentry/publish.
+      - name: Get auth token
+        id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.SENTRY_RELEASE_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.SENTRY_RELEASE_BOT_PRIVATE_KEY }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          token: ${{ steps.token.outputs.token }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Prepare release
+        uses: getsentry/craft@3f2abdc5703191d12ef2cc013f792f1bd220f44d # v2
+        env:
+          GITHUB_TOKEN: ${{ steps.token.outputs.token }}
+        with:
+          version: ${{ inputs.version }}
+          force: ${{ inputs.force && 'true' || 'false' }}
