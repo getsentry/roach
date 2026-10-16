@@ -24,7 +24,11 @@ export function createSecrets(initial: string[] = []) {
   // `Bearer <token>` or each value of a cookie header.
   const add = (value: string) => {
     for (const part of [value, ...value.split(/[\s;,=]+/)]) {
-      if (part.length >= MIN_LENGTH) values.add(part);
+      if (part.length < MIN_LENGTH) continue;
+      values.add(part);
+      // The recorder redacts JSON text, which escapes `"`, `\`, and
+      // control characters.
+      values.add(JSON.stringify(part).slice(1, -1));
     }
   };
   initial.forEach(add);

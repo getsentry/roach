@@ -102,7 +102,7 @@ the run and writes its stats to the job summary.
 ## Config
 
 A run takes `RunConfig` (`src/service.ts`): `tenant`, `mode`, `rules`,
-`allow`, and `name`.
+`allow`, `name`, and `secrets`.
 
 - `mode`: `auto` replays recordings and records misses. `replay` replays
   recordings and fails a miss with HTTP 412, so nothing goes live. `record`
@@ -115,8 +115,11 @@ A run takes `RunConfig` (`src/service.ts`): `tenant`, `mode`, `rules`,
   and `-`. `match` has `method`, `url` (a prefix),
   and `headers`. `keyHeaders` adds request headers to the key. `values`
   names the values that change from run to run.
-- Credentials: the proxy never writes the `secrets` of the service config.
-  It also learns the value of each request header whose name can mean a credential,
+- Credentials: the proxy never writes the `secrets` of the service config
+  or of the run. Use `secrets` of the run for the credentials of a CI job
+  that a response can show but no request header has, such as a token that
+  goes to a model in a prompt. The service keeps them only in memory, for
+  the run. A run can have 32 of them. It also learns the value of each request header whose name can mean a credential,
   such as one with `auth`, `token`, `key`, `secret`, `cookie`, or `session`.
   The match is broad on purpose. Recordings show `<<redacted>>` in place of
   each known value.
