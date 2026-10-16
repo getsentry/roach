@@ -43,6 +43,7 @@ async function start(mode: RecordingMode): Promise<RemoteRoach> {
     {
       tenant: TENANT,
       mode,
+      allow: [origin],
       rules: [
         {
           name: "model",
@@ -119,7 +120,7 @@ beforeEach(async () => {
   directory = await mkdtemp(path.join(tmpdir(), "roach-"));
   service = await startRoachService({
     directory,
-    allow: [origin],
+    privateNetworks: true,
     writeTokenHash: createHash("sha256").update(TOKEN).digest("hex"),
   });
 });

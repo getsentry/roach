@@ -32,17 +32,6 @@ variable "machine_type" {
   default     = "e2-small"
 }
 
-variable "allow" {
-  description = "The only origins that runs can reach, such as https://ai-gateway.vercel.sh."
-  type        = list(string)
-}
-
-variable "value_patterns" {
-  description = "Regular expression sources that rules can use in values, in addition to the built-in ones. Check each one for slow backtracking."
-  type        = list(string)
-  default     = []
-}
-
 variable "recording_days" {
   description = "GCS deletes each recording this many days after it was written."
   type        = number

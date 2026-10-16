@@ -16,6 +16,13 @@
  * - The service gives each run its own id and token. A proxied request
  *   names its run in `Proxy-Authorization`, as `Basic base64(<id>:<token>)`.
  *   The proxy URL of the run has them, so `HTTPS_PROXY` sends them.
+ * - A run sends its own config: its origins (`allow`), rules, and value
+ *   patterns. So a tenant changes what it records without a change to the
+ *   service. Two checks keep that safe for the other tenants. The proxy
+ *   sends requests only to public addresses (`addresses.ts`), so a run
+ *   cannot reach the metadata server or the VPC. The key of a request has
+ *   a time limit (`request-key.ts`), so a slow pattern fails only its own
+ *   request.
  * - The recordings of a tenant are under `<tenant>/`, in a directory or a
  *   GCS bucket (`gcs.ts`). Tenants never share recordings, because a key
  *   does not include credentials.
@@ -46,7 +53,7 @@ import {
 } from "./server.ts";
 import { RULE_NAME, type RecordingStore } from "./store.ts";
 import type { RecordingMode, RecordingRule, RecordingStats } from "./types.ts";
-import { VALUE_PATTERNS } from "./values.ts";
+import { invalidValuePatterns } from "./values.ts";
 
 /** The configuration of the service. The operator owns it. */
 export interface RoachServiceConfig {
@@ -63,21 +70,19 @@ export interface RoachServiceConfig {
   directory?: string;
   /** A GCS bucket for the recordings. Set this or `directory`. */
   bucket?: string;
-  /** The only origins that runs can reach. A run can allow fewer. */
-  allow: string[];
   /**
    * The SHA-256 of the write token, in hex. All tenants share the token.
    * Give it only to CI jobs that you trust.
    */
   writeTokenHash: string;
-  /**
-   * More regular expression sources that rules can use in `values`, in
-   * addition to `VALUE_PATTERNS`. A slow pattern blocks all runs, so check
-   * each one for catastrophic backtracking before you add it.
-   */
-  valuePatterns?: string[];
   /** Credentials to redact in all recordings. */
   secrets?: string[];
+  /**
+   * Let runs reach addresses that are not public, such as `127.0.0.1` and
+   * the metadata server. Only for tests and local development. Default:
+   * `false`.
+   */
+  privateNetworks?: boolean;
   /**
    * The certificate authority that signs intercepted hosts. Clients trust
    * it, so a deployed service must keep it across restarts. Default: a new
@@ -97,8 +102,12 @@ export interface RunConfig {
   tenant: string;
   mode: RecordingMode;
   rules: RecordingRule[];
-  /** Default: all origins of the service. */
-  allow?: string[];
+  /**
+   * The only origins that the run can reach, such as
+   * `https://ai-gateway.vercel.sh`. The service sends requests only to
+   * their public addresses.
+   */
+  allow: string[];
   /**
    * The name of the run in Sentry, such as
    * `${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}`. Default: the run id.
@@ -150,6 +159,15 @@ const RUN_TIMEOUT_MS = 6 * 60 * 60 * 1000;
  */
 const MAX_PUBLIC_RUNS = 100;
 const MAX_RUN_NAME = 128;
+/**
+ * Limits of the config of a run. Anyone can start a run, so they keep the
+ * work of a run small: the service makes a certificate for each host that
+ * a run tunnels to, and runs each value pattern on each request.
+ */
+const MAX_RUN_ORIGINS = 32;
+const MAX_RULES = 64;
+const MAX_RULE_VALUES = 32;
+const MAX_PATTERN_LENGTH = 2048;
 /** Enough for the API keys and OIDC tokens of a CI job. */
 const MAX_RUN_SECRETS = 32;
 const MAX_SECRET_LENGTH = 16 * 1024;
@@ -184,11 +202,7 @@ function proxyCredentials(
 }
 
 /** Check the run config of a client. Returns the error, or `undefined`. */
-function invalidRunConfig(
-  config: Partial<RunConfig>,
-  serviceOrigins: Map<string, URL>,
-  valuePatterns: Set<string>,
-): string | undefined {
+function invalidRunConfig(config: Partial<RunConfig>): string | undefined {
   if (!config.mode || !MODES.has(config.mode)) {
     return "mode must be auto, off, record, or replay";
   }
@@ -209,7 +223,9 @@ function invalidRunConfig(
       return `secrets must be a list of at most ${MAX_RUN_SECRETS} strings of at most ${MAX_SECRET_LENGTH} characters`;
     }
   }
-  if (!Array.isArray(config.rules)) return "rules must be a list";
+  if (!Array.isArray(config.rules) || config.rules.length > MAX_RULES) {
+    return `rules must be a list of at most ${MAX_RULES} rules`;
+  }
   const names = new Set<string>();
   for (const rule of config.rules) {
     if (typeof rule?.name !== "string" || !RULE_NAME.test(rule.name)) {
@@ -220,29 +236,41 @@ function invalidRunConfig(
     if (typeof rule.match !== "object" || rule.match === null) {
       return `rule ${rule.name} must have match`;
     }
-    // A pattern runs on the requests of all runs in one process, so a
-    // client can only use patterns that the operator knows to be fast.
+    // A slow pattern fails only its own requests (`request-key.ts`), so
+    // the service takes any pattern that compiles.
     if (rule.values !== undefined) {
       if (typeof rule.values !== "object" || rule.values === null) {
         return `values of rule ${rule.name} must be an object`;
       }
-      for (const [name, source] of Object.entries(rule.values)) {
-        if (typeof source !== "string" || !valuePatterns.has(source)) {
-          return `value ${name} of rule ${rule.name} is not a pattern that the service allows`;
+      const values = Object.entries(rule.values);
+      if (values.length > MAX_RULE_VALUES) {
+        return `rule ${rule.name} can have at most ${MAX_RULE_VALUES} values`;
+      }
+      for (const [name, source] of values) {
+        if (typeof source !== "string" || source.length > MAX_PATTERN_LENGTH) {
+          return `value ${name} of rule ${rule.name} must be a pattern of at most ${MAX_PATTERN_LENGTH} characters`;
         }
       }
     }
   }
-  if (config.allow !== undefined) {
-    if (!Array.isArray(config.allow)) return "allow must be a list";
-    for (const origin of config.allow) {
-      // The client sends JSON, so check the type at run time.
-      if (
-        typeof origin !== "string" ||
-        !serviceOrigins.has(origin.replace(/\/$/, ""))
-      ) {
-        return `the service does not allow ${origin}`;
-      }
+  const patternError = invalidValuePatterns(
+    config.rules.flatMap((rule) => (rule.values ? [rule.values] : [])),
+  );
+  if (patternError) return patternError;
+  if (
+    !Array.isArray(config.allow) ||
+    config.allow.length === 0 ||
+    config.allow.length > MAX_RUN_ORIGINS
+  ) {
+    return `allow must be a list of 1 to ${MAX_RUN_ORIGINS} origins`;
+  }
+  for (const origin of config.allow) {
+    // The client sends JSON, so check the type at run time.
+    if (typeof origin !== "string") return "allow must be a list of origins";
+    try {
+      parseOrigins([origin.replace(/\/$/, "")]);
+    } catch {
+      return `${origin} is not an http or https origin`;
     }
   }
   return undefined;
@@ -297,13 +325,8 @@ export async function startRoachService(
   if (config.sentryDsn) {
     Sentry.init({ dsn: config.sentryDsn, tracesSampleRate: 0 });
   }
-  const serviceOrigins = parseOrigins(config.allow);
   const runs = new Map<string, Run>();
   const authority = await createCertificateAuthority(config.ca);
-  const valuePatterns = new Set<string>([
-    ...Object.values(VALUE_PATTERNS),
-    ...(config.valuePatterns ?? []),
-  ]);
   const storeOf = (tenant: string): RecordingStore =>
     config.bucket
       ? createGcsStore(config.bucket, `${tenant}/`)
@@ -320,7 +343,6 @@ export async function startRoachService(
   const createRun = (runConfig: RunConfig, canWrite: boolean): RemoteRun => {
     const id = randomBytes(8).toString("hex");
     const token = randomBytes(24).toString("hex");
-    const allow = runConfig.allow ?? config.allow;
     const store = runStore(
       storeOf(runConfig.tenant),
       { tenant: runConfig.tenant, run: runConfig.name ?? id },
@@ -330,9 +352,12 @@ export async function startRoachService(
       id,
       token,
       started: Date.now(),
-      origins: parseOrigins(allow.map((origin) => origin.replace(/\/$/, ""))),
+      origins: parseOrigins(
+        runConfig.allow.map((origin) => origin.replace(/\/$/, "")),
+      ),
       // A public run must not be an open proxy to the allowed origins.
       replayOnly: !canWrite,
+      privateNetworks: config.privateNetworks === true,
       // Each run learns only the credentials of its own requests.
       recorder: createRecorder(
         {
@@ -387,7 +412,7 @@ export async function startRoachService(
         sendJson(outgoing, 400, { error: "tenant must be owner/repo" });
         return;
       }
-      const error = invalidRunConfig(runConfig, serviceOrigins, valuePatterns);
+      const error = invalidRunConfig(runConfig);
       if (error) {
         sendJson(outgoing, 400, { error });
         return;

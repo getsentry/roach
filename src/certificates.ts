@@ -3,7 +3,9 @@
  *
  * The proxy intercepts HTTPS. It signs one certificate for each host when a
  * client first connects to that host, and signs it again before it
- * expires. Clients must trust the authority certificate. The service loads
+ * expires. Runs name their own hosts, so the authority keeps the
+ * certificates of at most `MAX_HOSTS` hosts, and keeps no files for them.
+ * Clients must trust the authority certificate. The service loads
  * a fixed one, so that clients can trust it across restarts.
  */
 import { execFile } from "node:child_process";
@@ -44,6 +46,8 @@ export interface CertificateAuthorityPem {
 const HOST_DAYS = 7;
 /** Sign a host again when its certificate is older than this. */
 const RESIGN_MS = (HOST_DAYS - 1) * 24 * 60 * 60 * 1000;
+/** The hosts with a certificate in memory. More hosts drop the oldest one. */
+const MAX_HOSTS = 1000;
 
 /**
  * Create a certificate authority in a new temporary directory. Without
@@ -109,10 +113,11 @@ export async function createCertificateAuthority(
       "-out",
       cert,
     ]);
-    return tls.createSecureContext({
-      cert: await readFile(cert, "utf8"),
-      key: hostKeyPem,
-    });
+    const certPem = await readFile(cert, "utf8");
+    await Promise.all(
+      [csr, extensions, cert].map((file) => rm(file, { force: true })),
+    );
+    return tls.createSecureContext({ cert: certPem, key: hostKeyPem });
   };
 
   return {
@@ -126,7 +131,12 @@ export async function createCertificateAuthority(
         fresh.context.catch(() => {
           if (contexts.get(host) === fresh) contexts.delete(host);
         });
+        contexts.delete(host);
         contexts.set(host, fresh);
+        // A map keeps the order of insertion, so the first key is the oldest.
+        if (contexts.size > MAX_HOSTS) {
+          contexts.delete(contexts.keys().next().value!);
+        }
         entry = fresh;
       }
       return entry.context;

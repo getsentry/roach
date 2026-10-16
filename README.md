@@ -71,11 +71,12 @@ A repository adds one step and a `roach.json` file:
     run: pnpm test
 ```
 
-`roach.json` is at the root of the repository. It has the `rules` of the
-run, and can have `allow` (`RunConfig` in `src/service.ts`):
+`roach.json` is at the root of the repository. It has the `allow` origins
+and the `rules` of the run (`RunConfig` in `src/service.ts`):
 
 ```json
 {
+  "allow": ["https://ai-gateway.vercel.sh"],
   "rules": [
     {
       "name": "model",
@@ -108,13 +109,16 @@ A run takes `RunConfig` (`src/service.ts`): `tenant`, `mode`, `rules`,
   recordings and fails a miss with HTTP 412, so nothing goes live. `record`
   sends every request live and records it again. `off` records and replays
   nothing.
-- `allow`: the only origins that the proxy sends requests to. It refuses all
-  other origins with HTTP 403. The upstream host always comes from this
-  list, not from the client.
+- `allow`: the only origins that the proxy sends requests to, 1 to 32 of
+  them. It refuses all other origins with HTTP 403. The upstream host
+  always comes from this list, not from the request. The service sends
+  requests only to public addresses, so an origin that resolves to a
+  private, loopback, or link-local address also gets HTTP 403.
 - `rules`: the traffic to record. `name` uses letters, digits, `_`, `.`,
   and `-`. `match` has `method`, `url` (a prefix),
   and `headers`. `keyHeaders` adds request headers to the key. `values`
-  names the values that change from run to run.
+  names the values that change from run to run. A run can have 64 rules,
+  and a rule can have 32 values.
 - Credentials: the proxy never writes the `secrets` of the service config
   or of the run. Use `secrets` of the run for the credentials of a CI job
   that a response can show but no request header has, such as a token that
@@ -183,6 +187,14 @@ it, and the provider refuses a changed thinking block.
 Keep the patterns narrow. A broad pattern makes requests that differ in a
 real way use the same recording.
 
+The service takes any pattern that compiles in 1 s, up to 2048
+characters. A run without the token must use the same patterns as the run
+that recorded, or its keys do not match. All runs share one process, so
+the key of each request has a time limit: 1 s, and 0.5 s for each MiB of
+the body. The built-in patterns take less than 0.1 s for each MiB. A
+request whose key takes longer fails with HTTP 400, and other runs go on.
+Avoid nested quantifiers, such as `(a+)+`.
+
 ## Misses
 
 The proxy adds each request without a recording to `stats().misses`, with
@@ -214,10 +226,16 @@ first miss of each test, which is the one to fix.
   stats. A proxied request names its run in `Proxy-Authorization`, as
   `Basic base64(<id>:<token>)`. The proxy URL of the run has them, so
   `HTTPS_PROXY` sends them. A request without them gets HTTP 407.
-- **Value patterns.** A pattern runs for every run in the process, so a
-  run can only use the patterns in `VALUE_PATTERNS` and the ones in
-  `valuePatterns` of the config. Check each one for slow backtracking
-  before you add it.
+- **Config of a run.** Each run sends its own `allow` and `rules`, with
+  their value patterns. A tenant that calls a new origin or uses a new
+  pattern changes only its own config. The service needs no change and no
+  restart. Two checks keep one run from harming the others:
+  - The proxy sends requests only to public addresses (`addresses.ts`).
+    It checks the address of each connection after DNS, so a host name
+    cannot point a run at the metadata server, at the VPC, or at the VM.
+    Only tests and local development set `privateNetworks`.
+  - The key of a request has a time limit (`request-key.ts`), so a slow
+    pattern fails only its own request.
 - **Sentry.** With `sentryDsn`, each read and write of a recording sends
   the metric `roach.recording`. Its attributes are `tenant`, `rule`, `key`,
   `run` (the `name` of the run), and `result`: `replayed`, `missed`, or
@@ -261,9 +279,8 @@ The `Image` workflow builds the image on each pull request and pushes it on
 1. Make the package `ghcr.io/getsentry/roach` public once, after the first
    push to `main`, so the VM can pull it without credentials.
 2. `deploy/gcp/roach.tfvars` has the values of the Sentry deployment: the
-   GCP project `roach-511216`, the domain, `allow`, and `value_patterns`.
-   `allow` and `value_patterns` must cover the rules of every tenant. Another
-   deployment changes these values.
+   GCP project `roach-511216` and the domain. Another deployment changes
+   these values. It has no origins or patterns: runs send them.
 3. The Terraform state is in the private bucket that `backend "gcs"` in
    `versions.tf` names. The state holds the CA key and the write token, so
    the bucket must stay private. Make the bucket before the first
@@ -296,10 +313,8 @@ To deploy a new image, restart the VM:
 
 To add a project, add its repository to the repositories of the
 `ROACH_TOKEN` organization secret, in the GitHub settings of the
-organization. Its CI jobs set `tenant` to `GITHUB_REPOSITORY`. When the
-project calls origins or uses value patterns that are not in
-`roach.tfvars` yet, add them and apply again. Terraform writes a new config version, and the
-VM reads it at its next start.
+organization. Its CI jobs set `tenant` to `GITHUB_REPOSITORY`, and send
+their own origins and patterns. The service needs no change.
 
 To change the write token, run
 `terraform apply -var-file=roach.tfvars -replace=random_password.write_token`,
@@ -376,6 +391,7 @@ The proxy is in `src/`. Tests are in `tests/`. The production setup is in
 - `types.ts`: rules, modes, and the results of a run.
 - `server.ts`: sockets, HTTPS interception, the allow list, and the control
   API.
+- `addresses.ts`: the public addresses that the proxy can send requests to.
 - `service.ts`: the shared service: tenants, runs, access, and metrics.
 - `recorder.ts`: modes, sessions, replay, and misses.
 - `request-key.ts`: the key of a request.

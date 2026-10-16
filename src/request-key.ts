@@ -5,6 +5,10 @@
  * and the body. A JSON body has sorted object keys, so key order does not
  * matter. Each changing value of the rule is `<<name>>` in the key
  * (`values.ts`).
+ *
+ * The patterns of `values` come from the client, and all runs share one
+ * process. A slow pattern would block every run, so a key has a time limit
+ * (`KEY_TIME_LIMIT`).
  */
 import { createHash } from "node:crypto";
 import type { IncomingHttpHeaders } from "node:http";
@@ -15,10 +19,26 @@ import {
   type KnownValues,
   type RequestValues,
   type ValuePatterns,
+  withTimeLimit,
 } from "./values.ts";
 
 /** Change this to make every recording a miss. */
 const KEY_VERSION = "http-v1";
+
+/**
+ * The time that the key of one request can take: 1 s, and 0.5 s for each
+ * MiB of the body. The built-in patterns take less than 0.1 s for each
+ * MiB. A key that takes longer fails its request, and other runs go on.
+ */
+const KEY_TIME_LIMIT = { baseMs: 1000, msPerMiB: 500 };
+
+/** The parts of a request that make its key. */
+interface RequestToKey {
+  method: string;
+  url: string;
+  headers: IncomingHttpHeaders;
+  body: string;
+}
 
 /** A request as the key sees it. */
 export interface KeyedRequest {
@@ -100,16 +120,24 @@ const sha256 = (text: string) =>
   createHash("sha256").update(text).digest("hex");
 /**
  * The key and the changing values of a request. `known` holds
- * the values of earlier requests in the same session (`values.ts`).
+ * the values of earlier requests in the same session (`values.ts`). It
+ * throws an error with HTTP status 400 when it takes too long.
  */
 export function keyRequest(
   rule: RecordingRule,
-  request: {
-    method: string;
-    url: string;
-    headers: IncomingHttpHeaders;
-    body: string;
-  },
+  request: RequestToKey,
+  known?: KnownValues,
+): KeyedRequest {
+  const mib = Buffer.byteLength(request.body) / (1024 * 1024);
+  return withTimeLimit(
+    Math.ceil(KEY_TIME_LIMIT.baseMs + KEY_TIME_LIMIT.msPerMiB * mib),
+    () => keyRequestNow(rule, request, known),
+  );
+}
+
+function keyRequestNow(
+  rule: RecordingRule,
+  request: RequestToKey,
   known?: KnownValues,
 ): KeyedRequest {
   const headers = Object.fromEntries(

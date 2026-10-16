@@ -6,9 +6,11 @@
  * rule matches to the recorder (`recorder.ts`). Other requests go live
  * without a change, and their responses stream.
  *
- * It sends requests only to the `allow` origins. It refuses other origins
- * with HTTP 403 and sends nothing. The upstream host always comes from
- * `allow`, never from the client. Only the path comes from the client.
+ * It sends requests only to the `allow` origins of the run. It refuses
+ * other origins with HTTP 403 and sends nothing. The upstream host always
+ * comes from `allow`, never from the request. Only the path comes from the
+ * request. It also refuses an origin whose address is not public
+ * (`addresses.ts`), unless the service config has `privateNetworks`.
  *
  * Each response has an `x-roach` header: `replayed`, `live`,
  * `missed` (`replay` mode had no recording), or `passthrough` (no rule
@@ -19,6 +21,7 @@ import http from "node:http";
 import https from "node:https";
 import { isIP, type Socket } from "node:net";
 import tls from "node:tls";
+import { isPublicAddress, notPublicError, publicLookup } from "./addresses.ts";
 import type { CertificateAuthority } from "./certificates.ts";
 import type { ProxyRequest, Recorder } from "./recorder.ts";
 
@@ -122,11 +125,13 @@ export function sameToken(
 
 /**
  * Send a request to an allowed origin. The host, port, and scheme come from
- * the configuration. Only the path comes from the client.
+ * the configuration. Only the path comes from the client. Without
+ * `privateNetworks`, only public addresses get the request.
  */
 function sendUpstream(
   origin: URL,
   request: ProxyRequest,
+  privateNetworks: boolean,
   extraHeaders: http.OutgoingHttpHeaders = {},
 ): Promise<http.IncomingMessage> {
   const headers: http.OutgoingHttpHeaders = {};
@@ -143,12 +148,19 @@ function sendUpstream(
   const client = origin.protocol === "https:" ? https : http;
   // A URL keeps the brackets of an IPv6 host. A request option has none.
   const hostname = origin.hostname.replace(/^\[|\]$/g, "");
+  // Node does not call `lookup` for an IP address, so check it here.
+  if (!privateNetworks && isIP(hostname) && !isPublicAddress(hostname)) {
+    return Promise.reject(notPublicError(hostname, hostname));
+  }
   return new Promise((resolve, reject) => {
     const upstream = client.request(
       {
         protocol: origin.protocol,
         hostname,
         port: origin.port || undefined,
+        // The check is on the address of the connection. A kept-alive
+        // connection had the check when it opened.
+        lookup: privateNetworks ? undefined : publicLookup,
         servername: isIP(hostname) ? undefined : hostname,
         path: `${request.url.pathname}${request.url.search}`,
         method: request.method,
@@ -163,7 +175,7 @@ function sendUpstream(
 
 /** Proxy one request to an allowed origin, through the recorder. */
 async function proxyRequest(
-  { recorder, origins, replayOnly }: ProxyTarget,
+  { recorder, origins, replayOnly, privateNetworks = false }: ProxyTarget,
   incoming: http.IncomingMessage,
   outgoing: http.ServerResponse,
   tunnelOrigin: string | undefined,
@@ -196,7 +208,7 @@ async function proxyRequest(
   }
   if (!rule) {
     recorder.countPassthrough(origin.origin, request.headers);
-    const upstream = await sendUpstream(origin, request);
+    const upstream = await sendUpstream(origin, request, privateNetworks);
     outgoing.writeHead(upstream.statusCode ?? 502, upstream.statusMessage, {
       ...upstream.headers,
       "x-roach": "passthrough",
@@ -208,7 +220,7 @@ async function proxyRequest(
 
   const response = await recorder.respond(rule, request, async () => {
     // Ask for a plain body, so the recording is readable.
-    const upstream = await sendUpstream(origin, request, {
+    const upstream = await sendUpstream(origin, request, privateNetworks, {
       "accept-encoding": "identity",
     });
     return {
@@ -287,6 +299,11 @@ export interface ProxyTarget {
    * service sets this for a run without the write token.
    */
   replayOnly?: boolean;
+  /**
+   * Send requests to addresses that are not public too, such as
+   * `127.0.0.1`. Only for tests and local development.
+   */
+  privateNetworks?: boolean;
   /** Set when the target stops. Its tunnels then refuse new requests. */
   closed?: boolean;
 }
