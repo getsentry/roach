@@ -14,7 +14,7 @@ import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { createServer } from "node:http";
+import { createServer, type IncomingHttpHeaders } from "node:http";
 import https from "node:https";
 import net, { type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -35,7 +35,16 @@ let directory: string;
 let hostCertFile: string;
 let caCert: string;
 const objects = new Map<string, string>();
-const metrics: Array<Record<string, string>> = [];
+const envelopes: string[] = [];
+/** A metric or a span that the service sent to Sentry. */
+interface TelemetryItem {
+  name: string;
+  value?: number;
+  attributes: Record<string, unknown>;
+}
+const metrics: TelemetryItem[] = [];
+const spans: TelemetryItem[] = [];
+const upstreamHeaders: IncomingHttpHeaders[] = [];
 let liveRequests = 0;
 let upstreamOrigin: string;
 let frontUrl: string;
@@ -59,21 +68,56 @@ async function listen(server: net.Server, host = "127.0.0.1") {
   return (server.address() as AddressInfo).port;
 }
 
-/** Keep the `roach.recording` metrics of a Sentry envelope. */
+/**
+ * Keep the metrics and the spans of a Sentry envelope. Both are lists of
+ * items with typed attributes.
+ */
 function readEnvelope(envelope: string) {
-  for (const line of envelope.split("\n")) {
-    if (!line.includes('"roach.recording"')) continue;
-    const { items } = JSON.parse(line) as {
-      items: Array<{ attributes: Record<string, { value: string }> }>;
+  envelopes.push(envelope);
+  // A header line, then a header line and a payload line for each item.
+  const [, ...lines] = envelope.split("\n").filter(Boolean);
+  for (let index = 0; index + 1 < lines.length; index += 2) {
+    const { type } = JSON.parse(lines[index]!) as { type: string };
+    const list = { trace_metric: metrics, span: spans }[type];
+    if (!list) continue;
+    const { items } = JSON.parse(lines[index + 1]!) as {
+      items: Array<
+        Omit<TelemetryItem, "attributes"> & {
+          attributes: Record<string, { value: unknown }>;
+        }
+      >;
     };
-    for (const { attributes } of items) {
-      metrics.push(
-        Object.fromEntries(
-          Object.entries(attributes).map(([name, { value }]) => [name, value]),
+    for (const item of items) {
+      list.push({
+        ...item,
+        attributes: Object.fromEntries(
+          Object.entries(item.attributes).map(([name, { value }]) => [
+            name,
+            value,
+          ]),
         ),
-      );
+      });
     }
   }
+}
+
+/** The metrics of one request of the `model` rule. */
+function requestMetrics(mode: string, result: string) {
+  const attributes = {
+    tenant: TENANT,
+    mode,
+    rule: "model",
+    origin: upstreamOrigin,
+    result,
+  };
+  return [
+    { name: "roach.request", value: 1, attributes },
+    {
+      name: "roach.request.duration",
+      value: expect.any(Number),
+      attributes,
+    },
+  ];
 }
 
 /**
@@ -197,8 +241,9 @@ beforeAll(async () => {
   };
 
   // The upstream API. It is not on `localhost`, so `NO_PROXY` keeps it.
-  const upstream = https.createServer(host, (_incoming, outgoing) => {
+  const upstream = https.createServer(host, (incoming, outgoing) => {
     liveRequests += 1;
+    upstreamHeaders.push(incoming.headers);
     outgoing.writeHead(200, { "content-type": "application/json" });
     outgoing.end(JSON.stringify({ n: liveRequests }));
   });
@@ -361,23 +406,106 @@ describe("deployed roach", () => {
     expect(await once(service, "exit")).toEqual([0, null]);
     const [key] = objects.keys();
     const relativeKey = key!.slice(`${TENANT}/`.length);
+
+    // Metrics have only attributes with few values: no key and no run.
+    const labels = ["tenant", "mode", "rule", "origin", "result", "key", "run"];
     expect(
-      metrics.map(({ tenant, run, result, key: metricKey }) => ({
-        tenant,
-        run,
-        result,
-        key: metricKey,
+      metrics.map(({ name, value, attributes }) => ({
+        name,
+        value,
+        attributes: Object.fromEntries(
+          labels.flatMap((label) =>
+            label in attributes ? [[label, attributes[label]]] : [],
+          ),
+        ),
       })),
     ).toEqual([
-      { tenant: TENANT, run: "writer-1", result: "missed", key: relativeKey },
-      { tenant: TENANT, run: "writer-1", result: "written", key: relativeKey },
-      { tenant: TENANT, run: "fork-1", result: "replayed", key: relativeKey },
+      ...requestMetrics("auto", "live"),
       {
-        tenant: TENANT,
-        run: "miss-1",
-        result: "missed",
-        key: expect.stringMatching(/^model\//),
+        name: "roach.recording.write",
+        value: 1,
+        attributes: {
+          tenant: TENANT,
+          mode: "auto",
+          rule: "model",
+          result: "written",
+        },
       },
+      ...requestMetrics("replay", "replayed"),
+      ...requestMetrics("replay", "missed"),
     ]);
+
+    // Only the spans of Roach: 4 for each run, and 2 for the live request.
+    const ops = spans.map(({ attributes }) => attributes["sentry.op"]);
+    expect(ops).toHaveLength(14);
+    expect(new Set(ops)).toEqual(
+      new Set([
+        "roach.run.start",
+        "roach.request",
+        "roach.key",
+        "roach.store.read",
+        "roach.upstream",
+        "roach.store.write",
+      ]),
+    );
+    const span = (op: string, run: string) =>
+      spans.find(
+        ({ attributes }) =>
+          attributes["sentry.op"] === op && attributes.run === run,
+      )?.attributes;
+    expect(span("roach.run.start", "writer-1")).toMatchObject({
+      tenant: TENANT,
+      mode: "auto",
+      write: true,
+    });
+    expect(span("roach.request", "writer-1")).toMatchObject({
+      tenant: TENANT,
+      mode: "auto",
+      rule: "model",
+      origin: upstreamOrigin,
+      result: "live",
+      "http.response.status_code": 200,
+    });
+    expect(span("roach.request", "fork-1")).toMatchObject({
+      result: "replayed",
+    });
+    expect(span("roach.request", "miss-1")).toMatchObject({
+      result: "missed",
+      "http.response.status_code": 412,
+    });
+    expect(span("roach.key", "writer-1")).toMatchObject({ key: relativeKey });
+    expect(span("roach.store.read", "writer-1")).toMatchObject({
+      key: relativeKey,
+      result: "miss",
+    });
+    expect(span("roach.store.read", "fork-1")).toMatchObject({
+      key: relativeKey,
+      result: "hit",
+    });
+    expect(span("roach.upstream", "writer-1")).toMatchObject({
+      origin: upstreamOrigin,
+      "http.response.status_code": 200,
+    });
+    expect(span("roach.store.write", "writer-1")).toMatchObject({
+      recordings: 1,
+      written: 1,
+    });
+
+    // Sentry gets no credential, no path, and no body, and the upstream
+    // gets no trace headers.
+    for (const secret of [
+      TOKEN,
+      GCS_TOKEN,
+      "/v1/messages",
+      "/__roach/",
+      "prompt",
+    ]) {
+      expect(envelopes.join("\n")).not.toContain(secret);
+    }
+    for (const headers of upstreamHeaders) {
+      expect(headers).not.toHaveProperty("sentry-trace");
+      expect(headers).not.toHaveProperty("baggage");
+      expect(headers).not.toHaveProperty("traceparent");
+    }
   });
 });

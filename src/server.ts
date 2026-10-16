@@ -20,7 +20,7 @@ import https from "node:https";
 import { isIP, type Socket } from "node:net";
 import tls from "node:tls";
 import type { CertificateAuthority } from "./certificates.ts";
-import type { ProxyRequest, Recorder } from "./recorder.ts";
+import type { ProxyRequest, Recorder, Telemetry } from "./recorder.ts";
 
 /** The path prefix of the control API. */
 export const CONTROL_PATH = "/__roach";
@@ -289,6 +289,8 @@ export interface ProxyTarget {
   replayOnly?: boolean;
   /** Set when the target stops. Its tunnels then refuse new requests. */
   closed?: boolean;
+  /** Gets a span for each proxied request. */
+  telemetry: Telemetry;
 }
 
 /** A target, or the HTTP status that refuses the request. */
@@ -345,8 +347,24 @@ function serveProxied(
     outgoing.end("Roach: this run has ended\n");
     return;
   }
-  proxyRequest(target, incoming, outgoing, tunnelOrigin).catch(
-    (error: unknown) => {
+  // Only the origin: the path and query can hold a credential.
+  const origin = tunnelOrigin ?? URL.parse(incoming.url ?? "")?.origin;
+  const method = incoming.method ?? "GET";
+  target.telemetry
+    .span(
+      {
+        op: "roach.request",
+        name: `${method} ${origin}`,
+        attributes: { origin: String(origin), "http.request.method": method },
+      },
+      async () => {
+        await proxyRequest(target, incoming, outgoing, tunnelOrigin);
+        target.telemetry.annotate({
+          "http.response.status_code": outgoing.statusCode,
+        });
+      },
+    )
+    .catch((error: unknown) => {
       if (!outgoing.headersSent) {
         const status = (error as { status?: number }).status ?? 502;
         outgoing.writeHead(status, { "content-type": "text/plain" });
@@ -354,8 +372,7 @@ function serveProxied(
       outgoing.end(
         `Roach error: ${error instanceof Error ? error.message : String(error)}\n`,
       );
-    },
-  );
+    });
 }
 
 /**
