@@ -239,20 +239,20 @@ describe("roach service", () => {
       }),
     ).rejects.toThrow(/Invalid regular expression/);
     // Patterns can also be slow to compile. They have a time limit too.
+    // Without it, these take over a minute. Each pattern is different,
+    // so V8 cannot reuse an earlier one.
     await expect(
       startRun("write-token", "auto", {
-        rules: [
-          {
-            name: "model",
-            match: {},
-            values: Object.fromEntries(
-              Array.from({ length: 32 }, (_, i) => [
-                `v${i}`,
-                `(?:(?:(?:(?:a?){30}){30}){30}){${30 + i}}`,
-              ]),
-            ),
-          },
-        ],
+        rules: Array.from({ length: 64 }, (_, rule) => ({
+          name: `model${rule}`,
+          match: {},
+          values: Object.fromEntries(
+            Array.from({ length: 32 }, (__, value) => [
+              `v${value}`,
+              `(?:(?:(?:(?:a?){30}){30}){${30 + rule}}){${30 + value}}`,
+            ]),
+          ),
+        })),
       }),
     ).rejects.toThrow(/value patterns took over/);
     await expect(
