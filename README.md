@@ -237,13 +237,59 @@ first miss of each test, which is the one to fix.
   - The key of a request has a time limit (`request-key.ts`), so a slow
     pattern fails only its own request.
 - **Sentry.** With `sentryDsn`, each read and write of a recording sends
-  the metric `roach.recording`. Its attributes are `tenant`, `rule`, `key`,
-  `run` (the `name` of the run), and `result`: `replayed`, `missed`, or
-  `written`. Group by `key` and count `run`, and a recording that only one
-  run uses shows that a value changes on each run.
+  a span to Sentry. Each proxied request sends a span and metrics. See
+  [Sentry](#sentry).
 - **Certificate authority.** `ca` holds the PEM certificate and key that
   clients trust. Keep it across restarts. Host certificates live for 7
   days, and the service makes new ones before they expire.
+
+### Sentry
+
+With `sentryDsn`, the service sends metrics and spans to Sentry. It keeps
+all traces. Metrics have only attributes with few values: `tenant`, `mode`,
+`rule`, `origin`, and `result`. Spans also have `run` (the `name` of the
+run) and `key`.
+
+| Metric                   | Type              | Value                                                                                                                                                |
+| ------------------------ | ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `roach.request`          | counter           | 1 for each proxied request. `result` is the `x-roach` header: `replayed`, `live`, `missed`, or `passthrough`. A `passthrough` request has no `rule`. |
+| `roach.request.duration` | distribution (ms) | The time to answer a request that a rule records, by `result`.                                                                                       |
+| `roach.recording.write`  | counter           | Recordings by `rule`. `result` is `written` (the proxy sent them to the store) or `dropped` (their session failed).                                  |
+
+Each proxied request is one trace. Each span has `tenant`, `mode`, and
+`run`.
+
+- `roach.run.start`: a new run, with `write` (the run has the write token).
+- `roach.request`: one proxied request, named `<method> <origin>`, with
+  `origin`, `rule`, `result`, and `http.response.status_code`. It contains:
+  - `roach.key`: the key of the request, with `rule` and `key`.
+  - `roach.store.read`: a read of a recording, with `key` and `result`:
+    `hit` or `miss`.
+  - `roach.upstream`: the live request, with `origin` and
+    `http.response.status_code`.
+- `roach.store.write`: a write of recordings, with `recordings` and
+  `written`. A session writes when it ends, so this span is usually its
+  own trace.
+
+Telemetry never has a credential, a body, or the path or query of a URL.
+So the service turns off the request data and the HTTP spans of the SDK,
+and it adds no trace headers to the requests that it sends.
+
+To see how well the cache works:
+
+- **Hit rate.** Sum `roach.request`, group by `result`, and filter by
+  `tenant` and `rule`. The hit rate is `replayed / (replayed + live +
+  missed)`.
+- **Misses.** `missed` is a request that failed in `replay` mode. `live`
+  in `auto` mode is a new recording. When `live` stays high from run to
+  run, a value in the key changes on each run.
+- **Time.** Compare `roach.request.duration` for `live` and `replayed`.
+- **Dropped.** `roach.recording.write` with `result:dropped` counts
+  recordings of failed sessions. The next run sends these requests live
+  again.
+- **Changing keys.** Search spans for `span.op:roach.key`, group by
+  `key`, and count the runs. A key that only one run uses shows that a
+  value changes on each run.
 
 ### Limits
 

@@ -26,8 +26,9 @@
  * - The recordings of a tenant are under `<tenant>/`, in a directory or a
  *   GCS bucket (`gcs.ts`). Tenants never share recordings, because a key
  *   does not include credentials.
- * - Each read and write of a recording sends the Sentry metric
- *   `roach.recording`, with the tenant, the key, and the run.
+ * - With `sentryDsn`, the service sends spans and metrics to Sentry. See
+ *   "Sentry" in `README.md`. Metrics have only attributes with few values,
+ *   so the key and the run are only on spans.
  */
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import type http from "node:http";
@@ -38,7 +39,7 @@ import {
   type CertificateAuthorityPem,
 } from "./certificates.ts";
 import { createGcsStore } from "./gcs.ts";
-import { createRecorder } from "./recorder.ts";
+import { createRecorder, type Telemetry } from "./recorder.ts";
 import { createFileStore } from "./recordings.ts";
 import {
   CONTROL_PATH,
@@ -150,6 +151,8 @@ interface Run extends ProxyTarget {
 }
 
 const MODES = new Set<RecordingMode>(["auto", "off", "record", "replay"]);
+/** The service gets little traffic, so it keeps all traces. */
+const TRACES_SAMPLE_RATE = 1;
 /** A run that is open longer than this ends as failed, such as a dead job. */
 const RUN_TIMEOUT_MS = 6 * 60 * 60 * 1000;
 /**
@@ -277,36 +280,73 @@ function invalidRunConfig(config: Partial<RunConfig>): string | undefined {
 }
 
 /**
- * The store of one run. It counts each read and write in Sentry, and a
- * run without write access cannot write.
+ * The telemetry of one run, in Sentry. Metrics get `labels`. Spans also get
+ * the name of the run.
+ */
+function runTelemetry(
+  labels: { tenant: string; mode: RecordingMode },
+  run: string,
+): Telemetry {
+  return {
+    span: ({ op, name = op, attributes }, fn) =>
+      Sentry.startSpan(
+        { op, name, attributes: { ...labels, run, ...attributes } },
+        fn,
+      ),
+    annotate: (attributes) => {
+      Sentry.getActiveSpan()?.setAttributes(attributes);
+    },
+    count: (name, value, attributes) => {
+      Sentry.metrics.count(name, value, {
+        attributes: { ...labels, ...attributes },
+      });
+    },
+    time: (name, ms, attributes) => {
+      Sentry.metrics.distribution(name, ms, {
+        unit: "millisecond",
+        attributes: { ...labels, ...attributes },
+      });
+    },
+  };
+}
+
+/**
+ * The store of one run. Each read and write has a span, and a run without
+ * write access cannot write.
  */
 function runStore(
   base: RecordingStore,
-  labels: { tenant: string; run: string },
+  labels: { tenant: string; mode: RecordingMode; run: string },
   canWrite: boolean,
 ): RecordingStore {
-  const count = (key: string, result: string) => {
-    Sentry.metrics.count("roach.recording", 1, {
-      attributes: {
-        ...labels,
-        rule: key.slice(0, key.indexOf("/")),
-        key,
-        result,
-      },
-    });
-  };
+  const span = <T>(
+    op: string,
+    attributes: Record<string, string | number>,
+    fn: (span: Sentry.Span) => Promise<T>,
+  ) =>
+    Sentry.startSpan(
+      { op, name: op, attributes: { ...labels, ...attributes } },
+      fn,
+    );
   return {
-    async read(key) {
-      const recording = await base.read(key);
-      count(key, recording ? "replayed" : "missed");
-      return recording;
-    },
+    read: (key) =>
+      span("roach.store.read", { key }, async (current) => {
+        const recording = await base.read(key);
+        current.setAttribute("result", recording ? "hit" : "miss");
+        return recording;
+      }),
     async write(recordings) {
       if (recordings.length === 0) return 0;
       if (!canWrite) throw new Error("This run cannot write recordings");
-      const written = await base.write(recordings);
-      for (const [key] of recordings) count(key, "written");
-      return written;
+      return span(
+        "roach.store.write",
+        { recordings: recordings.length },
+        async (current) => {
+          const written = await base.write(recordings);
+          current.setAttribute("written", written);
+          return written;
+        },
+      );
     },
   };
 }
@@ -323,7 +363,26 @@ export async function startRoachService(
   }
   const writeTokenHash = Buffer.from(config.writeTokenHash, "hex");
   if (config.sentryDsn) {
-    Sentry.init({ dsn: config.sentryDsn, tracesSampleRate: 0 });
+    Sentry.init({
+      dsn: config.sentryDsn,
+      tracesSampleRate: TRACES_SAMPLE_RATE,
+      // Send only what Roach puts on its spans. The HTTP integrations and
+      // `RequestData` add whole URLs, headers, and bodies, which can hold
+      // credentials, such as the `secrets` of a run. And the proxy must not
+      // add trace headers to the requests that it sends.
+      tracePropagationTargets: [],
+      integrations: (defaults) => [
+        ...defaults.filter(
+          ({ name }) => !["Http", "NodeFetch", "RequestData"].includes(name),
+        ),
+        Sentry.httpIntegration({
+          spans: false,
+          breadcrumbs: false,
+          maxRequestBodySize: "none",
+        }),
+        Sentry.nativeNodeFetchIntegration({ spans: false, breadcrumbs: false }),
+      ],
+    });
   }
   const runs = new Map<string, Run>();
   const authority = await createCertificateAuthority(config.ca);
@@ -342,10 +401,18 @@ export async function startRoachService(
 
   const createRun = (runConfig: RunConfig, canWrite: boolean): RemoteRun => {
     const id = randomBytes(8).toString("hex");
+    const telemetry = runTelemetry(
+      { tenant: runConfig.tenant, mode: runConfig.mode },
+      runConfig.name ?? id,
+    );
     const token = randomBytes(24).toString("hex");
     const store = runStore(
       storeOf(runConfig.tenant),
-      { tenant: runConfig.tenant, run: runConfig.name ?? id },
+      {
+        tenant: runConfig.tenant,
+        mode: runConfig.mode,
+        run: runConfig.name ?? id,
+      },
       canWrite,
     );
     const run: Run = {
@@ -364,9 +431,11 @@ export async function startRoachService(
           mode: runConfig.mode,
           rules: runConfig.rules,
           secrets: [...(config.secrets ?? []), ...(runConfig.secrets ?? [])],
+          telemetry,
         },
         store,
       ),
+      telemetry,
     };
     runs.set(id, run);
     process.stderr.write(
@@ -440,7 +509,20 @@ export async function startRoachService(
           return;
         }
       }
-      sendJson(outgoing, 201, createRun(runConfig as RunConfig, canWrite));
+      const valid = runConfig as RunConfig;
+      const remote = Sentry.startSpan(
+        {
+          op: "roach.run.start",
+          name: "roach.run.start",
+          attributes: { tenant, mode: valid.mode, write: canWrite },
+        },
+        (span) => {
+          const created = createRun(valid, canWrite);
+          span.setAttribute("run", valid.name ?? created.id);
+          return created;
+        },
+      );
+      sendJson(outgoing, 201, remote);
       return;
     }
 

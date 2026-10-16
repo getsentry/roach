@@ -14,7 +14,8 @@
  * its session ended follows the result of that session. A request outside
  * a session is written at once.
  *
- * The recorder never writes a known credential (`secrets.ts`).
+ * The recorder never writes a known credential (`secrets.ts`). It reports
+ * spans and metrics through the `Telemetry` hooks of `service.ts`.
  */
 import type { IncomingHttpHeaders } from "node:http";
 import { keyRequest, type KeyedRequest } from "./request-key.ts";
@@ -55,6 +56,29 @@ export interface ProxyResponse {
 
 /** Where the response to a recorded request came from. */
 export type ResponseSource = "live" | "missed" | "replayed";
+
+/** The attributes of a span or a metric. */
+type Attributes = Record<string, string | number | boolean>;
+
+/**
+ * Hooks that report spans and metrics. `service.ts` gives hooks that send
+ * them to Sentry, so this file and `server.ts` do not load the SDK. An
+ * attribute must never hold a credential, a body, or the path or query of
+ * a URL.
+ */
+export interface Telemetry {
+  /** Run `fn` in a span. The span ends when `fn` returns or settles. */
+  span<T>(
+    options: { op: string; name?: string; attributes?: Attributes },
+    fn: () => T,
+  ): T;
+  /** Add attributes to the active span. */
+  annotate(attributes: Attributes): void;
+  /** Add `value` to the counter `name`. */
+  count(name: string, value: number, attributes: Attributes): void;
+  /** Add a time in milliseconds to the distribution `name`. */
+  time(name: string, ms: number, attributes: Attributes): void;
+}
 
 interface Session {
   name: string;
@@ -142,6 +166,7 @@ export interface RecorderConfig {
   rules: RecordingRule[];
   /** Credentials to redact, in addition to the ones that it learns. */
   secrets?: string[];
+  telemetry: Telemetry;
 }
 
 /** Create the recorder of one run, with the store of its recordings. */
@@ -152,6 +177,7 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
     }
   }
   let session: Session | undefined;
+  const { telemetry } = config;
   const secrets = createSecrets(config.secrets);
   const stats: RecordingStats = {
     counts: Object.fromEntries(
@@ -165,8 +191,27 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
     discarded: 0,
     passthrough: {},
   };
+  /** Count recordings by rule in `roach.recording.write`. */
+  const countRecordings = (keys: string[], result: "dropped" | "written") => {
+    const byRule = new Map<string, number>();
+    for (const key of keys) {
+      const rule = key.slice(0, key.indexOf("/"));
+      byRule.set(rule, (byRule.get(rule) ?? 0) + 1);
+    }
+    for (const [rule, value] of byRule) {
+      telemetry.count("roach.recording.write", value, { rule, result });
+    }
+  };
   const write = async (recordings: Array<[string, Recording]>) => {
     stats.written += await store.write(recordings);
+    countRecordings(
+      recordings.map(([key]) => key),
+      "written",
+    );
+  };
+  const drop = (keys: string[]) => {
+    stats.discarded += keys.length;
+    countRecordings(keys, "dropped");
   };
 
   const record = async (
@@ -177,7 +222,7 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
     if (owner && owner.passed === undefined) {
       owner.recorded.set(key, recording);
     } else if (owner?.passed === false) {
-      stats.discarded += 1;
+      drop([key]);
     } else {
       await write([[key, recording]]);
     }
@@ -201,7 +246,7 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
     session = undefined;
     ended.passed = passed;
     if (passed) await write([...ended.recorded]);
-    else stats.discarded += ended.recorded.size;
+    else drop([...ended.recorded.keys()]);
     return ended.missed;
   };
 
@@ -216,6 +261,8 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
     countPassthrough(origin: string, headers: IncomingHttpHeaders): void {
       secrets.learn(headers);
       stats.passthrough[origin] = (stats.passthrough[origin] ?? 0) + 1;
+      telemetry.annotate({ result: "passthrough" });
+      telemetry.count("roach.request", 1, { origin, result: "passthrough" });
     },
 
     /**
@@ -228,19 +275,30 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
       request: ProxyRequest,
       sendLive: () => Promise<ProxyResponse>,
     ): Promise<ProxyResponse & { source: ResponseSource }> {
+      const started = performance.now();
+      const origin = request.url.origin;
       // A request belongs to the session that was open when it started.
       const owner = session;
       const counts = stats.counts[rule.name]!;
       secrets.learn(request.headers);
-      const keyed = keyRequest(
-        rule,
-        {
-          method: request.method,
-          url: request.url.href,
-          headers: request.headers,
-          body: request.body.toString("utf8"),
+      telemetry.annotate({ rule: rule.name });
+      const { keyed, key } = telemetry.span(
+        { op: "roach.key", attributes: { rule: rule.name } },
+        () => {
+          const result = keyRequest(
+            rule,
+            {
+              method: request.method,
+              url: request.url.href,
+              headers: request.headers,
+              body: request.body.toString("utf8"),
+            },
+            owner?.known,
+          );
+          const name = recordingKey(rule.name, result.key);
+          telemetry.annotate({ key: name });
+          return { keyed: result, key: name };
         },
-        owner?.known,
       );
       if (owner) {
         for (const [name, list] of keyed.values) {
@@ -249,12 +307,22 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
           }
         }
       }
-      const key = recordingKey(rule.name, keyed.key);
+      const report = (result: ResponseSource) => {
+        const attributes = { rule: rule.name, origin, result };
+        telemetry.annotate({ result });
+        telemetry.count("roach.request", 1, attributes);
+        telemetry.time(
+          "roach.request.duration",
+          performance.now() - started,
+          attributes,
+        );
+      };
 
       if (config.mode !== "record") {
         const recording = await store.read(key);
         if (recording) {
           counts.replayed += 1;
+          report("replayed");
           return {
             ...fromRecording(recording, keyed.values),
             source: "replayed",
@@ -264,6 +332,7 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
         if (config.mode === "replay") {
           counts.missed += 1;
           if (owner) owner.missed += 1;
+          report("missed");
           return {
             status: 412,
             headers: { "content-type": "text/plain" },
@@ -276,18 +345,29 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
       }
 
       counts.live += 1;
+      const live = await telemetry.span(
+        {
+          op: "roach.upstream",
+          name: `${request.method} ${origin}`,
+          attributes: { origin, "http.request.method": request.method },
+        },
+        async () => {
+          const response = await sendLive();
+          telemetry.annotate({ "http.response.status_code": response.status });
+          return response;
+        },
+      );
       // The client gets the redacted response too, so a live run and a
       // replay give the same body.
       const recording = JSON.parse(
         secrets.redact(
-          JSON.stringify(
-            toRecording(request, keyed, owner?.name, await sendLive()),
-          ),
+          JSON.stringify(toRecording(request, keyed, owner?.name, live)),
         ),
       ) as Recording;
       if (!isTemporaryStatus(recording.response.status)) {
         await record(owner, key, recording);
       }
+      report("live");
       return { ...fromRecording(recording, keyed.values), source: "live" };
     },
 
