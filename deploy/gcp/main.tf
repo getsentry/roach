@@ -84,9 +84,7 @@ resource "google_secret_manager_secret_version" "config" {
       port           = local.port
       publicUrl      = "https://${var.domain}"
       bucket         = google_storage_bucket.recordings.name
-      allow          = var.allow
       writeTokenHash = sha256(random_password.write_token.result)
-      valuePatterns  = var.value_patterns
       ca = {
         cert = tls_self_signed_cert.ca.cert_pem
         key  = tls_private_key.ca.private_key_pem

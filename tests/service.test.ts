@@ -39,6 +39,7 @@ async function startRun(
     {
       tenant: "acme/alpha",
       mode,
+      allow: [origin],
       rules: [
         { name: "model", match: { method: "POST", url: `${origin}/v1/` } },
       ],
@@ -103,7 +104,8 @@ beforeEach(async () => {
   directory = await mkdtemp(path.join(tmpdir(), "roach-service-"));
   service = await startRoachService({
     directory,
-    allow: [origin],
+    // The upstream of the tests is on 127.0.0.1.
+    privateNetworks: true,
     writeTokenHash: hash("write-token"),
     secrets: ["service-secret-value-123"],
   });
@@ -221,19 +223,38 @@ describe("roach service", () => {
       );
     }
     await expect(
-      startRun("write-token", "auto", { allow: ["https://example.com"] }),
-    ).rejects.toThrow(/does not allow/);
+      startRun("write-token", "auto", { allow: ["file:///etc/passwd"] }),
+    ).rejects.toThrow(/not an http or https origin/);
+    await expect(
+      startRun("write-token", "auto", { allow: [] }),
+    ).rejects.toThrow(/allow must be a list/);
     await expect(
       startRun("write-token", "auto", {
         rules: [{ name: "../escape", match: {} }],
       }),
     ).rejects.toThrow(/rule name/);
-    // A pattern runs for all runs, so only known patterns are allowed.
     await expect(
       startRun("write-token", "auto", {
-        rules: [{ name: "model", match: {}, values: { slow: "(a+)+$" } }],
+        rules: [{ name: "model", match: {}, values: { broken: "(" } }],
       }),
-    ).rejects.toThrow(/not a pattern that the service allows/);
+    ).rejects.toThrow(/Invalid regular expression/);
+    // Patterns can also be slow to compile. They have a time limit too.
+    await expect(
+      startRun("write-token", "auto", {
+        rules: [
+          {
+            name: "model",
+            match: {},
+            values: Object.fromEntries(
+              Array.from({ length: 32 }, (_, i) => [
+                `v${i}`,
+                `(?:(?:(?:(?:a?){30}){30}){30}){${30 + i}}`,
+              ]),
+            ),
+          },
+        ],
+      }),
+    ).rejects.toThrow(/value patterns took over/);
     await expect(
       startRun("write-token", "auto", { secrets: [42 as unknown as string] }),
     ).rejects.toThrow(/secrets must be a list/);
@@ -282,6 +303,66 @@ describe("roach service", () => {
     await run.close();
     await expect(send(run.url, { prompt: "hi" })).rejects.toThrow(/407/);
     // Only the large response went live.
+    expect(liveRequests).toBe(1);
+  });
+
+  it("takes origins and patterns from the run, and keeps the service safe", async () => {
+    // A run can use any pattern, also one that backtracks a lot. Its key
+    // has a time limit, so only its own request fails.
+    const slow = await startRun("write-token", "auto", {
+      rules: [
+        {
+          name: "model",
+          match: { method: "POST", url: `${origin}/v1/` },
+          values: { slow: "(a+)+$" },
+        },
+      ],
+    });
+    const started = Date.now();
+    const stuck = await send(slow.url, { prompt: `${"a".repeat(40)}!` });
+    expect(stuck.status).toBe(400);
+    expect(stuck.body).toMatch(/value patterns took over/);
+    expect(Date.now() - started).toBeLessThan(5000);
+    // The process goes on for other runs.
+    const other = await startRun("write-token", "auto");
+    expect(await send(other.url, { prompt: "hi" })).toMatchObject({
+      status: 200,
+      source: "live",
+    });
+    expect(liveRequests).toBe(1);
+
+    // A deployed service sends requests only to public addresses. A run
+    // names its own origins, so it must not reach the metadata server or
+    // the network of the service, by IP address or by host name.
+    const port = new URL(origin).port;
+    const guarded = await startRoachService({
+      directory,
+      writeTokenHash: hash("write-token"),
+    });
+    try {
+      for (const target of [origin, `http://localhost:${port}`]) {
+        const run = await startRemoteRun(
+          { url: guarded.url, token: "write-token" },
+          {
+            tenant: "acme/alpha",
+            mode: "auto",
+            allow: [target],
+            rules: [{ name: "model", match: { url: `${target}/v1/` } }],
+          },
+        );
+        runs.push(run);
+        const agent = new ProxyAgent({ uri: run.url, proxyTunnel: true });
+        agents.push(agent);
+        // One request that a rule records, and one that goes through.
+        for (const url of [`${target}/v1/messages`, `${target}/other`]) {
+          const response = await request(url, { dispatcher: agent });
+          expect(response.statusCode).toBe(403);
+          expect(await response.body.text()).toMatch(/not a public address/);
+        }
+      }
+    } finally {
+      await guarded.close();
+    }
     expect(liveRequests).toBe(1);
   });
 

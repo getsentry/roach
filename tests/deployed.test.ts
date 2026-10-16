@@ -93,7 +93,10 @@ async function ciJob(job: {
   summary: string;
 }> {
   const workspace = await mkdtemp(path.join(directory, "job-"));
-  const config = { rules: [{ name: "model", match: { method: "POST" } }] };
+  const config = {
+    allow: [upstreamOrigin],
+    rules: [{ name: "model", match: { method: "POST" } }],
+  };
   await writeFile(path.join(workspace, "roach.json"), JSON.stringify(config));
   await writeFile(
     path.join(workspace, "job.mjs"),
@@ -273,7 +276,9 @@ beforeAll(async () => {
     port: servicePort,
     publicUrl: frontUrl,
     bucket: BUCKET,
-    allow: [upstreamOrigin],
+    // The upstream is on 127.0.0.2 here. A deployed service has no such
+    // option, so runs reach only public addresses.
+    privateNetworks: true,
     writeTokenHash: createHash("sha256").update(TOKEN).digest("hex"),
     ca: { cert: caCert, key: await readFile(caKeyFile, "utf8") },
     sentryDsn: `http://public@127.0.0.1:${sentryPort}/1`,

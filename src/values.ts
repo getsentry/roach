@@ -16,6 +16,7 @@
  * A value that the response makes itself, such as a date that the model
  * calculates, stays as it was recorded.
  */
+import vm from "node:vm";
 
 /**
  * Lookbehind: the value does not continue a word or number. The proxy
@@ -100,6 +101,44 @@ function compile(patterns: ValuePatterns): CompiledValues {
   };
   compiled.set(patterns, result);
   return result;
+}
+
+/**
+ * Run `fn` with a time limit. A slow pattern cannot stop itself, but the
+ * `timeout` of `vm` stops any code that runs too long, also code outside
+ * the context that the script calls. A timeout throws an error with HTTP
+ * status 400.
+ */
+export function withTimeLimit<T>(ms: number, fn: () => T): T {
+  try {
+    return vm.runInContext("fn()", vm.createContext({ fn }), {
+      timeout: ms,
+    }) as T;
+  } catch (error) {
+    if ((error as { code?: string }).code === "ERR_SCRIPT_EXECUTION_TIMEOUT") {
+      throw Object.assign(
+        new Error(`the value patterns took over ${ms} ms. Make them simpler.`),
+        { status: 400 },
+      );
+    }
+    throw error;
+  }
+}
+
+/**
+ * Check that the patterns of each rule compile. Returns the error, or
+ * `undefined`. A pattern can be slow to compile, so all of them together
+ * have 1 s.
+ */
+export function invalidValuePatterns(
+  list: ValuePatterns[],
+): string | undefined {
+  try {
+    withTimeLimit(1000, () => list.forEach((patterns) => compile(patterns)));
+    return undefined;
+  } catch (error) {
+    return (error as Error).message;
+  }
 }
 
 /** Values that an earlier request of the same session had, by value. */

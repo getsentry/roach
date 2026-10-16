@@ -7,21 +7,7 @@ project = "roach-511216"
 # The record is in getsentry/ops (getsentry/ops#24232).
 domain = "roach-proxy.getsentry.net"
 
-# The origins of Junior's evals (packages/junior-evals/src/recording-rules.ts).
-allow = [
-  "https://ai-gateway.vercel.sh",
-  "https://vercel.com",
-  "https://api.vercel.com",
-  "https://oidc.vercel.com",
-  "https://docs.slack.dev",
-]
-
-# Junior's own value patterns, in addition to the built-in ones. Each one must
-# be equal to its source in packages/junior-evals/src/recording-rules.ts, or
-# the service refuses the run.
-value_patterns = [
-  "(?<!(?:^|[^\\\\])[0-9A-Za-z])(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) {1,2}\\d{1,2}(?:, \\d{4}, \\d{1,2}:\\d{2}\\s?[AP]M| \\d{2}:\\d{2})\\b",
-  "(?<=event_id=)[0-9a-f]{32}(?![0-9A-Za-z])",
-]
+# Runs send their own origins and value patterns (RunConfig in src/service.ts),
+# so a tenant needs no change here.
 
 # To send metrics to Sentry, set TF_VAR_sentry_dsn when you apply.
