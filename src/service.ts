@@ -104,6 +104,12 @@ export interface RunConfig {
    * `${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}`. Default: the run id.
    */
   name?: string;
+  /**
+   * Credentials that this run must never write, such as the API keys of
+   * its CI job. The service redacts them with the `secrets` of the service
+   * config, keeps them only in memory, and forgets them when the run ends.
+   */
+  secrets?: string[];
 }
 
 /** A run that the service created. */
@@ -144,6 +150,9 @@ const RUN_TIMEOUT_MS = 6 * 60 * 60 * 1000;
  */
 const MAX_PUBLIC_RUNS = 100;
 const MAX_RUN_NAME = 128;
+/** Enough for the API keys and OIDC tokens of a CI job. */
+const MAX_RUN_SECRETS = 32;
+const MAX_SECRET_LENGTH = 16 * 1024;
 /**
  * A tenant name: `owner/repo`, with the characters of GitHub names. It is a
  * path in the store, so each part starts with a letter, digit, or `_`, and
@@ -186,6 +195,18 @@ function invalidRunConfig(
   if (config.name !== undefined) {
     if (typeof config.name !== "string" || config.name.length > MAX_RUN_NAME) {
       return `name must be a string of at most ${MAX_RUN_NAME} characters`;
+    }
+  }
+  if (config.secrets !== undefined) {
+    if (
+      !Array.isArray(config.secrets) ||
+      config.secrets.length > MAX_RUN_SECRETS ||
+      !config.secrets.every(
+        (secret) =>
+          typeof secret === "string" && secret.length <= MAX_SECRET_LENGTH,
+      )
+    ) {
+      return `secrets must be a list of at most ${MAX_RUN_SECRETS} strings of at most ${MAX_SECRET_LENGTH} characters`;
     }
   }
   if (!Array.isArray(config.rules)) return "rules must be a list";
@@ -317,7 +338,7 @@ export async function startRoachService(
         {
           mode: runConfig.mode,
           rules: runConfig.rules,
-          ...(config.secrets ? { secrets: config.secrets } : {}),
+          secrets: [...(config.secrets ?? []), ...(runConfig.secrets ?? [])],
         },
         store,
       ),

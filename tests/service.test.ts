@@ -89,6 +89,7 @@ beforeEach(async () => {
       JSON.stringify({
         n: liveRequests,
         key: incoming.headers["x-api-key"] ?? null,
+        echo: incoming.headers["x-echo"] ?? null,
         serviceSecret: "service-secret-value-123",
       }),
     );
@@ -233,6 +234,9 @@ describe("roach service", () => {
         rules: [{ name: "model", match: {}, values: { slow: "(a+)+$" } }],
       }),
     ).rejects.toThrow(/not a pattern that the service allows/);
+    await expect(
+      startRun("write-token", "auto", { secrets: [42 as unknown as string] }),
+    ).rejects.toThrow(/secrets must be a list/);
     await startRun("write-token", "auto", {
       rules: [
         { name: "model", match: {}, values: { id: VALUE_PATTERNS.uuid } },
@@ -281,18 +285,26 @@ describe("roach service", () => {
     expect(liveRequests).toBe(1);
   });
 
-  it("redacts request credentials and the secrets of the service", async () => {
-    const run = await startRun("write-token", "auto");
+  it("redacts request credentials and the secrets of the service and the run", async () => {
+    // A run secret is not in a credential header, so only the run config
+    // tells the service about it.
+    const run = await startRun("write-token", "auto", {
+      secrets: ["run-secret-value-789"],
+    });
     const response = await send(
       run.url,
       { prompt: "hi" },
-      { "x-api-key": "sk-live-request-key-456" },
+      {
+        "x-api-key": "sk-live-request-key-456",
+        "x-echo": "run-secret-value-789",
+      },
     );
 
     // The client gets the redacted body, as a replay would give it.
     expect(JSON.parse(response.body)).toEqual({
       n: 1,
       key: "<<redacted>>",
+      echo: "<<redacted>>",
       serviceSecret: "<<redacted>>",
     });
     const [file] = await recordings("acme/alpha");
@@ -302,5 +314,6 @@ describe("roach service", () => {
     );
     expect(text).not.toContain("sk-live-request-key-456");
     expect(text).not.toContain("service-secret-value-123");
+    expect(text).not.toContain("run-secret-value-789");
   });
 });
