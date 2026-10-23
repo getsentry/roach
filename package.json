@@ -32,7 +32,7 @@
     "typecheck": "tsc -p ."
   },
   "dependencies": {
-    "@sentry/node": "11.6.0"
+    "@sentry/node": "11.8.0"
   },
   "devDependencies": {
     "@sentry/dotagents": "^3.3.0",
