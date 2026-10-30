@@ -1,0 +1,126 @@
+name: Deploy
+
+# Deploy main when it is green. When the Image workflow pushed `:<sha>`,
+# CI passed for the same commit, and the commit is still the head of main,
+# move `:main` to `:<sha>` and reset the VM, which pulls `:main` at each
+# start. See "Deploy" in README.md.
+on:
+  workflow_run:
+    workflows: [Image]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+# One deploy at a time. A newer commit replaces a deploy that waits.
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+env:
+  # The values of deploy/gcp/roach.tfvars and variables.tf.
+  GCP_PROJECT: roach-511216
+  GCP_ZONE: us-east1-b
+  INSTANCE: roach
+  DOMAIN: roach-proxy.getsentry.net
+  IMAGE: ghcr.io/getsentry/roach
+  SHA: ${{ github.event.workflow_run.head_sha }}
+
+jobs:
+  promote:
+    name: promote
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    outputs:
+      promoted: ${{ steps.head.outputs.promoted }}
+    steps:
+      - name: Wait for CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for _ in $(seq 60); do
+            run=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml \
+              --commit "$SHA" --event push --limit 1 --json status,conclusion)
+            if [ "$(jq -r '.[0].status' <<<"$run")" = completed ]; then
+              conclusion=$(jq -r '.[0].conclusion' <<<"$run")
+              if [ "$conclusion" = success ]; then exit 0; fi
+              echo "::error::CI of $SHA is $conclusion. Nothing deploys."
+              exit 1
+            fi
+            sleep 20
+          done
+          echo "::error::CI of $SHA did not end in 20 minutes."
+          exit 1
+
+      # Do not go back to an older commit when a newer one is on main.
+      # The newer commit deploys when it is green.
+      - name: Check that the commit is the head of main
+        id: head
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          head=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
+          if [ "$head" != "$SHA" ]; then
+            echo "::notice::main is at $head now, not $SHA. Nothing deploys."
+            echo "promoted=false" >>"$GITHUB_OUTPUT"
+          else
+            echo "promoted=true" >>"$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.head.outputs.promoted == 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Move :main to the commit
+        if: steps.head.outputs.promoted == 'true'
+        run: docker buildx imagetools create --tag "$IMAGE:main" "$IMAGE:$SHA"
+
+  deploy:
+    name: deploy
+    needs: promote
+    # The variables come from `terraform output` (see "Set up" in
+    # README.md). Until they are set, the VM gets the new `:main` only at
+    # its next start.
+    if: >-
+      needs.promote.outputs.promoted == 'true' &&
+      vars.GCP_WORKLOAD_IDENTITY_PROVIDER != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      # A reset ends the open runs of the service, so their CI jobs fail.
+      - name: Reset the VM
+        run: |
+          gcloud compute instances reset "$INSTANCE" \
+            --project "$GCP_PROJECT" --zone "$GCP_ZONE" --quiet
+
+      - name: Wait for the service
+        run: |
+          sleep 30
+          for _ in $(seq 30); do
+            if curl -fsS -o /dev/null "https://$DOMAIN/__roach/ca.pem"; then
+              echo "Deployed $SHA."
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::https://$DOMAIN did not answer in 5 minutes."
+          exit 1

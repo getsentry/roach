@@ -319,10 +319,20 @@ To see how well the cache works:
   `ghcr.io/getsentry/roach:main`, with a service account that can only use
   the bucket and the secret,
 - an SSL proxy load balancer with a Google-managed certificate. It ends TLS
-  and passes the raw TCP stream, with `CONNECT`, to the VM.
+  and passes the raw TCP stream, with `CONNECT`, to the VM,
+- a service account for the `Deploy` workflow, which GitHub Actions uses
+  through workload identity federation (`deploy.tf`). It can only reset
+  the VM.
 
-The `Image` workflow builds the image on each pull request and pushes it on
-`main`. The VM pulls the image at each start.
+The `Image` workflow builds the image on each pull request and pushes it as
+`:<sha>` on `main`. The VM pulls `:main` at each start.
+
+The `Deploy` workflow deploys `main` when it is green. After the `Image`
+workflow of a commit on `main`, it waits for `CI` of the same commit. When
+both pass and the commit is still the head of `main`, it moves `:main` to
+`:<sha>`, resets the VM, and waits until the service answers. A reset ends
+the open runs, so their CI jobs fail. A red commit does not deploy, and an
+older commit never replaces a newer one.
 
 ### Set up
 
@@ -358,9 +368,24 @@ The `Image` workflow builds the image on each pull request and pushes it on
 
 7. Check it: `curl https://<domain>/__roach/ca.pem` returns the CA
    certificate.
+8. Let the `Deploy` workflow reset the VM. Set two variables of the
+   repository from the outputs. Until they are set, the workflow only
+   moves `:main`, and the VM gets it at its next start:
 
-To deploy a new image, restart the VM:
-`gcloud compute instances reset roach --zone <zone>`.
+   ```sh
+   gh variable set GCP_WORKLOAD_IDENTITY_PROVIDER --repo getsentry/roach \
+     --body "$(terraform output -raw deploy_workload_identity_provider)"
+   gh variable set GCP_DEPLOY_SERVICE_ACCOUNT --repo getsentry/roach \
+     --body "$(terraform output -raw deploy_service_account)"
+   ```
+
+   Another deployment also changes `deploy_repository` and
+   `deploy_repository_id` in its tfvars, and the `env` of
+   `.github/workflows/deploy.yml`.
+
+To deploy by hand, restart the VM:
+`gcloud compute instances reset roach --zone <zone>`. It pulls `:main`,
+the last green commit.
 
 To add a project, add its repository to the repositories of the
 `ROACH_TOKEN` organization secret, in the GitHub settings of the

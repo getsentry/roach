@@ -14,7 +14,14 @@ locals {
 }
 
 resource "google_project_service" "apis" {
-  for_each           = toset(["compute.googleapis.com", "secretmanager.googleapis.com", "storage.googleapis.com"])
+  for_each = toset([
+    "compute.googleapis.com",
+    "iam.googleapis.com",
+    "iamcredentials.googleapis.com",
+    "secretmanager.googleapis.com",
+    "storage.googleapis.com",
+    "sts.googleapis.com",
+  ])
   service            = each.value
   disable_on_destroy = false
 }

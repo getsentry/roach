@@ -18,3 +18,13 @@ output "write_token" {
   value       = random_password.write_token.result
   sensitive   = true
 }
+
+output "deploy_workload_identity_provider" {
+  description = "Set it as the GCP_WORKLOAD_IDENTITY_PROVIDER variable of the repository, for the Deploy workflow."
+  value       = google_iam_workload_identity_pool_provider.github.name
+}
+
+output "deploy_service_account" {
+  description = "Set it as the GCP_DEPLOY_SERVICE_ACCOUNT variable of the repository, for the Deploy workflow."
+  value       = google_service_account.deploy.email
+}

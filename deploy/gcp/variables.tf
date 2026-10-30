@@ -21,9 +21,19 @@ variable "domain" {
 }
 
 variable "image" {
-  description = "The container image of Roach. The VM pulls it each time the service starts."
+  description = "The container image of Roach. The VM pulls it each time the service starts. The Deploy workflow moves `:main` to each green commit of main."
   type        = string
   default     = "ghcr.io/getsentry/roach:main"
+}
+
+variable "deploy_repository" {
+  description = "The GitHub repository, as owner/repo, whose Deploy workflow on main can reset the VM."
+  type        = string
+}
+
+variable "deploy_repository_id" {
+  description = "The numeric id of deploy_repository: `gh api repos/<owner>/<repo> --jq .id`."
+  type        = string
 }
 
 variable "machine_type" {
