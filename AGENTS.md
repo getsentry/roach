@@ -26,6 +26,7 @@
 | Service access, limits, and deploy     | "Service" and "Deploy" in `README.md` |
 | Public types                           | `src/types.ts`                        |
 | Map of source files                    | "Files" in `README.md`                |
+| Sentry queries and cache hit rate      | `TELEMETRY.md`                        |
 
 ## Key Conventions
 
