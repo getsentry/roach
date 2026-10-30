@@ -37,6 +37,7 @@ The code in `src/service.ts` and `src/recorder.ts` is authoritative.
 | `run`                       | run name, such as a CI run      | spans only       |
 | `key`                       | recording key of a request      | `roach.key` span |
 | `http.response.status_code` | status to the client            | `roach.request`  |
+| `gen_ai.request.model`      | model of a model call           | `roach.request`  |
 
 `origin` is also a built-in Sentry field. A query on `origin` gives the span
 origin (`manual`) or nothing. Use `tags[origin,string]`.
@@ -109,19 +110,34 @@ sentry explore sentry/roach --dataset spans --period 24h \
 
 ## Cost
 
-Roach does not report tokens or money. So Sentry cannot give the net cost.
+A `roach.request` span of a model call has its token usage as `gen_ai`
+attributes. Sentry calculates the cost from them and its own price of the
+model: `gen_ai.cost.total_tokens`, in USD. Roach has no prices.
 
-- Each live `model` request is one paid model call. Each replayed `model`
-  request is one model call that did not occur.
-- Each dropped `model` recording is a paid call that the next run makes
-  again.
-- To get cost in money, Roach must read the usage or cost of each live model
-  response and send it as a metric. Then a replayed request can count the
-  recorded cost as saved.
+- `result:live` is money that the runs spent.
+- `result:replayed` is money that the recordings saved. A replay has the
+  usage of its recording.
+- A model that Sentry has no price for has tokens, but no cost.
+
+Spent and saved, by rule and model.
+
+```bash
+sentry explore sentry/roach --dataset spans --period 24h \
+  -q 'span.op:roach.request has:gen_ai.usage.input_tokens' \
+  -F result -F rule -F gen_ai.request.model \
+  -F 'sum(gen_ai.cost.total_tokens)' -F 'sum(gen_ai.usage.input_tokens)' \
+  -F 'sum(gen_ai.usage.output_tokens)' -F 'count()'
+```
+
+Money that failed tests wasted. A dropped recording was a paid live call,
+and the next run makes it again. Compare `roach.recording.write` with
+`result:dropped` to the cost of `result:live`.
 
 ## Limits
 
 - Metrics have only `tenant`, `mode`, `rule`, `origin`, and `result`. Use
   spans for `run` and `key`.
 - Telemetry never has a body, a credential, or the path or query of a URL.
-  So you cannot see the model, the prompt, or the test name in Sentry.
+  From a model call, it has only the model name and the token counts. So
+  you cannot see the prompt or the test name in Sentry.
+- Cost is on spans only, not on metrics.

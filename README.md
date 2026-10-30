@@ -261,7 +261,10 @@ Each proxied request is one trace. Each span has `tenant`, `mode`, and
 
 - `roach.run.start`: a new run, with `write` (the run has the write token).
 - `roach.request`: one proxied request, named `<method> <origin>`, with
-  `origin`, `rule`, `result`, and `http.response.status_code`. It contains:
+  `origin`, `rule`, `result`, and `http.response.status_code`. When a
+  replayed or live response has token usage, the span also has the
+  `gen_ai` attributes of the model call (`usage.ts`). Sentry then
+  calculates its cost in USD as `gen_ai.cost.total_tokens`. It contains:
   - `roach.key`: the key of the request, with `rule` and `key`.
   - `roach.store.read`: a read of a recording, with `key` and `result`:
     `hit` or `miss`.
@@ -272,6 +275,7 @@ Each proxied request is one trace. Each span has `tenant`, `mode`, and
   own trace.
 
 Telemetry never has a credential, a body, or the path or query of a URL.
+From a model call, it has only the model name and the token counts.
 So the service turns off the request data and the HTTP spans of the SDK,
 and it adds no trace headers to the requests that it sends.
 
@@ -447,6 +451,7 @@ The proxy is in `src/`. Tests are in `tests/`. The production setup is in
 - `gcs.ts`: the GCS store.
 - `values.ts`: changing values and their placeholders.
 - `streams.ts`: merges the deltas of a recorded model stream.
+- `usage.ts`: the token usage of a model response, for Sentry.
 - `secrets.ts`: redaction of credentials.
 - `certificates.ts`: the certificate authority for HTTPS.
 - `client.ts`: starts a run and calls the control API.

@@ -101,6 +101,39 @@ function readEnvelope(envelope: string) {
   }
 }
 
+/**
+ * An Anthropic Messages stream with its usage. The first event gives the
+ * input tokens, and the last one gives the total output tokens.
+ */
+const modelStream = (n: number) =>
+  [
+    {
+      type: "message_start",
+      message: {
+        model: "claude-test",
+        usage: {
+          input_tokens: 10,
+          cache_read_input_tokens: 100,
+          cache_creation_input_tokens: 20,
+          output_tokens: 1,
+        },
+      },
+    },
+    { type: "message_delta", n, usage: { output_tokens: 7 } },
+  ]
+    .map((data) => `event: ${data.type}\ndata: ${JSON.stringify(data)}\n\n`)
+    .join("");
+
+/** The `gen_ai` attributes of a response of `modelStream`. */
+const MODEL_USAGE = {
+  "gen_ai.operation.name": "chat",
+  "gen_ai.request.model": "anthropic/claude-test",
+  "gen_ai.usage.input_tokens": 130,
+  "gen_ai.usage.output_tokens": 7,
+  "gen_ai.usage.cache_read.input_tokens": 100,
+  "gen_ai.usage.cache_creation.input_tokens": 20,
+};
+
 /** The metrics of one request of the `model` rule. */
 function requestMetrics(mode: string, result: string) {
   const attributes = {
@@ -147,7 +180,7 @@ async function ciJob(job: {
     `import { readFileSync } from "node:fs";
 const response = await fetch(${JSON.stringify(`${upstreamOrigin}/v1/messages`)}, {
   method: "POST",
-  body: JSON.stringify({ prompt: ${JSON.stringify(job.prompt)} }),
+  body: JSON.stringify({ model: "anthropic/claude-test", prompt: ${JSON.stringify(job.prompt)} }),
 });
 console.log(JSON.stringify({
   response: { status: response.status, source: response.headers.get("x-roach"), body: await response.text() },
@@ -247,8 +280,8 @@ beforeAll(async () => {
   const upstream = https.createServer(host, (incoming, outgoing) => {
     liveRequests += 1;
     upstreamHeaders.push(incoming.headers);
-    outgoing.writeHead(200, { "content-type": "application/json" });
-    outgoing.end(JSON.stringify({ n: liveRequests }));
+    outgoing.writeHead(200, { "content-type": "text/event-stream" });
+    outgoing.end(modelStream(liveRequests));
   });
   upstreamOrigin = `https://127.0.0.2:${await listen(upstream, "127.0.0.2")}`;
 
@@ -374,7 +407,7 @@ describe("deployed roach", () => {
     expect(writer.response).toEqual({
       status: 200,
       source: "live",
-      body: JSON.stringify({ n: 1 }),
+      body: modelStream(1),
     });
     expect(writer.summary).toContain("1 recordings new or changed");
     // The command never sees the write token.
@@ -395,7 +428,7 @@ describe("deployed roach", () => {
     expect(fork.response).toEqual({
       status: 200,
       source: "replayed",
-      body: JSON.stringify({ n: 1 }),
+      body: modelStream(1),
     });
     expect(liveRequests).toBe(1);
 
@@ -470,14 +503,20 @@ describe("deployed roach", () => {
       origin: upstreamOrigin,
       result: "live",
       "http.response.status_code": 200,
+      ...MODEL_USAGE,
     });
+    // A replay reports the usage of its recording: the call that it saved.
     expect(span("roach.request", "fork-1")).toMatchObject({
       result: "replayed",
+      ...MODEL_USAGE,
     });
     expect(span("roach.request", "miss-1")).toMatchObject({
       result: "missed",
       "http.response.status_code": 412,
     });
+    expect(span("roach.request", "miss-1")).not.toHaveProperty(
+      "gen_ai.operation.name",
+    );
     expect(span("roach.key", "writer-1")).toMatchObject({ key: relativeKey });
     expect(span("roach.store.read", "writer-1")).toMatchObject({
       key: relativeKey,
