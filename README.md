@@ -325,8 +325,9 @@ The `Image` workflow builds the image on each pull request and pushes it on
 1. Make the package `ghcr.io/getsentry/roach` public once, after the first
    push to `main`, so the VM can pull it without credentials.
 2. `deploy/gcp/roach.tfvars` has the values of the Sentry deployment: the
-   GCP project `roach-511216` and the domain. Another deployment changes
-   these values. It has no origins or patterns: runs send them.
+   GCP project `roach-511216`, the domain, and the DSN of the `sentry/roach`
+   project. Another deployment changes these values. It has no origins or
+   patterns: runs send them.
 3. The Terraform state is in the private bucket that `backend "gcs"` in
    `versions.tf` names. The state holds the CA key and the write token, so
    the bucket must stay private. Make the bucket before the first
