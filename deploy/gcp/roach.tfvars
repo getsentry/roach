@@ -7,6 +7,10 @@ project = "roach-511216"
 # The record is in getsentry/ops (getsentry/ops#24232).
 domain = "roach-proxy.getsentry.net"
 
+# The Deploy workflow of this repository resets the VM (deploy.tf).
+deploy_repository    = "getsentry/roach"
+deploy_repository_id = "1412275249"
+
 # Runs send their own origins and value patterns (RunConfig in src/service.ts),
 # so a tenant needs no change here.
 

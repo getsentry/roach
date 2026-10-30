@@ -2,8 +2,9 @@ name: Image
 
 # Build the service image on each pull request. On main and release
 # branches, also push it to ghcr.io/getsentry/roach as `:<sha>`. On main,
-# also push `:main`, which deploy/gcp pulls. A release copies `:<sha>` to
-# `:<version>` (`.craft.yml`).
+# the Deploy workflow then moves `:main`, which deploy/gcp pulls, to
+# `:<sha>` when CI passed. A release copies `:<sha>` to `:<version>`
+# (`.craft.yml`).
 on:
   push:
     branches: [main, "release/**"]
@@ -39,9 +40,7 @@ jobs:
         with:
           context: .
           push: ${{ github.event_name == 'push' }}
-          tags: |
-            ghcr.io/getsentry/roach:${{ github.sha }}
-            ${{ github.ref == 'refs/heads/main' && 'ghcr.io/getsentry/roach:main' || '' }}
+          tags: ghcr.io/getsentry/roach:${{ github.sha }}
 
   terraform:
     name: terraform
