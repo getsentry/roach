@@ -10,4 +10,6 @@ domain = "roach-proxy.getsentry.net"
 # Runs send their own origins and value patterns (RunConfig in src/service.ts),
 # so a tenant needs no change here.
 
-# To send metrics to Sentry, set TF_VAR_sentry_dsn when you apply.
+# The service sends metrics and spans to the sentry/roach project.
+# A DSN only lets a client send events, so it is not a secret.
+sentry_dsn = "https://68127ffce4e8fa6bdc3270d3c7570821@o1.ingest.us.sentry.io/4512346152763392"
