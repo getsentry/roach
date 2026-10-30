@@ -31,6 +31,7 @@ import {
   mapStreamEvents,
   mergeStreamDeltas,
 } from "./streams.ts";
+import { usageAttributes } from "./usage.ts";
 import type {
   RecordingMiss,
   RecordingMode,
@@ -307,9 +308,17 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
           }
         }
       }
-      const report = (result: ResponseSource) => {
+      const report = (result: ResponseSource, response?: ProxyResponse) => {
         const attributes = { rule: rule.name, origin, result };
         telemetry.annotate({ result });
+        const usage =
+          response &&
+          usageAttributes(
+            request.body.toString("utf8"),
+            response.headers["content-type"],
+            response.body.toString("utf8"),
+          );
+        if (usage) telemetry.annotate(usage);
         telemetry.count("roach.request", 1, attributes);
         telemetry.time(
           "roach.request.duration",
@@ -322,11 +331,9 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
         const recording = await store.read(key);
         if (recording) {
           counts.replayed += 1;
-          report("replayed");
-          return {
-            ...fromRecording(recording, keyed.values),
-            source: "replayed",
-          };
+          const response = fromRecording(recording, keyed.values);
+          report("replayed", response);
+          return { ...response, source: "replayed" };
         }
         reportMiss(rule, key, owner);
         if (config.mode === "replay") {
@@ -367,8 +374,9 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
       if (!isTemporaryStatus(recording.response.status)) {
         await record(owner, key, recording);
       }
-      report("live");
-      return { ...fromRecording(recording, keyed.values), source: "live" };
+      const response = fromRecording(recording, keyed.values);
+      report("live", response);
+      return { ...response, source: "live" };
     },
 
     /** Open the session of one test. An open session fails first. */
