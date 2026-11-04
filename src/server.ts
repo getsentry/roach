@@ -24,9 +24,7 @@ import tls from "node:tls";
 import { isPublicAddress, notPublicError, publicLookup } from "./addresses.ts";
 import type { CertificateAuthority } from "./certificates.ts";
 import type { ProxyRequest, Recorder, Telemetry } from "./recorder.ts";
-
-/** The path prefix of the control API. */
-export const CONTROL_PATH = "/__roach";
+import type { OpenedSession } from "./types.ts";
 
 /** Headers for one connection, which the proxy must not forward. */
 const HOP_HEADERS = new Set([
@@ -176,6 +174,7 @@ function sendUpstream(
 /** Proxy one request to an allowed origin, through the recorder. */
 async function proxyRequest(
   { recorder, origins, replayOnly, privateNetworks = false }: ProxyTarget,
+  session: string | undefined,
   incoming: http.IncomingMessage,
   outgoing: http.ServerResponse,
   tunnelOrigin: string | undefined,
@@ -218,17 +217,22 @@ async function proxyRequest(
     return;
   }
 
-  const response = await recorder.respond(rule, request, async () => {
-    // Ask for a plain body, so the recording is readable.
-    const upstream = await sendUpstream(origin, request, privateNetworks, {
-      "accept-encoding": "identity",
-    });
-    return {
-      status: upstream.statusCode ?? 502,
-      headers: upstream.headers,
-      body: await readBody(upstream),
-    };
-  });
+  const response = await recorder.respond(
+    rule,
+    request,
+    async () => {
+      // Ask for a plain body, so the recording is readable.
+      const upstream = await sendUpstream(origin, request, privateNetworks, {
+        "accept-encoding": "identity",
+      });
+      return {
+        status: upstream.statusCode ?? 502,
+        headers: upstream.headers,
+        body: await readBody(upstream),
+      };
+    },
+    session,
+  );
   outgoing.writeHead(response.status, {
     ...response.headers,
     "content-length": String(response.body.length),
@@ -250,13 +254,15 @@ export function sendJson(
 /**
  * Answer a session or stats call of one recorder. `route` is the method
  * and the path after the prefix of the run, such as `POST /session`.
- * Returns `false` when the route is not one of them.
+ * `sessionUrl` gives the proxy URL of a session id. Returns `false` when
+ * the route is not one of them.
  */
 export async function controlRecorder(
   recorder: Recorder,
   route: string,
   incoming: http.IncomingMessage,
   outgoing: http.ServerResponse,
+  sessionUrl: (id: string) => string,
 ): Promise<boolean> {
   switch (route) {
     case "GET /stats":
@@ -268,8 +274,14 @@ export async function controlRecorder(
         sendJson(outgoing, 400, { error: "name must be a string" });
         return true;
       }
-      await recorder.startSession(name);
-      outgoing.writeHead(204).end();
+      try {
+        const id = await recorder.startSession(name);
+        sendJson(outgoing, 200, {
+          url: sessionUrl(id),
+        } satisfies OpenedSession);
+      } catch (error) {
+        sendJson(outgoing, 429, { error: (error as Error).message });
+      }
       return true;
     }
     case "POST /session/end": {
@@ -310,8 +322,13 @@ export interface ProxyTarget {
   telemetry: Telemetry;
 }
 
-/** A target, or the HTTP status that refuses the request. */
-export type TargetResult = ProxyTarget | { status: 403 | 407 };
+/**
+ * The target of a request and the session id of its proxy URL, or the HTTP
+ * status that refuses the request.
+ */
+export type TargetResult =
+  | { target: ProxyTarget; session: string | undefined }
+  | { status: 403 | 407 };
 
 /** The options of `listenProxy()`. */
 export interface ListenOptions {
@@ -354,7 +371,7 @@ function refuse(status: 403 | 407, outgoing: http.ServerResponse): void {
 
 /** Proxy one request through its target, and answer errors with 502. */
 function serveProxied(
-  target: ProxyTarget,
+  { target, session }: { target: ProxyTarget; session: string | undefined },
   incoming: http.IncomingMessage,
   outgoing: http.ServerResponse,
   tunnelOrigin: string | undefined,
@@ -375,7 +392,7 @@ function serveProxied(
         attributes: { origin: String(origin), "http.request.method": method },
       },
       async () => {
-        await proxyRequest(target, incoming, outgoing, tunnelOrigin);
+        await proxyRequest(target, session, incoming, outgoing, tunnelOrigin);
         target.telemetry.annotate({
           "http.response.status_code": outgoing.statusCode,
         });
@@ -401,10 +418,11 @@ export async function listenProxy(
   options: ListenOptions,
 ): Promise<ListeningProxy> {
   const { authority } = options;
-  // The origin and target of each tunnel. Absolute-form requests have none.
+  // The origin, target, and session of each tunnel. Absolute-form requests
+  // have none.
   const tunnels = new WeakMap<
     Socket,
-    { origin: string; target: ProxyTarget }
+    { origin: string; target: ProxyTarget; session: string | undefined }
   >();
   const sockets = new Set<Socket>();
 
@@ -415,7 +433,7 @@ export async function listenProxy(
       outgoing.writeHead(400).end();
       return;
     }
-    serveProxied(tunnel.target, incoming, outgoing, tunnel.origin);
+    serveProxied(tunnel, incoming, outgoing, tunnel.origin);
   });
   const server = http.createServer((incoming, outgoing) => {
     // A request to the proxy itself has a path. A proxied plain HTTP
@@ -463,7 +481,7 @@ export async function listenProxy(
         return;
       }
       const [, host, port] = match as unknown as [string, string, string];
-      const allowed = [...target.origins.values()].some(
+      const allowed = [...target.target.origins.values()].some(
         (origin) => authorityOf(origin) === `${host.toLowerCase()}:${port}`,
       );
       if (!allowed) {
@@ -477,8 +495,8 @@ export async function listenProxy(
         // A TLS handshake starts with byte 0x16. Anything else is plain HTTP.
         if (first[0] !== 0x16) {
           tunnels.set(socket, {
+            ...target,
             origin: `http://${host}${port === "80" ? "" : `:${port}`}`,
-            target,
           });
           tunnelServer.emit("connection", socket);
           socket.resume();
@@ -491,8 +509,8 @@ export async function listenProxy(
         });
         secure.on("error", () => secure.destroy());
         tunnels.set(secure, {
+          ...target,
           origin: `https://${host}${port === "443" ? "" : `:${port}`}`,
-          target,
         });
         tunnelServer.emit("connection", secure);
       };

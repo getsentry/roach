@@ -1,8 +1,12 @@
 /**
- * The public types of Roach: rules, modes, and the results of a run. See
- * `README.md`.
+ * The public contract of Roach: rules, modes, runs, sessions, and the
+ * results of a run. The client, the service, and the vitest integration
+ * share it. See `README.md`.
  */
 import type { ValuePatterns } from "./values.ts";
+
+/** The path prefix of the control API. */
+export const CONTROL_PATH = "/__roach";
 
 /**
  * - `auto`: replay a request that has a recording. Send other requests live
@@ -69,4 +73,58 @@ export interface RecordingStats {
    * recorded. Use this to find traffic that a rule misses.
    */
   passthrough: Record<string, number>;
+}
+
+/** The configuration of one run. The client sends it. */
+export interface RunConfig {
+  /**
+   * The tenant of the run, as `owner/repo`, such as
+   * `process.env.GITHUB_REPOSITORY`.
+   */
+  tenant: string;
+  mode: RecordingMode;
+  rules: RecordingRule[];
+  /**
+   * The only origins that the run can reach, such as
+   * `https://ai-gateway.vercel.sh`. The service sends requests only to
+   * their public addresses.
+   */
+  allow: string[];
+  /**
+   * The name of the run in Sentry, such as
+   * `${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}`. Default: the run id.
+   */
+  name?: string;
+  /**
+   * Credentials that this run must never write, such as the API keys of
+   * its CI job. The service redacts them with the `secrets` of the service
+   * config, keeps them only in memory, and forgets them when the run ends.
+   */
+  secrets?: string[];
+}
+
+/** A run that the service created. */
+export interface RemoteRun {
+  /** The id of the run. */
+  id: string;
+  /**
+   * The proxy URL, with the run id and token as its user and password. A
+   * request through it belongs to the open session when only one is open.
+   */
+  url: string;
+  /** The run token. Session and stats calls use it. */
+  token: string;
+  /** The base URL of the control API of the run. */
+  controlUrl: string;
+  /** The PEM certificate of the authority that signs intercepted hosts. */
+  caCert: string;
+}
+
+/** A session that the service opened. */
+export interface OpenedSession {
+  /**
+   * The proxy URL of the session. Each request through it belongs to the
+   * session, also when other sessions are open.
+   */
+  url: string;
 }

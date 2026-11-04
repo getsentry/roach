@@ -85,6 +85,21 @@ async function send(bodies: unknown[], target = `${origin}/v1/messages`) {
   return responses;
 }
 
+/** Send one request through the proxy URL `url`, such as of a session. */
+async function sendThrough(url: string, body: unknown): Promise<void> {
+  const dispatcher = new ProxyAgent({ uri: url, proxyTunnel: true });
+  try {
+    const response = await request(`${origin}/v1/messages`, {
+      body: JSON.stringify(body),
+      dispatcher,
+      method: "POST",
+    });
+    await response.body.dump();
+  } finally {
+    await dispatcher.close();
+  }
+}
+
 /** Send the requests of one test session, then end it. */
 async function session(running: RemoteRoach, bodies: unknown[], passed = true) {
   const opened = await running.startSession("test");
@@ -309,6 +324,37 @@ describe("recording", () => {
     const [replayed] = await session(running, [{ model: "m" }]);
     expect(replayed!.source).toBe("replayed");
     expect(liveRequests).toBe(1);
+  });
+
+  it("keeps concurrent sessions of one run apart by their proxy URLs", async () => {
+    const running = await start("auto");
+    const failing = await running.startSession("fails");
+    const passing = await running.startSession("passes");
+    await Promise.all([
+      sendThrough(failing.url, { model: "dropped" }),
+      sendThrough(passing.url, { model: "kept" }),
+    ]);
+    // With two open sessions, the run URL names no session, so the request
+    // is outside both and is written at once.
+    await send([{ model: "outside" }]);
+    await failing.end(false);
+    await passing.end(true);
+
+    const recorded = await Promise.all(
+      (await files()).map(async (file) => {
+        const text = await readFile(
+          path.join(directory, TENANT, "model", file),
+          "utf8",
+        );
+        return (JSON.parse(text) as { session?: string }).session ?? null;
+      }),
+    );
+    expect(recorded).toHaveLength(2);
+    expect(recorded).toEqual(expect.arrayContaining([null, "passes"]));
+    await expect(running.stats()).resolves.toMatchObject({
+      written: 2,
+      discarded: 1,
+    });
   });
 
   it("records again in record mode", async () => {

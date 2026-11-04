@@ -7,16 +7,19 @@
  * every read and write of the recordings. A store keeps them: the file
  * store (`recordings.ts`) or a GCS bucket (`gcs.ts`).
  *
- * A session groups the requests of one test. One session is open at a
- * time. The recorder keeps the new recordings of a session in memory until
- * the session ends. A passed session writes them, and a failed session
- * drops them, so a bad sample is never replayed. A request that ends after
- * its session ended follows the result of that session. A request outside
- * a session is written at once.
+ * A session groups the requests of one test. Many sessions can be open at
+ * once, such as one for each test worker. A request names its session in
+ * its proxy URL (`service.ts`). A request that names no session belongs to
+ * the open session when only one is open. The recorder keeps the new
+ * recordings of a session in memory until the session ends. A passed
+ * session writes them, and a failed session drops them, so a bad sample is
+ * never replayed. A request that ends after its session ended follows the
+ * result of that session. A request outside a session is written at once.
  *
  * The recorder never writes a known credential (`secrets.ts`). It reports
  * spans and metrics through the `Telemetry` hooks of `service.ts`.
  */
+import { randomBytes } from "node:crypto";
 import type { IncomingHttpHeaders } from "node:http";
 import { keyRequest, type KeyedRequest } from "./request-key.ts";
 import { createSecrets } from "./secrets.ts";
@@ -82,6 +85,8 @@ export interface Telemetry {
 }
 
 interface Session {
+  /** The id in the proxy URL of the session. */
+  id: string;
   name: string;
   /** New recordings, by key. */
   recorded: Map<string, Recording>;
@@ -97,6 +102,13 @@ interface Session {
 }
 
 const MAX_MISSES = 500;
+/**
+ * Ended sessions that a run keeps, so that late requests follow their
+ * result. The oldest ones go first, so memory stays bounded.
+ */
+const MAX_ENDED_SESSIONS = 1000;
+/** Open sessions of a run, such as one for each test worker. */
+const MAX_OPEN_SESSIONS = 64;
 /** Response headers that a recording keeps. Other headers change each run. */
 const RECORDED_HEADERS = ["content-type", "location"];
 const NULL_BODY_STATUSES = new Set([101, 204, 205, 304]);
@@ -177,7 +189,10 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
       throw new Error(`Roach rule name is not valid: ${rule.name}`);
     }
   }
-  let session: Session | undefined;
+  /** Sessions by id. An ended session stays, so its late requests follow it. */
+  const sessions = new Map<string, Session>();
+  const open = () =>
+    [...sessions.values()].filter((s) => s.passed === undefined);
   const { telemetry } = config;
   const secrets = createSecrets(config.secrets);
   const stats: RecordingStats = {
@@ -240,15 +255,25 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
     process.stderr.write(`[roach] No ${rule.name} recording${where}: ${key}\n`);
   };
 
-  /** End the open session. Returns its requests that `replay` mode failed. */
-  const finish = async (passed: boolean): Promise<number> => {
-    const ended = session;
-    if (!ended) return 0;
-    session = undefined;
+  /** End a session. Returns its requests that `replay` mode failed. */
+  const finish = async (ended: Session, passed: boolean): Promise<number> => {
     ended.passed = passed;
-    if (passed) await write([...ended.recorded]);
-    else drop([...ended.recorded.keys()]);
+    const recorded = [...ended.recorded];
+    ended.recorded.clear();
+    ended.known.clear();
+    if (passed) await write(recorded);
+    else drop(recorded.map(([key]) => key));
     return ended.missed;
+  };
+
+  /**
+   * The session of a request. `id` comes from its proxy URL. Without it,
+   * the request belongs to the open session when only one is open.
+   */
+  const sessionOf = (id: string | undefined): Session | undefined => {
+    if (id !== undefined) return sessions.get(id);
+    const current = open();
+    return current.length === 1 ? current[0] : undefined;
   };
 
   return {
@@ -275,11 +300,12 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
       rule: RecordingRule,
       request: ProxyRequest,
       sendLive: () => Promise<ProxyResponse>,
+      sessionId?: string,
     ): Promise<ProxyResponse & { source: ResponseSource }> {
       const started = performance.now();
       const origin = request.url.origin;
       // A request belongs to the session that was open when it started.
-      const owner = session;
+      const owner = sessionOf(sessionId);
       const counts = stats.counts[rule.name]!;
       secrets.learn(request.headers);
       telemetry.annotate({ rule: rule.name });
@@ -379,40 +405,57 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
       return { ...response, source: "live" };
     },
 
-    /** Open the session of one test. An open session fails first. */
-    async startSession(name: string): Promise<void> {
-      if (session) {
+    /**
+     * Open the session of one test, and return its id. An open session with
+     * the same name fails first. Throws when the run has too many open
+     * sessions.
+     */
+    async startSession(name: string): Promise<string> {
+      const same = open().find((other) => other.name === name);
+      if (same) {
         process.stderr.write(
-          `[roach] Session "${session.name}" did not end, so its new recordings were dropped\n`,
+          `[roach] Session "${name}" did not end, so its new recordings were dropped\n`,
         );
-        await finish(false);
+        await finish(same, false);
       }
-      session = {
+      if (open().length >= MAX_OPEN_SESSIONS) {
+        throw new Error(`A run can have ${MAX_OPEN_SESSIONS} open sessions`);
+      }
+      const ended = [...sessions.values()].filter(
+        (other) => other.passed !== undefined,
+      );
+      const extra = ended.length - MAX_ENDED_SESSIONS + 1;
+      for (const old of ended.slice(0, Math.max(0, extra))) {
+        sessions.delete(old.id);
+      }
+      const id = randomBytes(8).toString("hex");
+      sessions.set(id, {
+        id,
         name,
         recorded: new Map(),
         missed: 0,
         known: new Map(),
-      };
+      });
+      return id;
     },
 
     /**
-     * End the session `name`. Returns its requests that `replay` mode
-     * failed. Throws when `name` is not the open session.
+     * End the open session `name`. Returns its requests that `replay` mode
+     * failed. Throws when no open session has that name.
      */
     async endSession(name: string, passed: boolean): Promise<number> {
-      if (session?.name !== name) {
-        throw new Error(`Session "${name}" is not open`);
-      }
-      return finish(passed);
+      const ended = open().find((other) => other.name === name);
+      if (!ended) throw new Error(`Session "${name}" is not open`);
+      return finish(ended, passed);
     },
 
     stats(): RecordingStats {
       return stats;
     },
 
-    /** Fail the open session. */
+    /** Fail the open sessions. */
     async close(): Promise<void> {
-      await finish(false);
+      for (const session of open()) await finish(session, false);
     },
   };
 }

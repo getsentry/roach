@@ -16,6 +16,44 @@ Roach started in
 It uses Node built-ins and the `openssl` command. Only the service uses the
 Sentry SDK (`@sentry/node`).
 
+## Use with vitest
+
+Install `@sentry/roach`, add a `roach.json` (see [Config file](#config-file)),
+and add two lines to the vitest config:
+
+```ts
+export default defineConfig({
+  test: {
+    globalSetup: ["@sentry/roach/vitest"],
+    setupFiles: ["@sentry/roach/vitest/setup"],
+  },
+});
+```
+
+The global setup (`src/vitest.ts`) starts one run for the invocation and
+gives its proxy variables to the test workers. The setup file
+(`src/vitest-setup.ts`) opens one session for each test, so test files
+record in parallel workers at the same time. A passed test writes its new
+recordings. A failed test drops them. In `replay` mode, a test with a miss
+fails. At the end, the global setup writes the stats of the run to stdout
+and to the job summary.
+
+- `ROACH_TOKEN`: the write token. Only the global setup reads it. Without
+  it, the run can only replay, as in jobs of forks.
+- `ROACH_URL`: the service. Default: `https://roach-proxy.getsentry.net`.
+- `ROACH_MODE`: `auto`, `replay`, `record`, or `off`. Default: `auto` with
+  the token, `replay` without it. With `off`, the global setup starts no run,
+  so requests go direct and need no service and no token.
+
+A project that has its own global setup calls `startRoach(project)` from
+`@sentry/roach/vitest` in it, and returns its teardown.
+
+- It needs Node 24.14 or later (`http.setGlobalProxyFromEnv`).
+- The tests of one file share one process, so they run one at a time. Do
+  not use `test.concurrent`.
+- The package has TypeScript sources. Vitest compiles them, but Node does
+  not strip types in `node_modules`, so plain Node scripts cannot import it.
+
 ## Use the service
 
 ```ts
@@ -43,7 +81,7 @@ const run = await startRemoteRun(
 spawn("vitest", { env: { ...process.env, ...run.env } });
 
 // Once per test, in a worker that has the `controlUrl` and `token` of the
-// run.
+// run. Send the requests of the test through `session.url`.
 const session = await connectRoach({ controlUrl, token }).startSession(
   testName,
 );
@@ -62,7 +100,8 @@ A client that does not use `client.ts` can do the same with plain HTTP. See
 
 ## Use the GitHub Action
 
-A repository adds one step and a `roach.json` file:
+A repository adds one step and a `roach.json` file (see
+[Config file](#config-file)):
 
 ```yaml
 - uses: getsentry/roach@v0
@@ -71,38 +110,56 @@ A repository adds one step and a `roach.json` file:
     run: pnpm test
 ```
 
-`roach.json` is at the root of the repository. It has the `allow` origins
-and the `rules` of the run (`RunConfig` in `src/service.ts`):
-
-```json
-{
-  "allow": ["https://ai-gateway.vercel.sh"],
-  "rules": [
-    {
-      "name": "model",
-      "match": { "method": "POST", "url": "https://ai-gateway.vercel.sh/" },
-      "keyHeaders": ["ai-model-id"]
-    }
-  ]
-}
-```
-
-The action (`src/action.ts`) starts a run of the tenant
-`GITHUB_REPOSITORY`, in `auto` mode with the token or `replay` mode without
-it. It runs `run` in bash with the proxy variables of the run, then ends
-the run and writes its stats to the job summary.
+The action (`src/action.ts`) starts a run with the token in `auto` mode, or
+without it in `replay` mode. It runs `run` in bash with the proxy variables
+of the run, then ends the run and writes its stats to the job summary.
 
 - Only `run` uses the proxy. Later steps, such as cache and artifact
   uploads, do not. `run` does not get the write token.
 - `run` is one session. When it fails, the run drops its new recordings. A
   miss in `replay` mode fails the step. The summary names the job, not the
-  test, of each miss.
+  test, of each miss. For a session per test, use
+  [vitest](#use-with-vitest) in `run`.
 - `NODE_EXTRA_CA_CERTS` works only for Node. Python and `curl` need a CA
   bundle that also has the system certificates.
 
+## Config file
+
+The action and the vitest integration read `roach.json` in the working
+directory or the closest parent directory (`src/config.ts`):
+
+```json
+{
+  "allow": ["https://api.anthropic.com"],
+  "secretEnv": ["ANTHROPIC_API_KEY"],
+  "rules": [
+    {
+      "name": "model",
+      "match": { "method": "POST", "url": "https://api.anthropic.com/v1/" },
+      "values": {
+        "uuid": { "builtin": "uuid" },
+        "build": "build-[0-9]+"
+      }
+    }
+  ]
+}
+```
+
+- `allow` and `rules` are those of the run. See [Config](#config).
+- A value is a regular expression source, or `{ "builtin": "<name>" }`
+  for a pattern of `VALUE_PATTERNS` in `values.ts`.
+- `secretEnv`: environment variables that hold credentials. Their values
+  are the `secrets` of the run.
+- `tenant`: default `GITHUB_REPOSITORY`. Set it, so local runs use the
+  recordings of CI.
+- `noProxy`: hosts that do not use the proxy. Default: loopback.
+
+The `name` of the run is `<GITHUB_RUN_ID>-<GITHUB_RUN_ATTEMPT>` in GitHub
+Actions.
+
 ## Config
 
-A run takes `RunConfig` (`src/service.ts`): `tenant`, `mode`, `rules`,
+A run takes `RunConfig` (`src/types.ts`): `tenant`, `mode`, `rules`,
 `allow`, `name`, and `secrets`.
 
 - `mode`: `auto` replays recordings and records misses. `replay` replays
@@ -141,8 +198,10 @@ headers, and the body. A JSON body has sorted keys. A recording keeps the
 response and the session that recorded it. It does not keep the request
 body.
 
-- One session is open at a time. The proxy keeps the new recordings of a
-  session in memory. A passed session writes them, and a failed session
+- Many sessions can be open at once. A request belongs to the session of
+  its proxy URL (`url` of the session). A request through the proxy URL of
+  the run belongs to the open session when only one is open. The proxy
+  keeps the new recordings of a session in memory. A passed session writes them, and a failed session
   drops them, so a bad sample is never replayed.
 - A request belongs to the session that was open when it started. If it
   ends after its session ended, it follows the result of that session.
@@ -410,7 +469,10 @@ It starts the service and prints its URL as one JSON line.
 The calls of a run are under `/__roach/runs/<id>`. They need
 `Authorization: Bearer <run token>`. `client.ts` calls them.
 
-- `POST /session` with `{"name": "..."}`: open a session.
+- `POST /session` with `{"name": "..."}`: open a session. Returns
+  `{"url": "..."}`, the proxy URL of the session. Its user is
+  `<run id>-<session id>`. An open session with the same name fails
+  first. A run can have 64 open sessions. Another one gets HTTP 429.
 - `POST /session/end` with `{"name": "...", "passed": true}`: end it.
   Returns `{"missed": 0}`, the misses that `replay` mode failed. Returns
   HTTP 409 when the session is not open.
@@ -434,9 +496,12 @@ manager accepts it, Craft:
 - copies the image `ghcr.io/getsentry/roach:<sha>` to `:<version>`.
 - makes the GitHub release `v<version>`, with the changelog, and moves the
   `v<major>` tag. Repositories use the action as `getsentry/roach@v<major>`.
+- publishes `@sentry/roach` to npm: the tarball that the `package` job of
+  `CI` uploads for the release commit. Craft writes the version to
+  `package.json` on the release branch.
 
-The action runs `src/action.ts` from the tag, so a release has no build
-step.
+The action runs `src/action.ts` from the tag, and the package has the
+sources, so a release has no build step.
 
 The `Release` workflow uses the token of Sentry Release Bot. A push with
 `GITHUB_TOKEN` starts no workflows, so the release branch gets no checks and
@@ -454,6 +519,8 @@ pnpm check   # format, lint, types, unused code, and tests, as CI runs them
 - `tests/recording.test.ts` tests modes, sessions, changing values, and
   misses.
 - `tests/service.test.ts` tests the service in the test process.
+- `tests/vitest.test.ts` runs vitest with the integration on a small
+  project, against a service in the test process.
 - `tests/deployed.test.ts` runs the service as it runs in production: from
   the command line, behind a TLS server that does what the load balancer
   does, with a local GCS server, metadata server, and Sentry server. Each
@@ -465,7 +532,7 @@ pnpm check   # format, lint, types, unused code, and tests, as CI runs them
 The proxy is in `src/`. Tests are in `tests/`. The production setup is in
 `deploy/gcp/` and `Dockerfile`.
 
-- `types.ts`: rules, modes, and the results of a run.
+- `types.ts`: rules, modes, runs, sessions, and the results of a run.
 - `server.ts`: sockets, HTTPS interception, the allow list, and the control
   API.
 - `addresses.ts`: the public addresses that the proxy can send requests to.
@@ -481,6 +548,9 @@ The proxy is in `src/`. Tests are in `tests/`. The production setup is in
 - `secrets.ts`: redaction of credentials.
 - `certificates.ts`: the certificate authority for HTTPS.
 - `client.ts`: starts a run and calls the control API.
+- `config.ts`: `roach.json`, for the action and vitest.
+- `vitest.ts`: the vitest global setup: one run for each invocation.
+- `vitest-setup.ts`: the vitest setup file: one session for each test.
 - `report.ts`: text reports of a run.
 - `action.ts`: the GitHub Action (`action.yml` at the root).
 - `cli.ts`: the command line.
