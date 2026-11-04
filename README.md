@@ -125,8 +125,9 @@ A run takes `RunConfig` (`src/service.ts`): `tenant`, `mode`, `rules`,
   goes to a model in a prompt. The service keeps them only in memory, for
   the run. A run can have 32 of them. It also learns the value of each request header whose name can mean a credential,
   such as one with `auth`, `token`, `key`, `secret`, `cookie`, or `session`.
-  The match is broad on purpose. Recordings show `<<redacted>>` in place of
-  each known value.
+  The match is broad on purpose. It does not learn `x-session-affinity`,
+  because that header has a conversation id and not a credential.
+  Recordings show `<<redacted>>` in place of each known value.
 
 Requests that match no rule go live without a change, and their responses
 stream. Each response has an `x-roach` header: `replayed`, `live`,

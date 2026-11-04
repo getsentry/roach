@@ -91,6 +91,7 @@ beforeEach(async () => {
         n: liveRequests,
         key: incoming.headers["x-api-key"] ?? null,
         echo: incoming.headers["x-echo"] ?? null,
+        affinity: incoming.headers["x-session-affinity"] ?? null,
         serviceSecret: "service-secret-value-123",
       }),
     );
@@ -386,6 +387,7 @@ describe("roach service", () => {
       n: 1,
       key: "<<redacted>>",
       echo: "<<redacted>>",
+      affinity: null,
       serviceSecret: "<<redacted>>",
     });
     const [file] = await recordings("acme/alpha");
@@ -396,5 +398,31 @@ describe("roach service", () => {
     expect(text).not.toContain("sk-live-request-key-456");
     expect(text).not.toContain("service-secret-value-123");
     expect(text).not.toContain("run-secret-value-789");
+  });
+
+  it("does not redact the session affinity header", async () => {
+    // AI Gateway clients send a conversation id in `x-session-affinity`.
+    // It is not a credential, and the client must get it back as it is.
+    const run = await startRun("write-token", "auto");
+    const response = await send(
+      run.url,
+      { prompt: "hi" },
+      {
+        "x-api-key": "sk-live-request-key-456",
+        "x-session-affinity": "conversation-id-0123456789",
+      },
+    );
+
+    expect(JSON.parse(response.body)).toMatchObject({
+      key: "<<redacted>>",
+      affinity: "conversation-id-0123456789",
+    });
+    const [file] = await recordings("acme/alpha");
+    const text = await readFile(
+      path.join(directory, "acme/alpha", "model", file!),
+      "utf8",
+    );
+    expect(text).toContain("conversation-id-0123456789");
+    expect(text).not.toContain("sk-live-request-key-456");
   });
 });
