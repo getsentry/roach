@@ -11,7 +11,8 @@
  * - `ROACH_TOKEN` is the write token. Only this file reads it, and the
  *   workers do not get it. Without it, the run can only replay.
  * - `ROACH_URL` is the service. Default: the Roach service of Sentry.
- * - `ROACH_MODE` sets the mode. See `runConfigOf()`.
+ * - `ROACH_MODE` sets the mode. See `runConfigOf()`. With `off`, it starts
+ *   no run and does not use the service, so requests go direct.
  */
 import http from "node:http";
 import tls from "node:tls";
@@ -29,7 +30,9 @@ import type { RemoteRun } from "./types.ts";
 declare module "vitest" {
   export interface ProvidedContext {
     /** The run of `@sentry/roach/vitest`, for the test workers. */
-    roach: Pick<RemoteRun, "controlUrl" | "token"> & { noProxy: string };
+    roach:
+      | (Pick<RemoteRun, "controlUrl" | "token"> & { noProxy: string })
+      | null;
   }
 }
 
@@ -48,6 +51,10 @@ export async function startRoach(
   delete process.env.ROACH_TOKEN;
   const file = await readRoachFile();
   const config = runConfigOf(file, { canWrite: token !== undefined });
+  if (config.mode === "off") {
+    project.provide("roach", null);
+    return async () => {};
+  }
   const noProxy = file.noProxy ?? "localhost,127.0.0.1,::1";
   const run = await startRemoteRun(
     { url: readEnv("ROACH_URL") ?? DEFAULT_SERVICE_URL, token },

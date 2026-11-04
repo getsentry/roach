@@ -45,7 +45,10 @@ const send = async (model) => {
 };
 
 it("passes", async () => {
-  expect(await send("${model}")).toMatch(/^(live|replayed)$/);
+  const via = await send("${model}");
+  // In \`off\` mode the request goes direct, so no proxy marks it.
+  if (process.env.ROACH_MODE === "off") expect(via).toBeNull();
+  else expect(via).toMatch(/^(live|replayed)$/);
   // A child process sends through the session of its test too.
   execFileSync(process.execPath, [
     "-e",
@@ -179,6 +182,16 @@ describe("vitest", () => {
     expect(replayed.output).toContain("Roach (replay):");
     expect(replayed.output).toContain("model 4 replayed, 0 live");
     expect(liveRequests).toHaveLength(6);
+  });
+
+  it("sends requests direct in off mode, without the service", async () => {
+    const result = await runVitest({
+      ROACH_MODE: "off",
+      ROACH_URL: "http://127.0.0.1:1",
+    });
+    expect(result).toMatchObject({ code: 0 });
+    expect(liveRequests).toHaveLength(4);
+    await expect(recordedSessions()).resolves.toEqual([]);
   });
 
   it("fails a test whose request has no recording in replay mode", async () => {

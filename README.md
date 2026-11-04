@@ -42,7 +42,8 @@ and to the job summary.
   it, the run can only replay, as in jobs of forks.
 - `ROACH_URL`: the service. Default: `https://roach-proxy.getsentry.net`.
 - `ROACH_MODE`: `auto`, `replay`, `record`, or `off`. Default: `auto` with
-  the token, `replay` without it.
+  the token, `replay` without it. With `off`, the global setup starts no run,
+  so requests go direct and need no service and no token.
 
 A project that has its own global setup calls `startRoach(project)` from
 `@sentry/roach/vitest` in it, and returns its teardown.
