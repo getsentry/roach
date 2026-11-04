@@ -13,6 +13,14 @@ import type { IncomingHttpHeaders } from "node:http";
  */
 const CREDENTIAL_HEADER =
   /auth|token|secret|key|cookie|session|password|credential|signature/i;
+/**
+ * Headers that match `CREDENTIAL_HEADER` but carry no credential. A response
+ * can show their values, and the client must get them back without a change.
+ * AI Gateway clients put a conversation id in `x-session-affinity`, and a
+ * model can repeat that id in its response. Node gives header names in
+ * lower case.
+ */
+const NOT_CREDENTIAL_HEADERS = new Set(["x-session-affinity"]);
 /** Shorter parts, such as `Bearer`, are not credentials. */
 const MIN_LENGTH = 12;
 const REDACTED = "<<redacted>>";
@@ -41,6 +49,7 @@ export function createSecrets(initial: string[] = []) {
     learn(headers: IncomingHttpHeaders): void {
       for (const [name, value] of Object.entries(headers)) {
         if (!CREDENTIAL_HEADER.test(name) || value === undefined) continue;
+        if (NOT_CREDENTIAL_HEADERS.has(name)) continue;
         for (const item of Array.isArray(value) ? value : [value]) add(item);
       }
     },
