@@ -1,22 +1,27 @@
 {
   "name": "@sentry/roach",
-  "private": true,
+  "version": "0.1.0",
   "description": "A recording HTTPS proxy for tests, as a shared service.",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/getsentry/roach.git"
   },
-  "bin": {
-    "roach": "./src/cli.ts"
-  },
+  "files": [
+    "src"
+  ],
   "type": "module",
   "exports": {
     "./client": "./src/client.ts",
     "./report": "./src/report.ts",
     "./service": "./src/service.ts",
     "./types": "./src/types.ts",
-    "./values": "./src/values.ts"
+    "./values": "./src/values.ts",
+    "./vitest": "./src/vitest.ts",
+    "./vitest/setup": "./src/vitest-setup.ts"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "scripts": {
     "check": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm knip && pnpm test",
@@ -47,6 +52,14 @@
     "typescript": "^7.0.2",
     "undici": "^8.11.2",
     "vitest": "^5.0.3"
+  },
+  "peerDependencies": {
+    "vitest": ">=3"
+  },
+  "peerDependenciesMeta": {
+    "vitest": {
+      "optional": true
+    }
   },
   "simple-git-hooks": {
     "pre-commit": "pnpm exec lint-staged",

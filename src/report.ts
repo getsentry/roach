@@ -1,6 +1,7 @@
 /**
  * Text reports of a Roach run, for logs and CI summaries.
  */
+import { appendFile } from "node:fs/promises";
 import type { RecordingMiss, RecordingStats } from "./types.ts";
 
 /** Describe the totals of a run in one line. */
@@ -33,4 +34,22 @@ export function describeRecordingMisses(misses: RecordingMiss[]): string[] {
       return first;
     })
     .map((miss) => `${miss.session ?? "outside a test"}: ${miss.file}`);
+}
+
+/**
+ * Write the report of a run to stdout, and in GitHub Actions also to the
+ * job summary. `title` names the run, such as `Roach (auto)`.
+ */
+export async function writeRunReport(
+  title: string,
+  stats: RecordingStats,
+): Promise<void> {
+  const report = [
+    `${title}: ${describeRecordingStats(stats)}`,
+    ...describeRecordingMisses(stats.misses).map((miss) => `- ${miss}`),
+  ].join("\n");
+  process.stdout.write(`${report}\n`);
+  if (process.env.GITHUB_STEP_SUMMARY) {
+    await appendFile(process.env.GITHUB_STEP_SUMMARY, `${report}\n`);
+  }
 }

@@ -3,14 +3,14 @@
  * `README.md`.
  *
  * It starts a run, runs the command of the step with the proxy variables of
- * the run, and ends the run. The rules of the run come from `roach.json`.
+ * the run, and ends the run. The run config comes from `roach.json`
+ * (`config.ts`).
  * The runner gives each input as `INPUT_<NAME>`.
  */
 import { spawn } from "node:child_process";
-import { appendFile, readFile } from "node:fs/promises";
 import { startRemoteRun } from "./client.ts";
-import { describeRecordingMisses, describeRecordingStats } from "./report.ts";
-import type { RunConfig } from "./service.ts";
+import { readEnv, readRoachFile, runConfigOf } from "./config.ts";
+import { writeRunReport } from "./report.ts";
 
 /**
  * Variables that the command does not get: the inputs, which have the token,
@@ -51,22 +51,13 @@ function runCommand(command: string, env: NodeJS.ProcessEnv): Promise<number> {
 const command = process.env.INPUT_RUN;
 if (!command) throw new Error("The run input is required");
 // The runner gives an empty string for an input that the step does not set.
-const token =
-  process.env.INPUT_TOKEN === "" ? undefined : process.env.INPUT_TOKEN;
-// Without the token, the service only allows `replay`, as for forks.
-const mode = token ? "auto" : "replay";
-const config = JSON.parse(await readFile("roach.json", "utf8")) as Pick<
-  RunConfig,
-  "allow" | "rules"
->;
+const token = readEnv("INPUT_TOKEN");
+const file = await readRoachFile();
+const config = runConfigOf(file, { canWrite: token !== undefined });
 const run = await startRemoteRun(
   { url: process.env.INPUT_URL!, token },
-  {
-    ...config,
-    tenant: process.env.GITHUB_REPOSITORY!,
-    mode,
-    name: `${process.env.GITHUB_RUN_ID}-${process.env.GITHUB_RUN_ATTEMPT}`,
-  },
+  config,
+  file.noProxy ? { noProxy: file.noProxy } : {},
 );
 // The proxy URL has the run token. Keep it out of the log.
 process.stdout.write(`::add-mask::${run.token}\n`);
@@ -85,14 +76,6 @@ try {
   const { missed } = await session.end(exitCode === 0);
   if (missed > 0 && exitCode === 0) exitCode = 1;
 } finally {
-  const stats = await run.close();
-  const report = [
-    `Roach (${mode}): ${describeRecordingStats(stats)}`,
-    ...describeRecordingMisses(stats.misses).map((miss) => `- ${miss}`),
-  ].join("\n");
-  process.stdout.write(`${report}\n`);
-  if (process.env.GITHUB_STEP_SUMMARY) {
-    await appendFile(process.env.GITHUB_STEP_SUMMARY, `${report}\n`);
-  }
+  await writeRunReport(`Roach (${config.mode})`, await run.close());
 }
 process.exitCode = exitCode;

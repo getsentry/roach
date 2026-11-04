@@ -11,12 +11,21 @@ import http from "node:http";
 import https from "node:https";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { CONTROL_PATH } from "./server.ts";
-import type { RemoteRun, RunConfig } from "./service.ts";
-import type { RecordingStats } from "./types.ts";
+import {
+  CONTROL_PATH,
+  type OpenedSession,
+  type RecordingStats,
+  type RemoteRun,
+  type RunConfig,
+} from "./types.ts";
 
 /** The open session of one test. */
 export interface RecordingSession {
+  /**
+   * The proxy URL of the session. Send the requests of the test through
+   * it when other sessions of the run can be open at the same time.
+   */
+  url: string;
   /**
    * End the session. A passed session writes its new recordings, and a
    * failed one drops them. `missed` counts the requests of the session that
@@ -27,7 +36,11 @@ export interface RecordingSession {
 
 /** The control API of a run. */
 export interface RoachControl {
-  /** Open the session of one test. Only one session is open at a time. */
+  /**
+   * Open the session of one test. Many sessions can be open at once. A
+   * request through `url` of the run belongs to the open session only when
+   * one is open, so concurrent tests send through `url` of their session.
+   */
   startSession(name: string): Promise<RecordingSession>;
   /** The totals of the run. */
   stats(): Promise<RecordingStats>;
@@ -90,8 +103,15 @@ export function connectRoach({
 }: Pick<RemoteRun, "controlUrl" | "token">): RoachControl {
   return {
     async startSession(name) {
-      await callControl(controlUrl, token, "POST", "session", { name });
+      const { url } = await callControl<OpenedSession>(
+        controlUrl,
+        token,
+        "POST",
+        "session",
+        { name },
+      );
       return {
+        url,
         end: (passed) =>
           callControl(controlUrl, token, "POST", "session/end", {
             name,

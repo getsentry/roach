@@ -42,7 +42,6 @@ import { createGcsStore } from "./gcs.ts";
 import { createRecorder, type Telemetry } from "./recorder.ts";
 import { createFileStore } from "./recordings.ts";
 import {
-  CONTROL_PATH,
   controlRecorder,
   listenProxy,
   parseOrigins,
@@ -53,7 +52,13 @@ import {
   type TargetResult,
 } from "./server.ts";
 import { RULE_NAME, type RecordingStore } from "./store.ts";
-import type { RecordingMode, RecordingRule, RecordingStats } from "./types.ts";
+import {
+  CONTROL_PATH,
+  type RecordingMode,
+  type RecordingStats,
+  type RemoteRun,
+  type RunConfig,
+} from "./types.ts";
 import { invalidValuePatterns } from "./values.ts";
 
 /** The configuration of the service. The operator owns it. */
@@ -92,48 +97,6 @@ export interface RoachServiceConfig {
   ca?: CertificateAuthorityPem;
   /** Without a DSN, the service sends nothing to Sentry. */
   sentryDsn?: string;
-}
-
-/** The configuration of one run. The client sends it. */
-export interface RunConfig {
-  /**
-   * The tenant of the run, as `owner/repo`, such as
-   * `process.env.GITHUB_REPOSITORY`.
-   */
-  tenant: string;
-  mode: RecordingMode;
-  rules: RecordingRule[];
-  /**
-   * The only origins that the run can reach, such as
-   * `https://ai-gateway.vercel.sh`. The service sends requests only to
-   * their public addresses.
-   */
-  allow: string[];
-  /**
-   * The name of the run in Sentry, such as
-   * `${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}`. Default: the run id.
-   */
-  name?: string;
-  /**
-   * Credentials that this run must never write, such as the API keys of
-   * its CI job. The service redacts them with the `secrets` of the service
-   * config, keeps them only in memory, and forgets them when the run ends.
-   */
-  secrets?: string[];
-}
-
-/** A run that the service created. */
-export interface RemoteRun {
-  /** The id of the run. */
-  id: string;
-  /** The proxy URL, with the run id and token as its user and password. */
-  url: string;
-  /** The run token. Session and stats calls use it. */
-  token: string;
-  /** The base URL of the control API of the run. */
-  controlUrl: string;
-  /** The PEM certificate of the authority that signs intercepted hosts. */
-  caCert: string;
 }
 
 /** A service that runs in this process. */
@@ -192,16 +155,35 @@ function isWriteToken(
   return token !== undefined && timingSafeEqual(expected, sha256(token));
 }
 
-/** The run id and token in a `Proxy-Authorization` header. */
+/**
+ * The run id, session id, and token in a `Proxy-Authorization` header. The
+ * user is `<run id>` or, for a session, `<run id>-<session id>`.
+ */
 function proxyCredentials(
   header: string | undefined,
-): { id: string; token: string } | undefined {
+): { id: string; session: string | undefined; token: string } | undefined {
   const match = /^Basic (.+)$/i.exec(header ?? "");
   if (!match) return undefined;
   const decoded = Buffer.from(match[1]!, "base64").toString("utf8");
   const colon = decoded.indexOf(":");
   if (colon <= 0) return undefined;
-  return { id: decoded.slice(0, colon), token: decoded.slice(colon + 1) };
+  const [id, session] = decoded.slice(0, colon).split("-", 2) as [
+    string,
+    string | undefined,
+  ];
+  return { id, session, token: decoded.slice(colon + 1) };
+}
+
+/** The proxy URL of a run, or of one session of the run. */
+function proxyUrl(
+  publicUrl: string,
+  run: { id: string; token: string },
+  session?: string,
+): string {
+  const url = new URL(publicUrl);
+  url.username = session ? `${run.id}-${session}` : run.id;
+  url.password = run.token;
+  return url.href.replace(/\/$/, "");
 }
 
 /** Check the run config of a client. Returns the error, or `undefined`. */
@@ -441,12 +423,9 @@ export async function startRoachService(
     process.stderr.write(
       `[roach] Run ${id} of ${runConfig.tenant} started in ${runConfig.mode} mode\n`,
     );
-    const base = new URL(publicUrl!);
-    base.username = id;
-    base.password = token;
     return {
       id,
-      url: base.href.replace(/\/$/, ""),
+      url: proxyUrl(publicUrl!, run),
       token,
       controlUrl: `${publicUrl}${CONTROL_PATH}/runs/${id}`,
       caCert: authority.caCert,
@@ -461,7 +440,7 @@ export async function startRoachService(
     if (!run || !sameToken(credentials.token, run.token)) {
       return { status: 407 };
     }
-    return run;
+    return { target: run, session: credentials.session };
   };
 
   const control = async (
@@ -548,6 +527,7 @@ export async function startRoachService(
       `${incoming.method} ${rest}`,
       incoming,
       outgoing,
+      (session) => proxyUrl(publicUrl!, run, session),
     );
     if (!handled) outgoing.writeHead(404).end();
   };
