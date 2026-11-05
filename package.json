@@ -18,14 +18,14 @@
     "typecheck": "tsc -p . && pnpm -r typecheck"
   },
   "devDependencies": {
-    "@sentry/dotagents": "^3.3.0",
+    "@sentry/dotagents": "^3.4.0",
     "@types/node": "catalog:",
-    "@vitest/coverage-v8": "^5.0.3",
-    "knip": "^6.40.0",
+    "@vitest/coverage-v8": "catalog:",
+    "knip": "^6.44.1",
     "lint-staged": "^17.6.0",
-    "oxfmt": "^0.72.0",
-    "oxlint": "^1.87.0",
-    "oxlint-tsgolint": "^7.0.2003",
+    "oxfmt": "^0.75.0",
+    "oxlint": "^1.90.0",
+    "oxlint-tsgolint": "^7.0.2005",
     "simple-git-hooks": "^2.14.0",
     "typescript": "catalog:",
     "vitest": "catalog:"
