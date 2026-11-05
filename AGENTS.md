@@ -37,7 +37,7 @@
 - Use functions and plain objects, not classes.
 - Start each source file with a comment that says what the file owns. Give each export a short JSDoc.
 - Update `README.md` in the same change when behavior, config, or the control API changes.
-- Test through a real proxy and a local upstream server in `packages/service/tests/`. Do not mock modules. Do not reach the internet.
+- Test through a real proxy and a local upstream server in `packages/service/tests/`. Start them with `startTestService()` and `startUpstream()` of `tests/harness.ts`. Wrap a tight timing limit in `budget()`, so that it allows for coverage, unless coverage barely slows that check. Do not mock modules. Do not reach the internet.
 - The proxy decrypts HTTPS. Never write a credential: every recording goes through `packages/service/src/secrets.ts`.
 - The upstream host always comes from `allow`, never from the client.
 - Write docs in ASD-STE100 English: common words, active voice, short sentences.

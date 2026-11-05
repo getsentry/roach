@@ -5,8 +5,6 @@
  * `roach.json`, against a service and an upstream in this process.
  */
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
-import { createServer, type Server } from "node:http";
 import {
   mkdtemp,
   readdir,
@@ -18,13 +16,12 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { startRoachService, type RoachService } from "../src/service.ts";
+import type { RoachService } from "../src/service.ts";
+import { startTestService, startUpstream, TOKEN } from "./harness.ts";
 
-const TOKEN = "write-token";
 const TENANT = "acme/vitest";
 const ROOT = path.resolve(import.meta.dirname, "..");
 
-let upstream: Server;
 let origin: string;
 let liveRequests: string[];
 let directory: string;
@@ -120,7 +117,7 @@ async function recordedSessions(): Promise<string[]> {
 
 beforeEach(async () => {
   liveRequests = [];
-  upstream = createServer((incoming, outgoing) => {
+  ({ origin } = await startUpstream((incoming, outgoing) => {
     const chunks: Buffer[] = [];
     incoming.on("data", (chunk: Buffer) => chunks.push(chunk));
     incoming.on("end", () => {
@@ -128,19 +125,8 @@ beforeEach(async () => {
       outgoing.writeHead(200, { "content-type": "application/json" });
       outgoing.end(`{"n":${liveRequests.length}}`);
     });
-  });
-  await new Promise<void>((resolve) =>
-    upstream.listen(0, "127.0.0.1", resolve),
-  );
-  const address = upstream.address();
-  if (!address || typeof address === "string") throw new Error("No port");
-  origin = `http://127.0.0.1:${address.port}`;
-  directory = await mkdtemp(path.join(tmpdir(), "roach-"));
-  service = await startRoachService({
-    directory,
-    privateNetworks: true,
-    writeTokenHash: createHash("sha256").update(TOKEN).digest("hex"),
-  });
+  }));
+  ({ service, directory } = await startTestService());
 
   project = await mkdtemp(path.join(tmpdir(), "roach-vitest-"));
   await symlink(
@@ -163,9 +149,6 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  await service.close();
-  await new Promise<void>((resolve) => upstream.close(() => resolve()));
-  await rm(directory, { recursive: true, force: true });
   await rm(project, { recursive: true, force: true });
 });
 
