@@ -362,11 +362,12 @@ describe("roach service", () => {
         }
         // The stats tell this refusal apart from an origin not in `allow`,
         // and count the requests only as refused.
-        expect(await run.stats()).toMatchObject({
-          counts: { model: { live: 0, missed: 0, replayed: 0 } },
-          passthrough: {},
-          refused: { notPublic: { [target]: 2 } },
+        const stats = await run.stats();
+        expect(stats.counts).toEqual({
+          model: { live: 0, missed: 0, replayed: 0 },
         });
+        expect(stats.passthrough).toEqual({});
+        expect(stats.refused).toEqual({ notPublic: { [target]: 2 } });
       }
     } finally {
       await guarded.close();
