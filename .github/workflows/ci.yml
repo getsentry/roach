@@ -5,6 +5,9 @@ on:
     # Craft publishes a release only when the checks of its branch pass.
     branches: [main, "release/**"]
   pull_request:
+  # GitHub sometimes starts no run for a push. Run it again by hand:
+  # `gh workflow run ci.yml --ref main`.
+  workflow_dispatch:
 
 permissions:
   contents: read
