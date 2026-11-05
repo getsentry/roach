@@ -73,6 +73,11 @@ For metrics, use `-f dataset=tracemetrics`,
 | `roach.write`               | the run has the write token (boolean)      | `roach.run.start`                 |
 | `http.response.status_code` | status to the client                       | `roach.request`, `roach.upstream` |
 | `gen_ai.request.model`      | model of a model call                      | `roach.request`                   |
+| `miss.sample`               | `found` or `none` for a miss               | `roach.request`                   |
+| `miss.changed_at`           | offset of the change of a miss             | `roach.request`                   |
+| `miss.compared`             | recording key of a miss change             | `roach.request`                   |
+| `miss.recorded`             | recorded text of a miss change             | `roach.request`                   |
+| `miss.request`              | sent text of a miss change                 | `roach.request`                   |
 
 A metric for a `notAllowed` request has `roach.origin:other`, because the
 client picks that origin. Its span has the origin.
@@ -159,6 +164,21 @@ sentry explore sentry/roach --dataset spans --period 24h \
   -F 'sum(tags[roach.live,number])' -F 'sum(tags[roach.replayed,number])'
 ```
 
+Where the requests of misses changed, and what changed. The same
+`miss.changed_at` from run to run shows one value that changes on each
+run. `miss.recorded` and `miss.request` show that value. `miss.sample:none`
+is a miss that has no recorded request to compare with. This works for
+runs without the token too, such as CI of a fork. Only Sentry has these
+texts: the run report shows only the offset and the key, because CI logs
+can be public.
+
+```bash
+sentry explore sentry/roach --dataset spans --period 24h \
+  -q 'span.op:roach.request has:miss.sample' -F roach.tenant -F roach.rule \
+  -F roach.run.id -F miss.sample -F miss.changed_at -F miss.recorded \
+  -F miss.request -F 'count()' -s '-count()'
+```
+
 Upstream errors. A live response with a temporary status is not recorded.
 
 ```bash
@@ -216,9 +236,23 @@ and the next run makes it again. Compare `roach.recording.write` with
 - Metrics have only `roach.tenant`, `roach.mode`, `roach.rule`,
   `roach.origin`, `roach.result`, and `roach.reason`. Use spans for the
   run, the CI job, the session, and the key.
-- Spans never have a body, a credential, or the path or query of a URL.
-  From a model call, they have only the model name and the token counts.
-  They have the test name (`roach.session`), but not the prompt.
+- Telemetry never has a credential. It has no body and no path or query
+  of a URL, except the change of a miss. From a model call, it has only
+  the model name and the token counts. Spans have the test name
+  (`roach.session`). You see the prompt only around the change of a miss.
+- The `roach.request` span of the first miss of a session has
+  `miss.sample`. When the proxy finds a change, it also has
+  `miss.changed_at`, `miss.compared`, `miss.recorded`, and `miss.request`.
+  The two texts have at most 160 characters each, redacted as in a
+  recording, with the value of each credential query parameter redacted.
+  Every run sends them, with or without the token. No stats, report, or
+  log has the texts. The stats and report of a run with the token have
+  only the offset and the key ("Misses" in `README.md`).
+- `roach.store.read` spans with a `roach.key` that starts with
+  `_requests/` read a request sample, not a recording. Leave them out of a
+  hit rate of `roach.store.read`. Each write of recordings has a second
+  `roach.store.write` span for their samples. The `roach.recording.write`
+  metric does not count samples.
 - An error event has the message of the error. The message can have the
   body of a GCS response. Only Sentry gets it. The client gets only the id
   of the event. The service log gets the id, the class, and the HTTP status

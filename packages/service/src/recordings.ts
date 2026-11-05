@@ -7,7 +7,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
   formatRecording,
-  type Recording,
+  type StoredFile,
   type RecordingStore,
 } from "./store.ts";
 
@@ -22,7 +22,7 @@ export function createFileStore(directory: string): RecordingStore {
   return {
     async read(key) {
       const text = await readText(path.join(directory, key));
-      return text === undefined ? undefined : (JSON.parse(text) as Recording);
+      return text === undefined ? undefined : (JSON.parse(text) as StoredFile);
     },
 
     async write(recordings) {

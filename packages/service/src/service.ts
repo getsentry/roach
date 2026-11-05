@@ -39,6 +39,7 @@ import {
   createCertificateAuthority,
   type CertificateAuthorityPem,
 } from "./certificates.ts";
+import { reportInternal } from "./errors.ts";
 import { createGcsStore } from "./gcs.ts";
 import { createRecorder, type Attributes, type Telemetry } from "./recorder.ts";
 import { createFileStore } from "./recordings.ts";
@@ -47,7 +48,6 @@ import {
   listenProxy,
   parseOrigins,
   readJson,
-  reportInternal,
   sameToken,
   sendJson,
   type ProxyTarget,
@@ -500,6 +500,9 @@ export async function startRoachService(
           mode: runConfig.mode,
           rules: runConfig.rules,
           secrets: [...(config.secrets ?? []), ...(runConfig.secrets ?? [])],
+          // A change shows a part of a recorded request, and reads are
+          // public, so only a run with the write token gets it.
+          explainMisses: canWrite,
           telemetry,
         },
         store,

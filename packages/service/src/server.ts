@@ -35,6 +35,7 @@ import {
   publicLookup,
 } from "./addresses.ts";
 import type { CertificateAuthority } from "./certificates.ts";
+import { reportInternal } from "./errors.ts";
 import type { ProxyRequest, Recorder, Telemetry } from "./recorder.ts";
 import type { OpenedSession } from "@sentry/roach/types";
 
@@ -56,41 +57,6 @@ const MAX_BODY_BYTES = 64 * 1024 * 1024;
 /** An error that answers a request with its own status. */
 const httpError = (status: number, message: string) =>
   Object.assign(new Error(message), { status });
-
-/**
- * The class, code, and HTTP status of an error, for the log. The message
- * can hold a response body, so the log does not get it.
- */
-function describeError(error: unknown): string {
-  if (!(error instanceof Error)) return typeof error;
-  const { code, responseStatus } = error as {
-    code?: string;
-    responseStatus?: number;
-  };
-  return [
-    error.name,
-    code,
-    responseStatus === undefined ? undefined : `HTTP ${responseStatus}`,
-  ]
-    .filter(Boolean)
-    .join(" ");
-}
-
-/**
- * Log the class of an unexpected error and the id of its Sentry event.
- * Returns the text for the client, which has only the event id.
- */
-export function reportInternal(
-  what: string,
-  error: unknown,
-  eventId: string | undefined,
-): string {
-  const event = eventId ? `, Sentry event ${eventId}` : "";
-  process.stderr.write(
-    `[roach] ${what} failed: ${describeError(error)}${event}\n`,
-  );
-  return `internal error${event}`;
-}
 
 /** Parse the allowed origins, by origin. A value that is not one throws. */
 export function parseOrigins(values: string[]): Map<string, URL> {

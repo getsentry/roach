@@ -13,7 +13,7 @@
  */
 import {
   formatRecording,
-  type Recording,
+  type StoredFile,
   type RecordingStore,
 } from "./store.ts";
 
@@ -28,7 +28,7 @@ const isTemporary = (status: number) => status === 429 || status >= 500;
 
 /**
  * The error of a failed call. Its message has the response body, so only
- * Sentry gets it (`server.ts`). The log gets `responseStatus`.
+ * Sentry gets it (`errors.ts`). The log gets `responseStatus`.
  */
 const callError = async (what: string, response: Response) =>
   Object.assign(
@@ -106,7 +106,7 @@ export function createGcsStore(bucket: string, prefix: string): RecordingStore {
   const token = createTokenSource(hosts.metadata);
   const bucketPath = `b/${encodeURIComponent(bucket)}/o`;
 
-  const writeOne = async ([key, recording]: [string, Recording]) => {
+  const writeOne = async ([key, file]: [string, StoredFile]) => {
     const name = encodeURIComponent(`${prefix}${key}`);
     const response = await call(
       `${hosts.storage}/upload/storage/v1/${bucketPath}?uploadType=media&name=${name}`,
@@ -116,7 +116,7 @@ export function createGcsStore(bucket: string, prefix: string): RecordingStore {
           authorization: `Bearer ${await token()}`,
           "content-type": "application/json",
         },
-        body: formatRecording(recording),
+        body: formatRecording(file),
       },
     );
     if (!response.ok) {
@@ -139,7 +139,7 @@ export function createGcsStore(bucket: string, prefix: string): RecordingStore {
       if (!response.ok) {
         throw await callError(`GCS read of ${key}`, response);
       }
-      return (await response.json()) as Recording;
+      return (await response.json()) as StoredFile;
     },
 
     // GCS does not say if an object changed, so each write counts.

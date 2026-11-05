@@ -216,11 +216,13 @@ A run takes `RunConfig` (`packages/roach/src/types.ts`): `tenant`, `mode`, `rule
   or of the run. Use `secrets` of the run for the credentials of a CI job
   that a response can show but no request header has, such as a token that
   goes to a model in a prompt. The service keeps them only in memory, for
-  the run. A run can have 32 of them. It also learns the value of each request header whose name can mean a credential,
+  the run. A run can have 32 of them. It also learns the value of each request header and query parameter whose name can mean a credential,
   such as one with `auth`, `token`, `key`, `secret`, `cookie`, or `session`.
   The match is broad on purpose. It does not learn `x-session-affinity`,
   because that header has a conversation id and not a credential.
-  Recordings show `<<redacted>>` in place of each known value.
+  Recordings show `<<redacted>>` in place of each known value. A request
+  sample and the text of a miss in Sentry also show `<<redacted>>` for the
+  value of each such query parameter, at any length (see [Misses](#misses)).
 
 Requests that match no rule go live without a change, and their responses
 stream. Each response has an `x-roach` header: `replayed`, `live`,
@@ -232,7 +234,7 @@ The key of a recording is `<rule>/<hash>.json`, under `<tenant>/` in the
 store. The hash is the hash of the rule name, the method, the URL, the key
 headers, and the body. A JSON body has sorted keys. A recording keeps the
 response and the session that recorded it. It does not keep the request
-body.
+body. A request sample keeps it. See [Misses](#misses).
 
 - Many sessions can be open at once. A request belongs to the session of
   its proxy URL (`url` of the session). A request through the proxy URL of
@@ -295,7 +297,51 @@ Avoid nested quantifiers, such as `(a+)+`.
 
 The proxy adds each request without a recording to `stats().misses`, with
 its session and key. `describeRecordingMisses()` in `report.ts` gives the
-first miss of each test, which is the one to fix.
+first miss of each test, which is the one to fix. The run report of the
+vitest integration and of the GitHub Action shows these misses.
+
+The proxy also finds where the first miss of each session changed
+(`misses.ts`). Sentry gets the text of the change, on the `roach.request`
+span of the miss (see [Sentry](#sentry)). The report of a run with the
+write token tells only where the change is:
+
+```text
+- a.fixture.ts > passes: model/074d….json
+  Changed at character 65 of the request of model/8b96….json. See miss.recorded and miss.request on the roach.request span in Sentry.
+```
+
+The report goes to CI logs and job summaries, and these can be public. So
+no report, log, or stats of a run show the text of a request. Only Sentry
+shows it.
+
+- When the proxy records a request, it also writes a request sample to
+  `_requests/<rule>/<hash>.json`. The sample has the text that the key
+  hashes: the rule, the method, the URL, the key headers, and the body
+  with `<<name>>` for each changing value. The proxy redacts credentials
+  in it, as in a recording, and the value of each credential query
+  parameter. It keeps the first 1,048,576 characters (UTF-16 code units)
+  of the text.
+- The hash of a sample is the place of the request: its session (test)
+  and the number of requests of the rule that the session sent before
+  it. So a sample is the last recorded request at the same place of the
+  same test. A replay writes no sample.
+- At the first miss of a session, the proxy reads the sample of the place
+  of the request. It finds the first character that is not the same.
+  Sentry gets 40 characters before it, and at most 120 characters from it,
+  of each text. This is one read for each session, in every run.
+- Sentry gets the change of every run, with or without the token. So find
+  the change of a miss of a fork in Sentry.
+- Only runs with the write token get `change` in their stats and report.
+  It has the key of the recording that the sample came from (`file`), and
+  the offset (`at`). It has no text. A run without the token, such as CI of
+  a fork, gets no `change`. Reads are public, and the offset of the first
+  change would let anyone guess the requests of a tenant back, one
+  character at a time.
+- A miss has no change when there is no sample, such as for a recording
+  from an older version, or when the texts are the same in the part that
+  the sample keeps.
+- When the requests of a test run in parallel, their order can change.
+  Then a sample can come from another request of the test.
 
 ## Find changing values
 
@@ -318,10 +364,13 @@ is not the same as the recorded one. No error shows this. The tests pass.
    that test with `ROACH_MODE=replay`. It needs no token. The test fails
    at the first miss, and the run report shows its key. Fix the first miss
    of a test before the others. The others often come from it.
-3. Get the body of that request from two runs, and compare them. A
-   recording does not keep the request body, so get it in the client. For
-   example, add this file to `setupFiles` after
-   `@sentry/roach/vitest/setup`, and run the test two times:
+3. Find the `roach.request` span of the first miss in Sentry, by its
+   `roach.run.id`, `roach.session`, and `has:miss.changed_at`. Read `miss.recorded` and `miss.request`. See
+   [Misses](#misses) and [`TELEMETRY.md`](TELEMETRY.md). They show the
+   changing value, with the text before it. This works for every run, with
+   or without the token. When the miss has no change, get the body of that
+   request from two runs, and compare them. For example, add this file to `setupFiles`
+   after `@sentry/roach/vitest/setup`, and run the test two times:
 
    ```ts
    // Local only. Writes each fetch request to DUMP_FILE.
@@ -388,7 +437,10 @@ config is `RoachServiceConfig` in `packages/service/src/service.ts`. `deploy/gcp
   refuses a request that no rule records, so nothing goes live. The stats
   count these requests in `refused.replayOnly`. Every other mode needs
   the write token. So treat each recording as readable by anyone who can
-  make its request. Do not record responses that must stay private.
+  make its request. Do not record responses that must stay private. Only
+  runs with the write token get the change of a miss in their stats, and
+  only its offset (see [Misses](#misses)). So CI of a fork does not show
+  it. Sentry shows it.
 - **Runs.** Each run has its own id, token, mode, rules, sessions, and
   stats. A proxied request names its run in `Proxy-Authorization`, as
   `Basic base64(<id>:<token>)`. The proxy URL of the run has them, so
@@ -443,16 +495,24 @@ Each proxied request is one trace. Each span has `roach.tenant`,
   refused request also has `roach.reason`. When a replayed or live
   response has token usage, the span also has the `gen_ai` attributes of
   the model call (`usage.ts`). Sentry then calculates its cost in USD as
-  `gen_ai.cost.total_tokens`. It contains:
+  `gen_ai.cost.total_tokens`. The span of the first miss of a session also
+  has `miss.sample` (`found` or `none`), in every run. When the proxy finds
+  a change, the span also has `miss.changed_at` (the offset of the first
+  different character), `miss.compared` (the key of the recording), and
+  the redacted text of the change: `miss.recorded` and `miss.request`.
+  Only Sentry gets these texts ([Misses](#misses)). It contains:
   - `roach.key`: the key of the request, with `roach.rule` and
     `roach.key`.
   - `roach.store.read`: a read of a recording, with `roach.key` and
     `roach.result`: `replayed` (the store has the recording) or `missed`.
+    The first miss of a session also reads a request sample. Its
+    `roach.key` starts with `_requests/`.
   - `roach.upstream`: the live request, with `roach.origin` and
     `http.response.status_code`.
 - `roach.store.write`: a write of recordings, with `roach.recordings` and
   `roach.written`. A session writes when it ends, so this span is usually
-  its own trace.
+  its own trace. A second span writes the request samples of the same
+  recordings.
 - `roach.run.end`: the end of a run, with its totals: `roach.replayed`,
   `roach.live`, `roach.missed`, `roach.passthrough`, `roach.refused`,
   `roach.written`, `roach.dropped`, and `roach.run.duration_ms`.
@@ -460,8 +520,12 @@ Each proxied request is one trace. Each span has `roach.tenant`,
 An error event has the tags of the spans of its run. An error of the
 control API has no run tags.
 
-Spans never have a credential, a body, or the path or query of a URL.
-From a model call, they have only the model name and the token counts.
+Telemetry never has a credential. It has no body and no path or query of
+a URL, except `miss.recorded` and `miss.request`. These have at most 160
+characters of the redacted text of a request, which can include a part of
+its URL, headers, or body. The log of the service names only the key of a
+miss, not its change.
+From a model call, it has only the model name and the token counts.
 So the service turns off the request data and the HTTP spans of the SDK,
 removes the path from the name of an error event, and adds no trace
 headers to the requests that it sends. An error event has the message of
@@ -470,8 +534,8 @@ the error, which can have a response body.
 To see how well the cache works:
 
 - **Hit rate.** Sum `roach.request`, group by `roach.result`, and filter
-  by `roach.tenant` and `roach.rule`. The hit rate is `replayed / (replayed
-  - live + missed)`.
+  by `roach.tenant` and `roach.rule`. The hit rate is
+  `replayed / (replayed + live + missed)`.
 - **Misses.** `missed` is a request that failed in `replay` mode. `live`
   in `auto` mode is a new recording. When `live` stays high from run to
   run, a value in the key changes on each run.
@@ -702,10 +766,13 @@ In `packages/service/src/`:
 - `cli.ts`: the command line, which the image runs.
 - `server.ts`: sockets, HTTPS interception, the allow list, and the control
   API.
+- `errors.ts`: the log line and the client text of an unexpected error.
 - `addresses.ts`: the public addresses that the proxy can send requests to.
 - `recorder.ts`: modes, sessions, replay, and misses.
 - `request-key.ts`: the key of a request.
-- `store.ts`: the recording format and the store contract.
+- `misses.ts`: request samples and the first change of a miss.
+- `store.ts`: the formats of recordings and request samples, and the
+  store contract.
 - `recordings.ts`: the file store, for tests and development.
 - `gcs.ts`: the GCS store.
 - `streams.ts`: merges the deltas of a recorded model stream.

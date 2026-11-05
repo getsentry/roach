@@ -2,12 +2,17 @@
  * Recordings, and the contract of a store that keeps them.
  *
  * A recording keeps the response of one request, and the session (test)
- * that recorded it. It does not keep the request body, so prompts and other
- * inputs are not stored.
+ * that recorded it. It does not keep the request body, so a replay reads
+ * only the response.
  *
- * A store keeps recordings by key, `<rule>/<hash>.json`. The GCS store
- * (`gcs.ts`) keeps them in a bucket. The file store (`recordings.ts`) keeps
- * them in a directory, for tests and development.
+ * A request sample keeps the redacted text that the key of a recorded
+ * request hashes, by its place in its session (`misses.ts`). A miss
+ * compares its own text with it.
+ *
+ * A store keeps recordings by key, `<rule>/<hash>.json`, and samples as
+ * `_requests/<rule>/<hash>.json`. The GCS store (`gcs.ts`) keeps them in a
+ * bucket. The file store (`recordings.ts`) keeps them in a directory, for
+ * tests and development.
  */
 /** One recorded response. */
 export interface Recording {
@@ -27,12 +32,25 @@ export interface Recording {
   };
 }
 
+/** The key text of the last recorded request at one place of a session. */
+export interface RequestSample {
+  /** The key of the recording of the request. */
+  file: string;
+  /** The redacted text that the key hashed, cut at a size limit. */
+  text: string;
+  /** Set when `text` was cut. */
+  truncated?: boolean;
+}
+
+/** A file in a store. */
+export type StoredFile = Recording | RequestSample;
+
 /** Where the recordings of a tenant are. */
 export interface RecordingStore {
-  /** The recording of `key`, or `undefined` when there is none. */
-  read(key: string): Promise<Recording | undefined>;
-  /** Write recordings by key. Returns how many were new or changed. */
-  write(recordings: Array<[string, Recording]>): Promise<number>;
+  /** The file of `key`, or `undefined` when there is none. */
+  read(key: string): Promise<StoredFile | undefined>;
+  /** Write files by key. Returns how many were new or changed. */
+  write(files: Array<[string, StoredFile]>): Promise<number>;
 }
 
 /** A rule name that a store accepts. It is a directory name. */
@@ -42,6 +60,6 @@ export const RULE_NAME = /^[A-Za-z0-9][\w.-]{0,63}$/;
 export const recordingKey = (rule: string, hash: string) =>
   `${rule}/${hash}.json`;
 
-/** The text of a recording, as the stores keep it. */
-export const formatRecording = (recording: Recording) =>
-  `${JSON.stringify(recording, null, 2)}\n`;
+/** The text of a file, as the stores keep it. */
+export const formatRecording = (file: StoredFile) =>
+  `${JSON.stringify(file, null, 2)}\n`;

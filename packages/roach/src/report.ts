@@ -2,7 +2,12 @@
  * Text reports of a Roach run, for logs and CI summaries.
  */
 import { appendFile } from "node:fs/promises";
-import type { RecordingMiss, RecordingStats, RefusalReason } from "./types.ts";
+import type {
+  RecordingChange,
+  RecordingMiss,
+  RecordingStats,
+  RefusalReason,
+} from "./types.ts";
 
 /** What to fix for each refusal reason. */
 const REFUSAL_HINTS: Record<RefusalReason, string> = {
@@ -34,10 +39,19 @@ export function describeRecordingStats(stats: RecordingStats): string {
 }
 
 /**
- * Describe the first request without a recording of each test, one line
- * each. The first miss of a test is the one to fix. Each later miss of the
- * test usually follows from it, because the live response differs from
- * the recording.
+ * Describe the first change of a miss, in an indented line. The report
+ * goes to public CI logs, so it never shows the text of a request. Sentry
+ * has it.
+ */
+const describeChange = ({ file, at }: RecordingChange) =>
+  `\n  Changed at character ${at} of the request of ${file}. See miss.recorded and miss.request on the roach.request span in Sentry.`;
+
+/**
+ * Describe the first request without a recording of each test. The first
+ * miss of a test is the one to fix. Each later miss of the test usually
+ * follows from it, because the live response differs from the recording.
+ * When the proxy has the text of the closest recorded request, the
+ * description also shows where it first changed, in an indented line.
  */
 export function describeRecordingMisses(misses: RecordingMiss[]): string[] {
   const seen = new Set<string | undefined>();
@@ -47,7 +61,10 @@ export function describeRecordingMisses(misses: RecordingMiss[]): string[] {
       seen.add(miss.session);
       return first;
     })
-    .map((miss) => `${miss.session ?? "outside a test"}: ${miss.file}`);
+    .map(
+      (miss) =>
+        `${miss.session ?? "outside a test"}: ${miss.file}${miss.change ? describeChange(miss.change) : ""}`,
+    );
 }
 
 /**

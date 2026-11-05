@@ -51,6 +51,19 @@ export interface RecordingRule {
   values?: ValuePatterns;
 }
 
+/**
+ * Where a request without a recording first differs from the request of
+ * the closest recording, in the texts that the keys hash. It has no text:
+ * the texts go only to the `roach.request` span in Sentry, as
+ * `miss.recorded` and `miss.request`.
+ */
+export interface RecordingChange {
+  /** The key of the recording that the request is compared with. */
+  file: string;
+  /** The offset of the first different character. */
+  at: number;
+}
+
 /** A request that a rule matched, but that had no recording. */
 export interface RecordingMiss {
   rule: string;
@@ -58,6 +71,12 @@ export interface RecordingMiss {
   session?: string | undefined;
   /** The key of the recording that the request needed. */
   file: string;
+  /**
+   * The first change from the request of the closest recording. Only the
+   * first miss of each session in a run with the write token has it, and
+   * only when the proxy has the text of that request.
+   */
+  change?: RecordingChange;
 }
 
 /** The totals of a run. */

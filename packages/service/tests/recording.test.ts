@@ -4,7 +4,14 @@
  */
 import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { ProxyAgent, request } from "undici";
@@ -17,7 +24,10 @@ import {
   onTestFinished,
 } from "vitest";
 import { startRemoteRun, type RemoteRoach } from "@sentry/roach/client";
-import { describeRecordingStats } from "@sentry/roach/report";
+import {
+  describeRecordingMisses,
+  describeRecordingStats,
+} from "@sentry/roach/report";
 import { startRoachService, type RoachService } from "../src/service.ts";
 import { keyRequest } from "../src/request-key.ts";
 import type { RecordingMode, RecordingRule } from "@sentry/roach/types";
@@ -45,12 +55,14 @@ let agent: ProxyAgent | undefined;
 async function start(
   mode: RecordingMode,
   url: string | string[] = `${origin}/v1/`,
+  secrets: string[] = [],
 ): Promise<RemoteRoach> {
   const run = await startRemoteRun(
     { url: service.url, token: TOKEN },
     {
       tenant: TENANT,
       mode,
+      secrets,
       allow: [origin],
       rules: [
         {
@@ -299,6 +311,148 @@ describe("recording", () => {
       counts: { model: { live: 0, missed: 1, replayed: 1 } },
       misses: [{ rule: "model", session: "test" }],
     });
+  });
+
+  it("shows the first change from the recorded request of a miss", async () => {
+    // A random finding id that no pattern finds changes the key on each
+    // run. The text around it has a credential of the run.
+    const secret = "sk-roach-test-0123456789";
+    const requestBody = (finding: string) => ({
+      model: "m",
+      messages: [`Token ${secret}.`, `Finding ${finding} is new.`],
+    });
+    const recording = await start("auto", `${origin}/v1/`, [secret]);
+    await session(recording, [{ model: "first" }, requestBody("ABC-123")]);
+    await recording.close();
+    const samples = path.join(directory, TENANT, "_requests", "model");
+    const sampleFiles = await readdir(samples);
+    expect(sampleFiles).toHaveLength(2);
+    for (const file of sampleFiles) {
+      const text = await readFile(path.join(samples, file), "utf8");
+      expect(text).not.toContain(secret);
+    }
+
+    const running = await start("replay", `${origin}/v1/`, [secret]);
+    const replay = await session(running, [
+      { model: "first" },
+      requestBody("XYZ-789"),
+      requestBody("XYZ-790"),
+    ]);
+
+    expect(replay.map(({ source }) => source)).toEqual([
+      "replayed",
+      "missed",
+      "missed",
+    ]);
+    const { misses } = await running.stats();
+    // Only the first miss of the session reads a sample.
+    expect(misses).toEqual([
+      {
+        rule: "model",
+        session: "test",
+        file: expect.stringMatching(/^model\/[0-9a-f]{64}\.json$/),
+        change: {
+          file: expect.stringMatching(/^model\/[0-9a-f]{64}\.json$/),
+          at: 98,
+        },
+      },
+      expect.not.objectContaining({ change: expect.anything() }),
+    ]);
+    const { change } = misses[0]!;
+    await expect(files()).resolves.toContain(change!.file.slice(6));
+    // The report goes to public CI logs, so it has no text of a request.
+    // Sentry has the text.
+    expect(describeRecordingMisses(misses)).toEqual([
+      `test: ${misses[0]!.file}\n  Changed at character 98 of the request of ${change!.file}. See miss.recorded and miss.request on the roach.request span in Sentry.`,
+    ]);
+  });
+
+  it("keeps a request sample for each place of a repeated request", async () => {
+    // The same request at two places of a test has one recording. Each
+    // place still gets its sample, so a later change at either place shows.
+    const recording = await start("auto");
+    await session(recording, [{ model: "same" }, { model: "same" }]);
+    await recording.close();
+    const samples = path.join(directory, TENANT, "_requests", "model");
+    expect(await readdir(samples)).toHaveLength(2);
+    expect(await files()).toHaveLength(1);
+
+    const running = await start("replay");
+    await session(running, [{ model: "changed" }]);
+    const [miss] = (await running.stats()).misses;
+    expect(miss!.change).toEqual({
+      file: expect.stringMatching(/^model\/[0-9a-f]{64}\.json$/),
+      at: expect.any(Number),
+    });
+  });
+
+  it("keeps the first 1,048,576 characters of a request in its sample", async () => {
+    // Object keys are sorted, so `c` comes after the long text.
+    const long = "x".repeat(1024 * 1024);
+    const recording = await start("auto");
+    await session(recording, [
+      { a: "a", b: long, c: "a" },
+      { a: "b", b: long, c: "b" },
+    ]);
+    await recording.close();
+    const samples = path.join(directory, TENANT, "_requests", "model");
+    for (const file of await readdir(samples)) {
+      const sample = JSON.parse(
+        await readFile(path.join(samples, file), "utf8"),
+      ) as { text: string; truncated?: boolean };
+      expect(sample).toMatchObject({ truncated: true });
+      expect(sample.text).toHaveLength(1024 * 1024);
+    }
+
+    // A change after the part that the sample keeps has no change. One
+    // before it has.
+    const first = await start("replay");
+    await session(first, [{ a: "a", b: long, c: "changed" }]);
+    const second = await start("replay");
+    await session(second, [
+      { a: "a", b: long, c: "a" },
+      { a: "changed", b: long, c: "b" },
+    ]);
+
+    const [missAfter] = (await first.stats()).misses;
+    expect(missAfter).not.toHaveProperty("change");
+    const [missBefore] = (await second.stats()).misses;
+    expect(missBefore!.change).toEqual({
+      file: expect.stringMatching(/^model\/[0-9a-f]{64}\.json$/),
+      at: expect.any(Number),
+    });
+    expect(missBefore!.change!.at).toBeLessThan(1024);
+  });
+
+  it("keeps a recording when its request sample cannot be written", async () => {
+    // A file where the directory of the samples must be makes each sample
+    // write fail. The request and its session still pass.
+    await mkdir(path.join(directory, TENANT), { recursive: true });
+    await writeFile(path.join(directory, TENANT, "_requests"), "");
+    const running = await start("auto");
+    const recorded = await session(running, [{ model: "m" }]);
+    expect(recorded.map(({ source }) => source)).toEqual(["live"]);
+    await expect(running.stats()).resolves.toMatchObject({ written: 1 });
+
+    const [replayed] = await session(running, [{ model: "m" }]);
+    expect(replayed!.source).toBe("replayed");
+    expect(liveRequests).toBe(1);
+  });
+
+  it("replays a recording without a request sample", async () => {
+    const recording = await start("auto");
+    await session(recording, [{ model: "m" }, { model: "second" }]);
+    await recording.close();
+    await rm(path.join(directory, TENANT, "_requests"), { recursive: true });
+
+    const running = await start("replay");
+    const replay = await session(running, [{ model: "m" }, { model: "other" }]);
+
+    expect(replay.map(({ source }) => source)).toEqual(["replayed", "missed"]);
+    const { misses } = await running.stats();
+    expect(misses).toEqual([
+      { rule: "model", session: "test", file: expect.any(String) },
+    ]);
   });
 
   it("sends no request to another origin", async () => {

@@ -34,6 +34,8 @@ const BUCKET = "roach-recordings";
 const GCS_TOKEN = "vm-access-token";
 /** The body of a failed GCS call. Only Sentry may get it. */
 const GCS_FAILURE = "gcs-failure-body-text";
+/** A credential in the query of each model request, as some APIs take it. */
+const QUERY_KEY = "query-api-key-0123456789";
 
 let directory: string;
 let hostCertFile: string;
@@ -180,6 +182,8 @@ async function ciJob(job: {
   runId: string;
   prompt: string;
   refused?: string;
+  /** The `page` query parameter of the request. Defaults to 1. */
+  page?: number;
 }): Promise<{
   exitCode: number;
   stderr: string;
@@ -198,7 +202,7 @@ async function ciJob(job: {
   await writeFile(
     path.join(workspace, "job.mjs"),
     `import { readFileSync } from "node:fs";
-const response = await fetch(${JSON.stringify(`${upstreamOrigin}/v1/messages`)}, {
+const response = await fetch(${JSON.stringify(`${upstreamOrigin}/v1/messages?key=${QUERY_KEY}&page=${job.page ?? 1}`)}, {
   method: "POST",
   body: JSON.stringify({ model: "anthropic/claude-test", prompt: ${JSON.stringify(job.prompt)} }),
 });
@@ -469,8 +473,12 @@ describe("deployed roach", () => {
     expect(writer.trusted).toContain(
       (await readFile(hostCertFile, "utf8")).trim(),
     );
+    // The recording, and the sample of its request.
     expect([...objects.keys()]).toEqual([
       expect.stringMatching(/^getsentry\/junior\/model\/[0-9a-f]{64}\.json$/),
+      expect.stringMatching(
+        /^getsentry\/junior\/_requests\/model\/[0-9a-f]{64}\.json$/,
+      ),
     ]);
 
     // Without the token, the action only replays.
@@ -484,10 +492,14 @@ describe("deployed roach", () => {
     expect(liveRequests).toBe(1);
 
     // A request without a recording fails the step, and the summary names it.
-    const miss = await ciJob({ runId: "miss", prompt: "bye" });
+    const miss = await ciJob({ runId: "miss", prompt: "hi", page: 2 });
     expect(miss.response.status).toBe(412);
     expect(miss.exitCode).toBe(1);
     expect(miss.summary).toMatch(/^- test: model\/[0-9a-f]{64}\.json$/m);
+    // A run without the token does not see what changed in its summary,
+    // because that shows a part of the recorded request. Sentry gets it.
+    expect(miss.summary).not.toContain("Changed at character");
+    expect(miss.summary).not.toContain(String.raw`\"prompt\":\"hi\"`);
     expect(liveRequests).toBe(1);
 
     // A failed GCS read gives a client without the token only the id of
@@ -620,9 +632,10 @@ describe("deployed roach", () => {
     ]);
 
     // Only the spans of Roach: 5 for each run, 2 for each live request, 1
-    // for the refused request, and none for the read that failed.
+    // for the refused request, and 4 for request samples: one write, and
+    // one read for the first miss of each of the 3 runs that miss.
     const ops = spans.map(({ attributes }) => attributes["sentry.op"]);
-    expect(ops).toHaveLength(30);
+    expect(ops).toHaveLength(34);
     expect(new Set(ops)).toEqual(
       new Set([
         "roach.run.start",
@@ -687,6 +700,27 @@ describe("deployed roach", () => {
     expect(span("roach.request", "broken-read-1")).toMatchObject({
       "http.response.status_code": 502,
     });
+    // The first miss of each run looks for a request sample. The writer
+    // found none. The run without the token found the writer's, and Sentry
+    // gets the redacted change, which its summary does not show. The change
+    // is in the query, so the text shows the URL with its key redacted.
+    expect(span("roach.request", "writer-1")).toMatchObject({
+      "miss.sample": "none",
+    });
+    expect(span("roach.request", "writer-1")).not.toHaveProperty(
+      "miss.changed_at",
+    );
+    expect(span("roach.request", "miss-1")).toMatchObject({
+      "miss.sample": "found",
+      "miss.changed_at": expect.any(Number),
+      "miss.compared": relativeKey,
+      "miss.recorded": expect.stringContaining(
+        "/v1/messages?key=<<redacted>>&page=1\n",
+      ),
+      "miss.request": expect.stringContaining(
+        "/v1/messages?key=<<redacted>>&page=2\n",
+      ),
+    });
     expect(span("roach.key", "writer-1")).toMatchObject({
       "roach.key": relativeKey,
     });
@@ -721,17 +755,19 @@ describe("deployed roach", () => {
       "roach.missed": 1,
     });
 
-    // Sentry gets no credential, no path, and no body, and the upstream
-    // gets no trace headers.
-    for (const secret of [
-      TOKEN,
-      GCS_TOKEN,
-      "/v1/messages",
-      "/__roach/",
-      "prompt",
-    ]) {
+    // Neither Sentry nor the store gets a credential. Only the text of the
+    // change of a miss has a path.
+    for (const secret of [TOKEN, GCS_TOKEN, QUERY_KEY, "/__roach/"]) {
       expect(envelopes.join("\n")).not.toContain(secret);
     }
+    for (const object of objects.values()) {
+      expect(object).not.toContain(QUERY_KEY);
+    }
+    for (const { attributes } of spans) {
+      const { "miss.recorded": _, "miss.request": __, ...rest } = attributes;
+      expect(JSON.stringify(rest)).not.toContain("/v1/messages");
+    }
+    // The upstream gets no trace headers.
     for (const headers of upstreamHeaders) {
       expect(headers).not.toHaveProperty("sentry-trace");
       expect(headers).not.toHaveProperty("baggage");
