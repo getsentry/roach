@@ -214,8 +214,9 @@ async function proxyRequest(
     return;
   }
   if (!rule) {
-    recorder.countPassthrough(origin.origin, request.headers);
     const upstream = await sendUpstream(origin, request, privateNetworks);
+    // Count it only when it went out. A refused address counts as refused.
+    recorder.countPassthrough(origin.origin, request.headers);
     outgoing.writeHead(upstream.statusCode ?? 502, upstream.statusMessage, {
       ...upstream.headers,
       "x-roach": "passthrough",

@@ -360,9 +360,12 @@ describe("roach service", () => {
           expect(response.statusCode).toBe(403);
           expect(await response.body.text()).toMatch(/not a public address/);
         }
-        // The stats tell this refusal apart from an origin not in `allow`.
-        expect((await run.stats()).refused).toEqual({
-          notPublic: { [target]: 2 },
+        // The stats tell this refusal apart from an origin not in `allow`,
+        // and count the requests only as refused.
+        expect(await run.stats()).toMatchObject({
+          counts: { model: { live: 0, missed: 0, replayed: 0 } },
+          passthrough: {},
+          refused: { notPublic: { [target]: 2 } },
         });
       }
     } finally {

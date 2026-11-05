@@ -396,7 +396,6 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
         }
       }
 
-      counts.live += 1;
       const live = await telemetry.span(
         {
           op: "roach.upstream",
@@ -409,6 +408,9 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
           return response;
         },
       );
+      // Count it only when it went out. A refused address counts as
+      // refused (`server.ts`).
+      counts.live += 1;
       // The client gets the redacted response too, so a live run and a
       // replay give the same body.
       const recording = JSON.parse(
