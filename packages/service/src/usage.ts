@@ -15,25 +15,15 @@
  * As in Sentry, `gen_ai.usage.input_tokens` includes the cache tokens.
  * Anthropic counts them apart, so the proxy adds them.
  */
+import { isObject, parseJson } from "./json-strings.ts";
 import { isEventStream } from "./streams.ts";
 
 type Fields = Record<string, unknown>;
-
-const isObject = (value: unknown): value is Fields =>
-  typeof value === "object" && value !== null && !Array.isArray(value);
 
 const count = (value: unknown) =>
   typeof value === "number" && Number.isFinite(value) && value >= 0
     ? value
     : undefined;
-
-function parseJson(text: string): unknown {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return undefined;
-  }
-}
 
 /** The JSON objects of a body: the body itself, or each stream event. */
 function bodyObjects(contentType: string | undefined, body: string): Fields[] {

@@ -21,8 +21,10 @@
  * or a copy of a value inside other text.
  */
 import type { IncomingHttpHeaders } from "node:http";
+import { httpError } from "./errors.ts";
 import {
-  parseJson,
+  parseJsonSkipBom,
+  isObject,
   isOpen,
   isJsonSpace,
   type Escapes,
@@ -672,10 +674,6 @@ function bodyStart(text: string, href: string, keyHeaders: string[]): number {
   return at;
 }
 
-/** Tells whether a parsed JSON value is an object that is not an array. */
-const isObject = (json: unknown): json is Record<string, unknown> =>
-  json !== null && typeof json === "object" && !Array.isArray(json);
-
 /** Tells whether the field `name` of `json` holds a minted value. */
 const mintedValue = (json: Record<string, unknown>, name: string) => {
   const value = json[name];
@@ -691,7 +689,7 @@ const mintedValue = (json: Record<string, unknown>, name: string) => {
  * result, so the caller does not record the body.
  */
 function replaceMinted(text: string): { text: string; minted: string[] } {
-  const json = parseJson(text);
+  const json = parseJsonSkipBom(text);
   const none = { text, minted: [] };
   if (!isObject(json)) return none;
   // The fields of the top object that can hold a minted value.
@@ -726,7 +724,7 @@ function replaceMinted(text: string): { text: string; minted: string[] } {
   // Parse the result again, and fail when a minted value stays. The pass
   // replaces only whole strings with strings, so the names of the fields
   // do not change. Thus only the names from the first parse can hold one.
-  const again = parseJson(result);
+  const again = parseJsonSkipBom(result);
   if (!isObject(again) || names.some((name) => mintedValue(again, name))) {
     throw new Error("a minted credential stayed in the body");
   }
@@ -892,7 +890,7 @@ export function toRedact(
  */
 function bodyFields(request: RequestToRedact) {
   const form = isForm(request.contentType);
-  const json = form ? undefined : parseJson(request.body);
+  const json = form ? undefined : parseJsonSkipBom(request.body);
   const fields = form ? formFields(request.body) : jsonFields(json);
   return { form, json, fields, isValue: valueTest(fields.values) };
 }
@@ -1001,7 +999,7 @@ export function redactRequestWith(
   }
   const known = new Set(fields.values);
   const body = redactWith(values, replaceStrings(result.slice(at), known));
-  const parsed = parseJson(body);
+  const parsed = parseJsonSkipBom(body);
   if (
     parsed === undefined ||
     !showsNoField(parsed, known) ||
@@ -1045,11 +1043,9 @@ export function createSecrets(initial: string[], limit: LearnLimit) {
       next.length += part.length;
     }
     if (next.values > limit.values || next.length > limit.length) {
-      throw Object.assign(
-        new Error(
-          `this run cannot learn more credentials (${limit.values} values or ${limit.length} characters, with the parts of each value). Start a new run.`,
-        ),
-        { status },
+      throw httpError(
+        status,
+        `this run cannot learn more credentials (${limit.values} values or ${limit.length} characters, with the parts of each value). Start a new run.`,
       );
     }
     learned = next;

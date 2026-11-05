@@ -4,16 +4,13 @@
  * the time that a body has to come.
  */
 import type http from "node:http";
+import { httpError } from "./errors.ts";
 
 /**
  * A control API body over this size gets HTTP 413. Anyone can call
  * `POST /runs`, so the service reads no more before it checks the token.
  */
 const MAX_CONTROL_BODY_BYTES = 1024 * 1024;
-
-/** An error that answers a request with its own status. */
-const httpError = (status: number, message: string) =>
-  Object.assign(new Error(message), { status });
 
 /**
  * The bytes of request bodies that the requests of many targets can hold

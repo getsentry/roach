@@ -1049,7 +1049,8 @@ In `packages/service/src/`:
 - `clients.ts`: the PROXY protocol header and the address of a client.
 - `run-config.ts`: the check of the run config of a client, with its
   limits.
-- `errors.ts`: the log line and the client text of an unexpected error.
+- `errors.ts`: the errors that are the fault of the client, and the log
+  line and the client text of an unexpected error.
 - `addresses.ts`: the public addresses that the proxy can send requests to.
 - `recorder.ts`: modes, sessions, replay, and misses.
 - `recording-file.ts`: a recording file from a live response, the response
@@ -1066,6 +1067,6 @@ In `packages/service/src/`:
 - `streams.ts`: merges the deltas of a recorded model stream.
 - `usage.ts`: the token usage of a model response, for Sentry.
 - `secrets.ts`: redaction of credentials.
-- `json-strings.ts`: the one-pass scan of the JSON strings of a body, for
-  `secrets.ts`.
+- `json-strings.ts`: the parse of a JSON body, and the one-pass scan of
+  the JSON strings of a body, for `secrets.ts`.
 - `certificates.ts`: the certificate authority for HTTPS.

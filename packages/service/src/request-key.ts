@@ -14,6 +14,7 @@
  */
 import { createHash } from "node:crypto";
 import type { IncomingHttpHeaders } from "node:http";
+import { parseJson } from "./json-strings.ts";
 import { THINKING_BLOCK_TYPES } from "./streams.ts";
 import type { RecordingRule } from "@sentry/roach/types";
 import {
@@ -90,14 +91,6 @@ function stableStringify(
         `${JSON.stringify(key)}:${stableStringify(item, replace)}`,
     )
     .join(",")}}`;
-}
-
-function parseJson(body: string): unknown {
-  try {
-    return body ? JSON.parse(body) : undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 /** Marks the place of a thinking block in the text of a body. */
