@@ -27,6 +27,7 @@
  */
 import { randomBytes } from "node:crypto";
 import type { IncomingHttpHeaders } from "node:http";
+import { reportInternal } from "./errors.ts";
 import { firstChange, sampleKey, toSample } from "./misses.ts";
 import { keyRequest, type KeyedRequest } from "./request-key.ts";
 import { createSecrets } from "./secrets.ts";
@@ -75,7 +76,7 @@ export interface ProxyResponse {
 export type ResponseSource = "live" | "missed" | "replayed";
 
 /** The attributes of a span or a metric. */
-type Attributes = Record<string, string | number | boolean>;
+export type Attributes = Record<string, string | number | boolean>;
 
 /**
  * Hooks that report spans and metrics. `service.ts` gives hooks
@@ -95,6 +96,11 @@ export interface Telemetry {
   count(name: string, value: number, attributes: Attributes): void;
   /** Add a time in milliseconds to the distribution `name`. */
   time(name: string, ms: number, attributes: Attributes): void;
+  /**
+   * Send an unexpected error to Sentry. Returns the id of its event, or
+   * `undefined` when nothing goes to Sentry.
+   */
+  capture(error: unknown): string | undefined;
 }
 
 /** Requests by their place, for the samples of `misses.ts`. */
@@ -140,6 +146,8 @@ const MAX_MISSES = 500;
  */
 const MAX_REFUSED_ORIGINS = 32;
 const OTHER_ORIGINS = "other origins";
+/** The `roach.origin` of a metric for an origin that is not in `allow`. */
+const METRIC_OTHER_ORIGIN = "other";
 /**
  * Ended sessions that a run keeps, so that late requests follow their
  * result. The oldest ones go first, so memory stays bounded.
@@ -266,7 +274,10 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
       byRule.set(rule, (byRule.get(rule) ?? 0) + 1);
     }
     for (const [rule, value] of byRule) {
-      telemetry.count("roach.recording.write", value, { rule, result });
+      telemetry.count("roach.recording.write", value, {
+        "roach.rule": rule,
+        "roach.result": result,
+      });
     }
   };
   const write = async (recordings: Array<[string, NewRecording]>) => {
@@ -278,9 +289,7 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
     await store
       .write(recordings.flatMap(([, { samples }]) => samples))
       .catch((error: unknown) => {
-        process.stderr.write(
-          `[roach] Request samples were not written: ${(error as Error).message}\n`,
-        );
+        reportInternal("Sample write", error, telemetry.capture(error));
       });
     countRecordings(
       recordings.map(([key]) => key),
@@ -392,11 +401,22 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
     },
 
     /** Count a request that no rule records, and learn its credentials. */
-    countPassthrough(origin: string, headers: IncomingHttpHeaders): void {
+    countPassthrough(
+      origin: string,
+      headers: IncomingHttpHeaders,
+      sessionId?: string,
+    ): void {
       secrets.learn(headers);
       stats.passthrough[origin] = (stats.passthrough[origin] ?? 0) + 1;
-      telemetry.annotate({ result: "passthrough" });
-      telemetry.count("roach.request", 1, { origin, result: "passthrough" });
+      const owner = sessionOf(sessionId);
+      telemetry.annotate({
+        "roach.result": "passthrough",
+        ...(owner ? { "roach.session": owner.name } : {}),
+      });
+      telemetry.count("roach.request", 1, {
+        "roach.origin": origin,
+        "roach.result": "passthrough",
+      });
     },
 
     /** Count a request that the proxy refused and sent nowhere. */
@@ -407,6 +427,14 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
           ? origin
           : OTHER_ORIGINS;
       origins[name] = (origins[name] ?? 0) + 1;
+      const attributes = { "roach.result": "refused", "roach.reason": reason };
+      telemetry.annotate(attributes);
+      // The client picks an origin that is not in `allow`, so the metric
+      // names it only as `other`. The span has the origin.
+      telemetry.count("roach.request", 1, {
+        ...attributes,
+        "roach.origin": reason === "notAllowed" ? METRIC_OTHER_ORIGIN : origin,
+      });
     },
 
     /**
@@ -427,9 +455,12 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
       const sample = nextSample(rule.name, owner);
       const counts = stats.counts[rule.name]!;
       secrets.learn(request.headers, request.url);
-      telemetry.annotate({ rule: rule.name });
+      telemetry.annotate({
+        "roach.rule": rule.name,
+        ...(owner ? { "roach.session": owner.name } : {}),
+      });
       const { keyed, key } = telemetry.span(
-        { op: "roach.key", attributes: { rule: rule.name } },
+        { op: "roach.key", attributes: { "roach.rule": rule.name } },
         () => {
           const result = keyRequest(
             rule,
@@ -442,7 +473,7 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
             owner?.known,
           );
           const name = recordingKey(rule.name, result.key);
-          telemetry.annotate({ key: name });
+          telemetry.annotate({ "roach.key": name });
           return { keyed: result, key: name };
         },
       );
@@ -455,8 +486,12 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
         }
       }
       const report = (result: ResponseSource, response?: ProxyResponse) => {
-        const attributes = { rule: rule.name, origin, result };
-        telemetry.annotate({ result });
+        const attributes = {
+          "roach.rule": rule.name,
+          "roach.origin": origin,
+          "roach.result": result,
+        };
+        telemetry.annotate({ "roach.result": result });
         const usage =
           response &&
           usageAttributes(
@@ -501,7 +536,10 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
         {
           op: "roach.upstream",
           name: `${request.method} ${origin}`,
-          attributes: { origin, "http.request.method": request.method },
+          attributes: {
+            "roach.origin": origin,
+            "http.request.method": request.method,
+          },
         },
         async () => {
           const response = await sendLive();
@@ -532,8 +570,8 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
 
     /**
      * Open the session of one test, and return its id. An open session with
-     * the same name fails first. Throws when the run has too many open
-     * sessions.
+     * the same name fails first. Throws an error with HTTP status 429 when
+     * the run has too many open sessions.
      */
     async startSession(name: string): Promise<string> {
       const same = open().find((other) => other.name === name);
@@ -544,7 +582,10 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
         await finish(same, false);
       }
       if (open().length >= MAX_OPEN_SESSIONS) {
-        throw new Error(`A run can have ${MAX_OPEN_SESSIONS} open sessions`);
+        throw Object.assign(
+          new Error(`A run can have ${MAX_OPEN_SESSIONS} open sessions`),
+          { status: 429 },
+        );
       }
       const ended = [...sessions.values()].filter(
         (other) => other.passed !== undefined,
@@ -568,11 +609,16 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
 
     /**
      * End the open session `name`. Returns its requests that `replay` mode
-     * failed. Throws when no open session has that name.
+     * failed. Throws an error with HTTP status 409 when no open session has
+     * that name.
      */
     async endSession(name: string, passed: boolean): Promise<number> {
       const ended = open().find((other) => other.name === name);
-      if (!ended) throw new Error(`Session "${name}" is not open`);
+      if (!ended) {
+        throw Object.assign(new Error(`Session "${name}" is not open`), {
+          status: 409,
+        });
+      }
       return finish(ended, passed);
     },
 

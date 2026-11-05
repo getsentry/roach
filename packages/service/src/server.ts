@@ -13,6 +13,12 @@
  * (`addresses.ts`), unless the service config has `privateNetworks`. The
  * stats of the run count each refused request (`refused`).
  *
+ * An error with a `status`, such as HTTP 413, is the fault of the client,
+ * and the client gets its message. Any other error, such as a failure of
+ * the upstream or of GCS, can hold a response body in its message. So only
+ * Sentry gets the error. The client gets a generic message with the id of
+ * the Sentry event, and the log gets the class of the error.
+ *
  * Each response has an `x-roach` header: `replayed`, `live`,
  * `missed` (`replay` mode had no recording), or `passthrough` (no rule
  * matched).
@@ -29,6 +35,7 @@ import {
   publicLookup,
 } from "./addresses.ts";
 import type { CertificateAuthority } from "./certificates.ts";
+import { reportInternal } from "./errors.ts";
 import type { ProxyRequest, Recorder, Telemetry } from "./recorder.ts";
 import type { OpenedSession } from "@sentry/roach/types";
 
@@ -216,7 +223,7 @@ async function proxyRequest(
   if (!rule) {
     const upstream = await sendUpstream(origin, request, privateNetworks);
     // Count it only when it went out. A refused address counts as refused.
-    recorder.countPassthrough(origin.origin, request.headers);
+    recorder.countPassthrough(origin.origin, request.headers, session);
     outgoing.writeHead(upstream.statusCode ?? 502, upstream.statusMessage, {
       ...upstream.headers,
       "x-roach": "passthrough",
@@ -277,20 +284,16 @@ export async function controlRecorder(
     case "GET /stats":
       sendJson(outgoing, 200, recorder.stats());
       return true;
+    // The recorder throws an error with a status for a fault of the client.
+    // `listenProxy()` answers each error.
     case "POST /session": {
       const { name } = await readJson<{ name?: unknown }>(incoming);
       if (typeof name !== "string" || name === "") {
         sendJson(outgoing, 400, { error: "name must be a string" });
         return true;
       }
-      try {
-        const id = await recorder.startSession(name);
-        sendJson(outgoing, 200, {
-          url: sessionUrl(id),
-        } satisfies OpenedSession);
-      } catch (error) {
-        sendJson(outgoing, 429, { error: (error as Error).message });
-      }
+      const id = await recorder.startSession(name);
+      sendJson(outgoing, 200, { url: sessionUrl(id) } satisfies OpenedSession);
       return true;
     }
     case "POST /session/end": {
@@ -298,12 +301,8 @@ export async function controlRecorder(
         name?: unknown;
         passed?: unknown;
       }>(incoming);
-      try {
-        const missed = await recorder.endSession(String(name), passed === true);
-        sendJson(outgoing, 200, { missed });
-      } catch (error) {
-        sendJson(outgoing, 409, { error: (error as Error).message });
-      }
+      const missed = await recorder.endSession(String(name), passed === true);
+      sendJson(outgoing, 200, { missed });
       return true;
     }
     default:
@@ -354,6 +353,11 @@ export interface ListenOptions {
     incoming: http.IncomingMessage,
     outgoing: http.ServerResponse,
   ): Promise<void>;
+  /**
+   * Send an unexpected error of `control` to Sentry. Returns the id of its
+   * event, or `undefined` when nothing goes to Sentry.
+   */
+  capture(error: unknown): string | undefined;
 }
 
 /** A listening proxy socket. */
@@ -391,34 +395,50 @@ function serveProxied(
     return;
   }
   // Only the origin: the path and query can hold a credential.
-  const origin = tunnelOrigin ?? URL.parse(incoming.url ?? "")?.origin;
+  const origin = String(tunnelOrigin ?? URL.parse(incoming.url ?? "")?.origin);
   const method = incoming.method ?? "GET";
-  target.telemetry
+  const { telemetry } = target;
+  telemetry
     .span(
       {
         op: "roach.request",
         name: `${method} ${origin}`,
-        attributes: { origin: String(origin), "http.request.method": method },
+        attributes: { "roach.origin": origin, "http.request.method": method },
       },
       async () => {
-        await proxyRequest(target, session, incoming, outgoing, tunnelOrigin);
-        target.telemetry.annotate({
+        try {
+          await proxyRequest(target, session, incoming, outgoing, tunnelOrigin);
+        } catch (error) {
+          // In the span, so that the Sentry event is in the trace.
+          answerError(target, origin, error, outgoing);
+        }
+        telemetry.annotate({
           "http.response.status_code": outgoing.statusCode,
         });
       },
     )
-    .catch((error: unknown) => {
-      if ((error as { code?: string }).code === NOT_PUBLIC_CODE) {
-        target.recorder.countRefused("notPublic", String(origin));
-      }
-      if (!outgoing.headersSent) {
-        const status = (error as { status?: number }).status ?? 502;
-        outgoing.writeHead(status, { "content-type": "text/plain" });
-      }
-      outgoing.end(
-        `Roach error: ${error instanceof Error ? error.message : String(error)}\n`,
-      );
-    });
+    .catch(() => outgoing.destroy());
+}
+
+/** Answer a proxied request that failed. See the start of this file. */
+function answerError(
+  target: ProxyTarget,
+  origin: string,
+  error: unknown,
+  outgoing: http.ServerResponse,
+): void {
+  if ((error as { code?: string }).code === NOT_PUBLIC_CODE) {
+    target.recorder.countRefused("notPublic", origin);
+  }
+  const status = (error as { status?: number }).status;
+  const text =
+    status === undefined
+      ? reportInternal("Request", error, target.telemetry.capture(error))
+      : (error as Error).message;
+  if (!outgoing.headersSent) {
+    outgoing.writeHead(status ?? 502, { "content-type": "text/plain" });
+  }
+  outgoing.end(`Roach error: ${text}\n`);
 }
 
 /**
@@ -457,17 +477,19 @@ export async function listenProxy(
       return;
     }
     options.control(incoming, outgoing).catch((error: unknown) => {
-      process.stderr.write(`[roach] Control failed: ${String(error)}\n`);
       // An error with a status, such as 413 from readBody, is the fault of
-      // the client. Any other error is a bug of the proxy.
-      const status = (error as { status?: number }).status ?? 500;
+      // the client. Any other error is a bug of the proxy or a failure of
+      // the store.
+      const status = (error as { status?: number }).status;
+      const message =
+        status === undefined
+          ? reportInternal("Control", error, options.capture(error))
+          : (error as Error).message;
       if (outgoing.headersSent) {
         outgoing.end();
         return;
       }
-      sendJson(outgoing, status, {
-        error: status === 500 ? "internal error" : (error as Error).message,
-      });
+      sendJson(outgoing, status ?? 500, { error: message });
     });
   });
   server.on("connection", (socket: Socket) => {
@@ -500,9 +522,17 @@ export async function listenProxy(
         process.stderr.write(`[roach] Refused ${host}:${port}\n`);
         // The scheme is not known before the tunnel opens. Most tunnels
         // are HTTPS on 443, so name them as their origin.
-        target.target.recorder.countRefused(
-          "notAllowed",
-          port === "443" ? `https://${host}` : `${host}:${port}`,
+        const origin = port === "443" ? `https://${host}` : `${host}:${port}`;
+        target.target.telemetry.span(
+          {
+            op: "roach.request",
+            name: `CONNECT ${origin}`,
+            attributes: {
+              "roach.origin": origin,
+              "http.request.method": "CONNECT",
+            },
+          },
+          () => target.target.recorder.countRefused("notAllowed", origin),
         );
         socket.end("HTTP/1.1 403 Forbidden\r\n\r\n");
         return;

@@ -7,6 +7,7 @@
  * runs this command.
  */
 import { readFile } from "node:fs/promises";
+import { describeError } from "./errors.ts";
 import { startRoachService, type RoachServiceConfig } from "./service.ts";
 
 const [command, ...args] = process.argv.slice(2);
@@ -26,7 +27,7 @@ const stop = () => {
   service.close().then(
     () => process.exit(0),
     (error: unknown) => {
-      process.stderr.write(`[roach] Close failed: ${String(error)}\n`);
+      process.stderr.write(`[roach] Close failed: ${describeError(error)}\n`);
       process.exit(1);
     },
   );

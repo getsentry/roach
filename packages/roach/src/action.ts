@@ -14,9 +14,11 @@ import { writeRunReport } from "./report.ts";
 
 /**
  * Variables that the command does not get: the inputs, which have the token,
- * and the proxy variables of the job.
+ * the tokens of the runner (`ACTIONS_*`, such as `ACTIONS_RUNTIME_TOKEN` and
+ * `ACTIONS_ID_TOKEN_REQUEST_TOKEN`), and the proxy variables of the job.
  */
-const HIDDEN_VARIABLE = /^(INPUT_.*|https?_proxy|no_proxy|all_proxy)$/i;
+const HIDDEN_VARIABLE =
+  /^(INPUT_.*|ACTIONS_.*|https?_proxy|no_proxy|all_proxy)$/i;
 
 /** Run the command in bash, and return its exit code. */
 function runCommand(command: string, env: NodeJS.ProcessEnv): Promise<number> {
