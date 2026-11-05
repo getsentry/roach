@@ -45,7 +45,7 @@ import {
 import { keyRequest, keyTimeLimit, type KeyedRequest } from "./request-key.ts";
 import {
   createSecrets,
-  redactUrl,
+  redactRequestUrl,
   toRedact,
   type LearnLimit,
 } from "./secrets.ts";
@@ -257,10 +257,13 @@ function matches(
  * block, and each value of the request becomes a placeholder. A body that
  * is not text gets `redactBytes` before it is encoded, because a redaction
  * of the encoded text cannot find a credential in it. The URL has the
- * value of each credential query parameter redacted.
+ * value of each credential query parameter redacted, and of each
+ * parameter that holds the value of a credential field of the body
+ * (`redactRequestUrl`).
  */
 function toRecording(
   request: ProxyRequest,
+  rule: RecordingRule,
   keyed: KeyedRequest,
   session: string | undefined,
   response: ProxyResponse,
@@ -286,7 +289,10 @@ function toRecording(
   }
   return {
     session,
-    request: { method: request.method, url: redactUrl(request.url.href) },
+    request: {
+      method: request.method,
+      url: redactRequestUrl(request, rule),
+    },
     response: { status: response.status, headers, body, bodyEncoding },
   };
 }
@@ -848,7 +854,14 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
       const recording = JSON.parse(
         secrets.redact(
           JSON.stringify(
-            toRecording(request, keyed, owner?.name, live, secrets.redactBytes),
+            toRecording(
+              request,
+              rule,
+              keyed,
+              owner?.name,
+              live,
+              secrets.redactBytes,
+            ),
           ),
         ),
       ) as Recording;

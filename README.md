@@ -226,7 +226,9 @@ A run takes `RunConfig` (`packages/roach/src/types.ts`): `tenant`, `mode`, `rule
   Recordings show `<<redacted>>` in place of each known value. The URL of
   a recording, a request sample, and the text of a miss in Sentry also show
   `<<redacted>>` for the value of each such query parameter, at any length
-  (see [Misses](#misses)). The other parameters do not change.
+  (see [Misses](#misses)). They also show it for a parameter whose value is
+  the value of a credential field of the request body (see below). The
+  other parameters do not change.
   A run without the token learns at most 1,024 values, with a total of
   1 Mi characters. A run with the token learns at most 16,384 values, with
   a total of 16 Mi characters, for credentials that change on each
@@ -307,9 +309,15 @@ A run takes `RunConfig` (`packages/roach/src/types.ts`): `tenant`, `mode`, `rule
   `bearer_token`, `client_assertion`, `password`, `api_key`,
   `secret_key`, `private_key`, and `secret_access_key`. In JSON, these
   fields count at each depth. In an `application/x-www-form-urlencoded`
-  body, the form fields count. No key uses this text, so this list can be
-  longer. The proxy replaces the value at the place of each field, and
-  each other string that is the same value. A value pattern can change
+  body, the form fields count, also with a nested name such as
+  `user[password]`, `password[]`, or `user[password][0]`. No key uses
+  this text, so this list can be longer. When the value of such a JSON
+  field is an object or an array, each string in it shows `<<redacted>>`,
+  at any depth. When the value is a number, or has a number in it, the
+  request sample has no text, and the URL of the recording shows
+  `<<redacted>>` for a parameter with that number. The proxy replaces the value at the place
+  of each field, and each other string that is the same value, also each
+  string of an object or an array value. A value pattern can change
   the text of a key, so then the proxy checks the result. It parses the
   body again, and the body must be JSON. Each field must hold
   `<<redacted>>` at its place, and no string can be one of the values.
@@ -320,16 +328,28 @@ A run takes `RunConfig` (`packages/roach/src/types.ts`): `tenant`, `mode`, `rule
   value of its rule has `"`, `\`, `&`, `=`, `<`, `>`, or a control
   character, because its `<<name>>` can add a field. A miss has no change
   then.
-- The proxy cannot find the fields of a body that is not JSON or a form,
-  such as JSON with a comma at the end, JSON lines, or a multipart body.
-  So the request sample of such a body has no text when the body has the
-  name of a field above anywhere. The name can be in any case, with `_`,
-  `-`, or nothing between its words, such as `accessToken`. This is one
-  search of the body, so a long body costs little.
+- The proxy cannot find the fields of a body that is not a JSON object or
+  array or a form, such as JSON with a comma at the end, JSON lines, a
+  multipart body, or a JSON string. It also cannot find them in a form body
+  that has no credential field, such as JSON or XML with a form content
+  type. So the request sample of such a body has no text when the body has
+  the name of a field above anywhere, or the start of a bare `token` above.
+  The name can be in any case, with `_`, `-`, or nothing between its words,
+  such as `accessToken`, and with JSON unicode escapes or URL escapes in
+  it. Each test is one search of the body, so a long body costs little.
+  In a form with credential fields, the request sample also has no text
+  when a field that is not a credential field can show one, such as
+  `user.password=`, or a bare `token` or another field with JSON with URL
+  escapes in its value. A value that is only such a name, such as
+  `grant_type=password`, does not count. It also has no text when a part
+  of a nested name, such as `S` of `S[password]`, is a credential value,
+  or when a name has the start of a bare `token`.
 - The proxy parses a JSON body to find the fields, so a long string value
-  cannot stop it. It does not find a field whose value is not a string,
-  such as an array, or a field in JSON text that is itself a string, such
-  as the escaped arguments of a tool call.
+  cannot stop it. It does not find a field in JSON text that is itself a
+  string, such as the escaped arguments of a tool call, or a copy of a
+  value inside other text, such as in a prompt or with URL escapes. The URL
+  of a recording keeps a copy of a value of the body when the proxy cannot
+  find the fields of the body.
 - Keys: redaction never changes the key of a request. The key is the hash
   of the request as the client sent it, so recordings from before stay
   valid.

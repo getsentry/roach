@@ -368,6 +368,47 @@ describe("redaction", () => {
     expect(text).not.toContain("api_token=x");
   });
 
+  it.each([
+    ["a string", HIDDEN],
+    ["an array", [HIDDEN]],
+    ["an object", { value: HIDDEN }],
+  ])(
+    "redacts a parameter of the URL of a recording that holds a credential field of the body, as %s",
+    async (_, password) => {
+      const run = await start("auto");
+      await send(
+        run,
+        `/v1/login?user=me&check=${HIDDEN}`,
+        JSON.stringify({ copy: HIDDEN, password }),
+      );
+      const { text, file } = await onlyRecording();
+      expect(file.request.url).toBe(
+        `${origin}/v1/login?user=me&check=<<redacted>>`,
+      );
+      expect(text).not.toContain("SECRET");
+      const [sample] = [...(await stored("_requests/api")).values()];
+      const { text: sampleText, withheld } = JSON.parse(
+        sample!,
+      ) as RequestSample;
+      expect(withheld).toBeUndefined();
+      expect(sampleText).toContain('"copy":"<<redacted>>"');
+      expect(sampleText).not.toContain("SECRET");
+    },
+  );
+
+  it.each([
+    ["a number", 8675309],
+    ["a number in an array", [8675309]],
+  ])(
+    "redacts a parameter of the URL of a recording that holds a credential field of the body, as %s",
+    async (_, password) => {
+      const run = await start("auto");
+      await send(run, "/v1/login?pin=8675309", JSON.stringify({ password }));
+      const { file } = await onlyRecording();
+      expect(file.request.url).toBe(`${origin}/v1/login?pin=<<redacted>>`);
+    },
+  );
+
   it("redacts a known credential in a binary body before it encodes it", async () => {
     const run = await start("auto");
     const live = await send(run, "/v1/binary", "{}", { "x-api-key": API_KEY });
@@ -469,6 +510,42 @@ describe("redaction", () => {
         expect(sample).not.toContain(secret);
       }
     }
+  });
+
+  it("redacts nested form fields and credential fields that are not strings", async () => {
+    const run = await start("auto");
+    await send(
+      run,
+      "/v1/login",
+      `user[name]=me&user%5Bpassword%5D=${HIDDEN}&password[]=${HIDDEN}-2&user[password][0]=${HIDDEN}-3&note=hi`,
+      { "content-type": "application/x-www-form-urlencoded" },
+    );
+    await send(
+      run,
+      "/v1/fields",
+      JSON.stringify({
+        api_key: [HIDDEN, { v: HIDDEN }],
+        password: { value: HIDDEN, hint: "" },
+        tools: [{ properties: { password: { type: "string" } } }],
+        note: "hi",
+      }),
+    );
+    const samples = [...(await stored("_requests/api")).values()].map(
+      (text) => JSON.parse(text) as RequestSample,
+    );
+    expect(samples.filter((sample) => sample.withheld)).toEqual([]);
+    const [form, json] = samples
+      .map((sample) => sample.text)
+      .toSorted((a, b) => a.length - b.length);
+    expect(form).toContain(
+      "user[name]=me&user%5Bpassword%5D=<<redacted>>&password[]=<<redacted>>&user[password][0]=<<redacted>>&note=hi",
+    );
+    // Each string in the value is replaced at its place.
+    expect(json).toContain(
+      '"api_key":["<<redacted>>",{"v":"<<redacted>>"}],"note":"hi","password":{"hint":"","value":"<<redacted>>"}',
+    );
+    expect(json).toContain('"password":{"type":"<<redacted>>"}');
+    expect(JSON.stringify(samples)).not.toContain("SECRET");
   });
 
   it.each(Object.keys(TOOL_INPUTS))(
@@ -1159,9 +1236,17 @@ describe("redaction", () => {
     expect(replayed.source).toBe("replayed");
   });
 
-  it("writes no text in a request sample when a body that is not JSON has a credential field name", async () => {
-    // The proxy cannot find the fields of a body that is not JSON or a
-    // form, so the name of a credential field is enough.
+  it("writes no text in a request sample when a body without fields that it can read can show a credential", async () => {
+    // The proxy cannot find the fields of a body that is not a JSON object
+    // or array, or a form with a credential field. So the name of a
+    // credential field, also with escapes, or a credential prefix is
+    // enough. So is a credential field with a number, also in an array or
+    // an object, and a form field that the proxy cannot read, such as
+    // `user.password` or JSON with URL escapes.
+    const form = "application/x-www-form-urlencoded";
+    // A JWT whose header has `-` in its base64url.
+    const dashJwt =
+      "eyJhbGciOiJSUzI1NiIsImtpZCI6In5-fj4-PiJ9.eyJzdWIiOiJhcHAifQ.c2ln";
     const bodies: [string, string][] = [
       [`{"password":"${HIDDEN}",}`, "application/json"],
       [`{"a":1}\n{"accessToken":"${HIDDEN}"}`, "application/x-ndjson"],
@@ -1169,6 +1254,46 @@ describe("redaction", () => {
         `--b\r\nContent-Disposition: form-data; name="Secret-Access-Key"\r\n\r\n${HIDDEN}\r\n--b--`,
         "multipart/form-data; boundary=b",
       ],
+      [`{"password":"${HIDDEN}"}`, form],
+      [`<login><password>${HIDDEN}</password></login>`, form],
+      [`payload=%7B%22pass%77ord%22%3A%22${HIDDEN}%22%7D`, form],
+      [
+        JSON.stringify(JSON.stringify({ password: HIDDEN })),
+        "application/json",
+      ],
+      [`{"pass\\u0077ord":"${HIDDEN}",}`, "application/json"],
+      [`token=${GITHUB_TOKEN}`, "text/plain"],
+      [`{"token":"${JWT}",}`, "application/json"],
+      [`{"password":8675309123456789}`, "application/json"],
+      [`{"password":[8675309123456789]}`, "application/json"],
+      [`{"password":{"pin":8675309123456789}}`, "application/json"],
+      [
+        JSON.stringify({ private_key: Buffer.from(HIDDEN) }),
+        "application/json",
+      ],
+      [`user.password=${HIDDEN}&api_key=abc123`, form],
+      [`api_key=abc123&data=%7B%22password%22%3A%22${HIDDEN}%22%7D`, form],
+      [`payload=%7B%22pass%77ord%22%3A%22${HIDDEN}%22%7D&pct=100%`, form],
+      [`see ${dashJwt}`, "text/plain"],
+      [`see x_${JWT}`, "text/plain"],
+      [`see 9${JWT}`, "text/plain"],
+      [`see -${dashJwt}`, "text/plain"],
+      // A bare `token` without a credential prefix is not a credential
+      // field, so its value is checked like any other.
+      ...[
+        "token=%7B%22password%22%3A%22S%22%7D",
+        "Token=%7B%22password%22%3A%22S%22%7D",
+        "user[token]=%7B%22password%22%3A%22S%22%7D",
+        "token=user.password%3DS",
+      ].map((part): [string, string] => [
+        `api_key=abc123&${part.replace("S", HIDDEN)}`,
+        form,
+      ]),
+      // A credential value or a JWT in a part of a form name that
+      // `formName` does not keep.
+      [`${HIDDEN}[password]=x&api_key=${HIDDEN}`, form],
+      [`a[${HIDDEN}][b]=x&api_key=${HIDDEN}`, form],
+      [`a[${JWT}][b]=x&api_key=abc123`, form],
     ];
     // A body without a name keeps its text.
     const kept = `{"note":"tokens and keys",}`;
@@ -1183,9 +1308,21 @@ describe("redaction", () => {
     const samples = [...(await stored("_requests/api")).values()].map(
       (sample) => JSON.parse(sample) as RequestSample,
     );
-    expect(samples).toHaveLength(4);
-    expect(JSON.stringify(samples)).not.toContain("SECRET");
-    expect(samples.filter((sample) => sample.withheld)).toHaveLength(3);
+    expect(samples).toHaveLength(bodies.length);
+    const bytes = [...Buffer.from(HIDDEN)].join(",");
+    for (const secret of [
+      "SECRET",
+      GITHUB_TOKEN,
+      JWT,
+      dashJwt,
+      "8675309",
+      bytes,
+    ]) {
+      expect(JSON.stringify(samples)).not.toContain(secret);
+    }
+    expect(samples.filter((sample) => sample.withheld)).toHaveLength(
+      bodies.length - 1,
+    );
     expect(samples.map((sample) => sample.text)).toContainEqual(
       expect.stringContaining(kept),
     );
