@@ -350,20 +350,16 @@ describe("recording", () => {
         change: {
           file: expect.stringMatching(/^model\/[0-9a-f]{64}\.json$/),
           at: 98,
-          recorded:
-            '…ssages":["Token <<redacted>>.","Finding ABC-123 is new."],"model":"…',
-          request:
-            '…ssages":["Token <<redacted>>.","Finding XYZ-789 is new."],"model":"…',
         },
       },
       expect.not.objectContaining({ change: expect.anything() }),
     ]);
     const { change } = misses[0]!;
     await expect(files()).resolves.toContain(change!.file.slice(6));
+    // The report goes to public CI logs, so it has no text of a request.
+    // Sentry has the text.
     expect(describeRecordingMisses(misses)).toEqual([
-      expect.stringContaining(
-        `\n  Changed at character ${change!.at} of the request of ${change!.file}:\n  - recorded: "…`,
-      ),
+      `test: ${misses[0]!.file}\n  Changed at character 98 of the request of ${change!.file}. See miss.recorded and miss.request on the roach.request span in Sentry.`,
     ]);
   });
 
@@ -398,10 +394,11 @@ describe("recording", () => {
     const [missAfter] = (await first.stats()).misses;
     expect(missAfter).not.toHaveProperty("change");
     const [missBefore] = (await second.stats()).misses;
-    expect(missBefore!.change).toMatchObject({
-      recorded: expect.stringMatching(/\{"a":"b","b":"x{100,}…$/),
-      request: expect.stringMatching(/\{"a":"changed","b":"x{100,}…$/),
+    expect(missBefore!.change).toEqual({
+      file: expect.stringMatching(/^model\/[0-9a-f]{64}\.json$/),
+      at: expect.any(Number),
     });
+    expect(missBefore!.change!.at).toBeLessThan(1024);
   });
 
   it("keeps a recording when its request sample cannot be written", async () => {

@@ -208,11 +208,13 @@ A run takes `RunConfig` (`src/types.ts`): `tenant`, `mode`, `rules`,
   or of the run. Use `secrets` of the run for the credentials of a CI job
   that a response can show but no request header has, such as a token that
   goes to a model in a prompt. The service keeps them only in memory, for
-  the run. A run can have 32 of them. It also learns the value of each request header whose name can mean a credential,
+  the run. A run can have 32 of them. It also learns the value of each request header and query parameter whose name can mean a credential,
   such as one with `auth`, `token`, `key`, `secret`, `cookie`, or `session`.
   The match is broad on purpose. It does not learn `x-session-affinity`,
   because that header has a conversation id and not a credential.
-  Recordings show `<<redacted>>` in place of each known value.
+  Recordings show `<<redacted>>` in place of each known value. A request
+  sample and the text of a miss in Sentry also show `<<redacted>>` for the
+  value of each such query parameter, at any length (see [Misses](#misses)).
 
 Requests that match no rule go live without a change, and their responses
 stream. Each response has an `x-roach` header: `replayed`, `live`,
@@ -290,40 +292,46 @@ its session and key. `describeRecordingMisses()` in `report.ts` gives the
 first miss of each test, which is the one to fix. The run report of the
 vitest integration and of the GitHub Action shows these misses.
 
-In a run with the write token, the first miss of each session also tells
-what changed (`misses.ts`):
+The proxy also finds where the first miss of each session changed
+(`misses.ts`). Sentry gets the text of the change, on the `roach.request`
+span of the miss (see [Sentry](#sentry)). The report of a run with the
+write token tells only where the change is:
 
 ```text
 - a.fixture.ts > passes: model/074d….json
-  Changed at character 65 of the request of model/8b96….json:
-  - recorded: "…/v1/messages\n{\"model\":\"a\"}"
-  - request:  "…/v1/messages\n{\"model\":\"a-changed\"}"
+  Changed at character 65 of the request of model/8b96….json. See miss.recorded and miss.request on the roach.request span in Sentry.
 ```
+
+The report goes to CI logs and job summaries, and these can be public. So
+no report, log, or stats of a run show the text of a request. Only Sentry
+shows it.
 
 - When the proxy records a request, it also writes a request sample to
   `_requests/<rule>/<hash>.json`. The sample has the text that the key
   hashes: the rule, the method, the URL, the key headers, and the body
   with `<<name>>` for each changing value. The proxy redacts credentials
-  in it, as in a recording. It keeps the first 1,048,576 characters
-  (UTF-16 code units) of the text.
+  in it, as in a recording, and the value of each credential query
+  parameter. It keeps the first 1,048,576 characters (UTF-16 code units)
+  of the text.
 - The hash of a sample is the place of the request: its session (test)
   and the number of requests of the rule that the session sent before
   it. So a sample is the last recorded request at the same place of the
   same test. A replay writes no sample.
-- Only runs with the write token get the change of a miss in their stats
-  and report. A run without the token, such as CI of a fork, gets no
-  change there. Reads are public, so a change would let anyone read back
-  the requests of a tenant. Sentry gets the change of every run, with or
-  without the token. So find the change of a fork in Sentry (see
-  [Sentry](#sentry)).
 - At the first miss of a session, the proxy reads the sample of the place
-  of the request. It shows the first character that is not the same, with
-  40 characters before it, and at most 120 characters from it. This is
-  one read for each session.
-- `change` of the miss has the key of the recording that the sample came
-  from, the offset, and the two texts. A miss has no `change` when there
-  is no sample, such as for a recording from an older version, or when
-  the texts are the same in the part that the sample keeps.
+  of the request. It finds the first character that is not the same.
+  Sentry gets 40 characters before it, and at most 120 characters from it,
+  of each text. This is one read for each session, in every run.
+- Sentry gets the change of every run, with or without the token. So find
+  the change of a miss of a fork in Sentry.
+- Only runs with the write token get `change` in their stats and report.
+  It has the key of the recording that the sample came from (`file`), and
+  the offset (`at`). It has no text. A run without the token, such as CI of
+  a fork, gets no `change`. Reads are public, and the offset of the first
+  change would let anyone guess the requests of a tenant back, one
+  character at a time.
+- A miss has no change when there is no sample, such as for a recording
+  from an older version, or when the texts are the same in the part that
+  the sample keeps.
 - When the requests of a test run in parallel, their order can change.
   Then a sample can come from another request of the test.
 
@@ -348,11 +356,12 @@ is not the same as the recorded one. No error shows this. The tests pass.
    that test with `ROACH_MODE=replay`. It needs no token. The test fails
    at the first miss, and the run report shows its key. Fix the first miss
    of a test before the others. The others often come from it.
-3. Run the test again with `ROACH_TOKEN` and `ROACH_MODE=replay`, and read
-   the change of the first miss in the run report. See [Misses](#misses).
-   It shows the changing value, with the text before it. Only a run with
-   the token shows it. When the miss has no change, get the body of that request from two
-   runs, and compare them. For example, add this file to `setupFiles`
+3. Find the `roach.request` span of the first miss in Sentry, by its `run`
+   and `has:miss.changed_at`. Read `miss.recorded` and `miss.request`. See
+   [Misses](#misses) and [`TELEMETRY.md`](TELEMETRY.md). They show the
+   changing value, with the text before it. This works for every run, with
+   or without the token. When the miss has no change, get the body of that
+   request from two runs, and compare them. For example, add this file to `setupFiles`
    after `@sentry/roach/vitest/setup`, and run the test two times:
 
    ```ts
@@ -470,8 +479,8 @@ Each proxied request is one trace. Each span has `tenant`, `mode`, and
   in every run. When the proxy finds a change, the span also has
   `miss.changed_at` (the offset of the first different character),
   `miss.compared` (the key of the recording), and the redacted text of the
-  change: `miss.recorded` and `miss.request`. These are the same texts as
-  in the run report ([Misses](#misses)). It contains:
+  change: `miss.recorded` and `miss.request`. Only Sentry gets these
+  texts ([Misses](#misses)). It contains:
   - `roach.key`: the key of the request, with `rule` and `key`.
   - `roach.store.read`: a read of a recording, with `key` and `result`:
     `hit` or `miss`. The first miss of a session also reads a request

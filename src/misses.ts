@@ -14,6 +14,17 @@ import { createHash } from "node:crypto";
 import type { RequestSample } from "./store.ts";
 import type { RecordingChange } from "./types.ts";
 
+/**
+ * A change with the redacted texts around it. Only Sentry gets the texts.
+ * The stats and the reports get only the `RecordingChange`.
+ */
+export interface ChangeText extends RecordingChange {
+  /** The recorded text there, with some text before and after it. */
+  recorded: string;
+  /** The text of the request there, with some text before and after it. */
+  request: string;
+}
+
 /** The longest text that a sample keeps, in UTF-16 characters. */
 const MAX_SAMPLE_LENGTH = 1024 * 1024;
 /** Characters shown before the first different character. */
@@ -54,7 +65,7 @@ export function toSample(file: string, text: string): RequestSample {
 export function firstChange(
   sample: RequestSample,
   text: string,
-): RecordingChange | undefined {
+): ChangeText | undefined {
   const recorded = sample.text;
   const shorter = Math.min(recorded.length, text.length);
   let at = 0;

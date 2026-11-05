@@ -102,7 +102,9 @@ Where the requests of misses changed, and what changed. The same
 `miss.changed_at` from run to run shows one value that changes on each
 run. `miss.recorded` and `miss.request` show that value. `miss.sample:none`
 is a miss that has no recorded request to compare with. This works for
-runs without the token too, such as CI of a fork.
+runs without the token too, such as CI of a fork. Only Sentry has these
+texts: the run report shows only the offset and the key, because CI logs
+can be public.
 
 ```bash
 sentry explore sentry/roach --dataset spans --period 24h \
@@ -163,9 +165,10 @@ and the next run makes it again. Compare `roach.recording.write` with
   `miss.sample`. When the proxy finds a change, it also has
   `miss.changed_at`, `miss.compared`, `miss.recorded`, and `miss.request`.
   The two texts have at most 160 characters each, redacted as in a
-  recording. Every run sends them, with or without the token. The stats
-  and the run report of a run without the token do not have them
-  ("Misses" in `README.md`).
+  recording, with the value of each credential query parameter redacted.
+  Every run sends them, with or without the token. No stats, report, or
+  log has the texts. The stats and report of a run with the token have
+  only the offset and the key ("Misses" in `README.md`).
 - `roach.store.read` spans with a `key` that starts with `_requests/` read
   a request sample, not a recording. Leave them out of a hit rate of
   `roach.store.read`. Each write of recordings has a second

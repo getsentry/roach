@@ -23,20 +23,20 @@ export function describeRecordingStats(stats: RecordingStats): string {
   return `${rules}. ${stats.written} recordings new or changed, ${stats.discarded} dropped from failed sessions. Not recorded: ${passthrough}.`;
 }
 
-/** Describe the first change of a miss, in indented lines. */
-const describeChange = ({ file, at, recorded, request }: RecordingChange) =>
-  [
-    `\n  Changed at character ${at} of the request of ${file}:`,
-    `\n  - recorded: ${JSON.stringify(recorded)}`,
-    `\n  - request:  ${JSON.stringify(request)}`,
-  ].join("");
+/**
+ * Describe the first change of a miss, in an indented line. The report
+ * goes to public CI logs, so it never shows the text of a request. Sentry
+ * has it.
+ */
+const describeChange = ({ file, at }: RecordingChange) =>
+  `\n  Changed at character ${at} of the request of ${file}. See miss.recorded and miss.request on the roach.request span in Sentry.`;
 
 /**
  * Describe the first request without a recording of each test. The first
  * miss of a test is the one to fix. Each later miss of the test usually
  * follows from it, because the live response differs from the recording.
  * When the proxy has the text of the closest recorded request, the
- * description also shows the first change from it, in indented lines.
+ * description also shows where it first changed, in an indented line.
  */
 export function describeRecordingMisses(misses: RecordingMiss[]): string[] {
   const seen = new Set<string | undefined>();

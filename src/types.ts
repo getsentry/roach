@@ -53,17 +53,15 @@ export interface RecordingRule {
 
 /**
  * Where a request without a recording first differs from the request of
- * the closest recording. The texts are those that the keys hash, redacted.
+ * the closest recording, in the texts that the keys hash. It has no text:
+ * the texts go only to the `roach.request` span in Sentry, as
+ * `miss.recorded` and `miss.request`.
  */
 export interface RecordingChange {
   /** The key of the recording that the request is compared with. */
   file: string;
   /** The offset of the first different character. */
   at: number;
-  /** The recorded text there, with some text before and after it. */
-  recorded: string;
-  /** The text of the request there, with some text before and after it. */
-  request: string;
 }
 
 /** A request that a rule matched, but that had no recording. */

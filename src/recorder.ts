@@ -19,8 +19,8 @@
  * With each new recording, the recorder writes the redacted text of its
  * request as a sample. The first miss of a session reads the sample of its
  * place and finds the first change (`misses.ts`). The span of the request
- * always gets the change. Only a run with the write token gets it in its
- * stats.
+ * always gets the change and its text. Only a run with the write token gets
+ * the change in its stats, and never its text.
  *
  * The recorder never writes a known credential (`secrets.ts`). It reports
  * spans and metrics through the `Telemetry` hooks of `service/service.ts`.
@@ -302,9 +302,9 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
   /**
    * Report a miss. The first miss of a session reads the sample of its
    * place (`sample`), and finds the first change from it to the text of the
-   * request (`text`). The span of the request gets the change. The stats
-   * get it only with `explainMisses`. A failed read only leaves the change
-   * out.
+   * request (`text`). The span of the request gets the change and its
+   * text. The stats get only its key and offset, and only with
+   * `explainMisses`. A failed read only leaves the change out.
    */
   const reportMiss = async (
     rule: RecordingRule,
@@ -335,7 +335,9 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
       "miss.recorded": change.recorded,
       "miss.request": change.request,
     });
-    if (config.explainMisses && miss) miss.change = change;
+    if (config.explainMisses && miss) {
+      miss.change = { file: change.file, at: change.at };
+    }
   };
 
   /** End a session. Returns its requests that `replay` mode failed. */
@@ -391,7 +393,7 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
       const owner = sessionOf(sessionId);
       const sample = nextSample(rule.name, owner);
       const counts = stats.counts[rule.name]!;
-      secrets.learn(request.headers);
+      secrets.learn(request.headers, request.url);
       telemetry.annotate({ rule: rule.name });
       const { keyed, key } = telemetry.span(
         { op: "roach.key", attributes: { rule: rule.name } },
@@ -411,7 +413,7 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
           return { keyed: result, key: name };
         },
       );
-      const redactedText = () => secrets.redact(keyed.text);
+      const redactedText = () => secrets.redactRequest(keyed.text, request.url);
       if (owner) {
         for (const [name, list] of keyed.values) {
           for (const value of list) {

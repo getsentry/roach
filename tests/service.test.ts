@@ -206,10 +206,13 @@ describe("roach service", () => {
     expect(await sendInSession(tokenRun, "\u0001")).toMatchObject({
       status: 412,
     });
-    const [miss] = (await tokenRun.stats()).misses;
-    expect(miss!.change).toMatchObject({
-      recorded: expect.stringContaining('{"prompt":"the stored prompt"}'),
+    // A run with the token gets where the request changed, but no text.
+    const tokenStats = await tokenRun.stats();
+    expect(tokenStats.misses[0]!.change).toEqual({
+      file: expect.stringMatching(/^model\/[0-9a-f]{64}\.json$/),
+      at: expect.any(Number),
     });
+    expect(JSON.stringify(tokenStats)).not.toContain("stored prompt");
     expect(liveRequests).toBe(1);
   });
 

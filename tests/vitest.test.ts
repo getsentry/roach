@@ -240,14 +240,10 @@ https.request = refuse;
 
     expect(result.code).toBe(1);
     expect(result.output).toMatch(
-      /- a\.fixture\.ts > passes: model\/[0-9a-f]{64}\.json\n {2}Changed at character \d+ of the request of model\/[0-9a-f]{64}\.json:\n/,
+      /- a\.fixture\.ts > passes: model\/[0-9a-f]{64}\.json\n {2}Changed at character \d+ of the request of model\/[0-9a-f]{64}\.json\. See miss\.recorded and miss\.request on the roach\.request span in Sentry\.\n/,
     );
-    // The end of the text that the key hashes is the URL and the body.
-    expect(result.output).toContain(
-      String.raw`/v1/messages\n{\"model\":\"a\"}"` + `\n  - request:  "…`,
-    );
-    expect(result.output).toContain(
-      String.raw`/v1/messages\n{\"model\":\"a-changed\"}"`,
-    );
+    // CI logs are public, so the output has no text of either request.
+    expect(result.output).not.toContain(String.raw`{\"model\":\"a\"}`);
+    expect(result.output).not.toContain("a-changed");
   });
 });
