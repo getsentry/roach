@@ -1138,9 +1138,11 @@ describe("limits of the service", () => {
     expect(failed.body).toMatch(
       /(key worker stopped|request took over \d+ ms).*This run has ended/s,
     );
-    // The service sends the 11 MB body to the worker, and it got 511 ms
+    // The service sends the 16.5 MB body to the worker, and it got 511 ms
     // once. A key in the service process takes seconds, or fills its heap.
-    expect(Math.max(...waits)).toBeLessThan(budget(1000));
+    // No `budget()`: coverage adds little here (about 280 ms against
+    // 220 ms), and 3 s would not catch a parse of the body in the service.
+    expect(Math.max(...waits)).toBeLessThan(1000);
     await expect(reader.stats()).rejects.toThrow(/404/);
     // The next key gets a new worker.
     const next = await startRun(undefined, "replay");

@@ -1,7 +1,9 @@
 import { defineProject } from "vitest/config";
 
 /** Tells whether vitest runs with `--coverage`, which makes the service slower. */
-const coverage = process.argv.some((arg) => arg.startsWith("--coverage"));
+const coverage = process.argv.some((arg) =>
+  /^--coverage(\.enabled(=true)?)?$/.test(arg),
+);
 
 export default defineProject({
   test: {
