@@ -43,7 +43,12 @@ import {
   type JobOptions,
 } from "./key-worker.ts";
 import { keyTimeLimit, type KeyedRequest } from "./request-key.ts";
-import { createSecrets, redactUrl, type LearnLimit } from "./secrets.ts";
+import {
+  createSecrets,
+  redactUrl,
+  toRedact,
+  type LearnLimit,
+} from "./secrets.ts";
 import {
   recordingKey,
   RULE_NAME,
@@ -661,11 +666,7 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
         redactInWorker(
           secrets.list(),
           keyed.text,
-          {
-            href: request.url.href,
-            body: request.body.toString("utf8"),
-            contentType: request.headers["content-type"],
-          },
+          toRedact(request, rule),
           jobOptions(keyed.text.length),
         ).then(
           (result) => {
@@ -790,7 +791,7 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
         } catch (error) {
           return notRecorded("it could not be redacted", error);
         }
-        const text = secrets.redactRequest(keyed.text, request);
+        const text = secrets.redactRequest(keyed.text, request, rule);
         if (text === undefined) {
           // A credential field of the request can stay in the text, so the
           // recorder writes a sample without text.

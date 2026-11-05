@@ -111,7 +111,15 @@ const isMinted = fieldTest(MINTED_FIELDS);
 /** Tells whether a field of `name` can hold a minted credential. */
 const mintedName = (name: string) =>
   MINTED_FIELDS.has(fieldName(name)) || fieldName(name) === "token";
-const isCredentialField = fieldTest(CREDENTIAL_FIELDS);
+/**
+ * The test for `CREDENTIAL_FIELDS`, as `fieldTest` makes it, but with
+ * `fieldKind`, which keeps the kinds of names it saw.
+ */
+const isCredentialField: CredentialTest = (name, value) => {
+  if (value === "" || value === REDACTED) return false;
+  const kind = fieldKind(name);
+  return kind === "credential" || (kind === "token" && TOKEN_VALUE.test(value));
+};
 /** A query parameter whose name can mean a credential, at any value. */
 const isCredentialParam: CredentialTest = (name) =>
   CREDENTIAL_HEADER.test(name);
@@ -287,21 +295,45 @@ function scanStrings(
 }
 
 /**
+ * The kind of a field: a credential field at any value, or a bare `token`
+ * that is a credential only with a credential prefix.
+ */
+type FieldKind = "credential" | "token" | undefined;
+/**
+ * The kinds of the names that `fieldKind` saw, with `""` for neither, for
+ * at most `MAX_KINDS` names of at most `MAX_NAME_LENGTH` characters.
+ */
+const kinds = new Map<string, "credential" | "token" | "">();
+const MAX_KINDS = 4096;
+/**
  * The longest name of a field, as it is sent, that `replaceStrings`
- * decodes to find a credential field. A longer name, such as one with
- * many `_`, is not decoded. Then only its value can match, and the check
- * of `redactRequestWith` finds a value that stays.
+ * decodes to find a credential field, and that `fieldKind` keeps. A
+ * longer name, such as one with many `_`, is not decoded. Then only its
+ * value can match, and the check of `redactRequestWith` finds a value
+ * that stays.
  */
 const MAX_NAME_LENGTH = 64;
 
 /**
- * The kind of a field of `name`: a credential field at any value, a bare
- * `token` that is a credential only with a credential prefix, or neither.
+ * The kind of a field of `name` (`FieldKind`), or `undefined` for
+ * neither.
  */
-function fieldKind(name: string): "credential" | "token" | undefined {
+function fieldKind(name: string): FieldKind {
+  const cached = kinds.get(name);
+  if (cached !== undefined) return cached || undefined;
   const key = fieldName(name);
-  if (CREDENTIAL_FIELDS.has(key)) return "credential";
-  return key === "token" ? "token" : undefined;
+  const kind = CREDENTIAL_FIELDS.has(key)
+    ? "credential"
+    : key === "token"
+      ? "token"
+      : undefined;
+  // A form can have millions of fields with a few names, and the name of
+  // each costs a regular expression. Only short names are kept, so the
+  // map stays small.
+  if (name.length <= MAX_NAME_LENGTH && kinds.size < MAX_KINDS) {
+    kinds.set(name, kind ?? "");
+  }
+  return kind;
 }
 
 /** Tells whether a field of `name` can hold a credential (`fieldKind`). */
@@ -439,48 +471,155 @@ function keepsFields(json: unknown, redacted: unknown): boolean {
 }
 
 /**
- * The number of credential fields of the lines of a form body, with each
- * field that holds `<<redacted>>`, and the decoded values of the others
- * (`CREDENTIAL_FIELDS`).
+ * Call `visit` for each part of a form body, in one pass: its start, the
+ * place of its `=` (or `-1`), and its end. Parts end at `&` and at line
+ * breaks. It stops when `visit` returns `false`.
  */
-function formFields(lines: string[]): { count: number; values: string[] } {
-  const values: string[] = [];
-  let count = 0;
-  for (const line of lines) {
-    for (const part of paramParts(line)) {
-      const name = decode(part.name);
-      const value = decode(part.value);
-      if (part.value && isCredentialField(name, value)) values.push(value);
-      else if (value === REDACTED && credentialName(name)) count += 1;
-    }
+function eachPart(
+  text: string,
+  visit: (start: number, equals: number, end: number) => boolean | void,
+): void {
+  // The next `&`, line break, and `=`, found again only after they pass,
+  // so each character is read a few times at most. The length of the text
+  // stands for one that is not there.
+  const next = (char: string, from: number) => {
+    const at = text.indexOf(char, from);
+    return at < 0 ? text.length : at;
+  };
+  let amp = -1;
+  let line = -1;
+  let equals = -1;
+  let start = 0;
+  while (start <= text.length) {
+    if (amp < start) amp = next("&", start);
+    if (line < start) line = next("\n", start);
+    if (equals < start) equals = next("=", start);
+    const end = Math.min(amp, line);
+    if (visit(start, equals < end ? equals : -1, end) === false) return;
+    start = end + 1;
   }
-  return { count: count + values.length, values };
+}
+
+/** The decoded name and value of a part of a form body (`eachPart`). */
+function formField(text: string, start: number, equals: number, end: number) {
+  const name = decode(text.slice(start, equals < 0 ? end : equals));
+  const value = equals < 0 ? "" : decode(text.slice(equals + 1, end));
+  return { name, value };
 }
 
 /**
- * Tells whether the lines of a form body, after `redactForm`, show no
- * credential field value, as `showsNoField` does for JSON, and still have
- * `expected` credential fields that hold `<<redacted>>`. The count
- * includes the fields that held `<<redacted>>` before (`formFields`), so
- * such a field cannot take the place of a field that a value pattern took
- * away.
+ * The credential fields of a form body (`CREDENTIAL_FIELDS`): their
+ * number, with each field that holds `<<redacted>>`, and the decoded
+ * values of the others.
  */
-function formShowsNoField(
-  lines: string[],
-  values: Set<string>,
-  expected: number,
-): boolean {
+function formFields(body: string): { count: number; values: string[] } {
+  const values: string[] = [];
   let count = 0;
-  for (const line of lines) {
-    for (const part of paramParts(line)) {
-      const name = decode(part.name);
-      const value = decode(part.value);
-      if (values.has(name) || values.has(value)) return false;
-      if (isCredentialField(name, value)) return false;
-      if (value === REDACTED && credentialName(name)) count += 1;
-    }
+  eachPart(body, (start, equals, end) => {
+    const { name, value } = formField(body, start, equals, end);
+    if (isCredentialField(name, value)) {
+      values.push(value);
+      count += 1;
+    } else if (value === REDACTED && credentialName(name)) count += 1;
+  });
+  return { count, values };
+}
+
+/**
+ * A test of whether a text is one of `values`. It compares the length
+ * first, and it makes the set of values only when a length matches, so a
+ * form with millions of credential fields and no other field costs little.
+ */
+function valueTest(values: string[]): (text: string) => boolean {
+  const lengths = new Set(values.map((value) => value.length));
+  let set: Set<string> | undefined;
+  return (text) =>
+    lengths.has(text.length) && (set ??= new Set(values)).has(text);
+}
+
+/**
+ * The credential fields of a parsed JSON body at any depth, as
+ * `formFields` gives them for a form. `keepsFields` checks each place.
+ */
+function jsonFields(json: unknown): { count: number; values: string[] } {
+  const values = credentialValues(json, isCredentialField, true);
+  return { count: values.length, values };
+}
+
+/**
+ * The text of a form body, after a value pattern changed it, with the
+ * value of each credential field replaced, in one pass. It is `undefined`
+ * when the result can still show a value: when a name or a value of
+ * another field is a credential value (`isValue`), or when fewer than
+ * `expected` fields hold `<<redacted>>` (`formFields`). Then a value
+ * pattern took a field away, such as with its name. A field that held
+ * `<<redacted>>` before counts in `expected`, so it cannot take the place
+ * of that field.
+ */
+function redactFormBody(
+  body: string,
+  isValue: (text: string) => boolean,
+  expected: number,
+): string | undefined {
+  const parts: string[] = [];
+  let from = 0;
+  let count = 0;
+  let shows = false;
+  eachPart(body, (start, equals, end) => {
+    const { name, value } = formField(body, start, equals, end);
+    if (isCredentialField(name, value)) {
+      parts.push(body.slice(from, equals + 1), REDACTED);
+      from = end;
+      count += 1;
+    } else if (value === REDACTED && credentialName(name)) count += 1;
+    else if (isValue(name) || isValue(value)) shows = true;
+    return !shows;
+  });
+  if (shows || count < expected) return undefined;
+  parts.push(body.slice(from));
+  return parts.join("");
+}
+
+/**
+ * Tells whether a value name of a rule can change the structure of the
+ * text of a key. Each value becomes `<<name>>`, so a name with a quote, a
+ * `&`, or a control character such as a line break could add a field
+ * that holds `<<redacted>>`, in JSON or in a form.
+ */
+function unsafeName(name: string): boolean {
+  if (/["\\&=<>]/.test(name)) return true;
+  for (let at = 0; at < name.length; at += 1) {
+    if (name.charCodeAt(at) < 0x20) return true;
   }
-  return count >= expected;
+  return false;
+}
+
+/**
+ * The number of lines of the key headers in the text of a key: one for
+ * each different name, and more for a name with a line break. A value of
+ * a header has no line break.
+ */
+function headerLines(names: string[]): number {
+  let lines = 0;
+  const unique = Object.fromEntries(names.map((name) => [name, true]));
+  for (const name of Object.keys(unique)) lines += name.split("\n").length;
+  return lines;
+}
+
+/**
+ * The place in `text`, the text of a key, where the body starts: after
+ * the line of `href` and the lines of the key headers. It is `-1` when
+ * `text` does not have `href`.
+ */
+function bodyStart(text: string, href: string, keyHeaders: string[]): number {
+  let at = text.indexOf(href);
+  if (at < 0) return -1;
+  for (let line = 0; line <= headerLines(keyHeaders); line += 1) {
+    at = text.indexOf("\n", at);
+    if (at < 0) return -1;
+    at += 1;
+  }
+  return at;
 }
 
 /** Tells whether a parsed JSON value is an object that is not an array. */
@@ -585,6 +724,7 @@ function replaceMinted(text: string): { text: string; minted: string[] } {
 
 /** Decode a part of a query, or keep it when it is not valid. */
 const decode = (part: string) => {
+  if (!part.includes("%") && !part.includes("+")) return part;
   try {
     return decodeURIComponent(part.replaceAll("+", " "));
   } catch {
@@ -657,10 +797,11 @@ export function redactUrl(
  * `Bearer <token>` or each value of a cookie header. Add each part with
  * `\/` for `/` to `derived`: a server can write a copy of it so, such as
  * PHP `json_encode`. These forms come from a value that the limit counts,
- * so the limit does not count them again. The whole value does not get
- * them when it has parts, because its parts cover a copy of it. So a
- * header such as a SigV4 `Authorization`, with a new value with `/` on
- * each request, does not make the list longer.
+ * so the limit does not count them again. The whole value gets them only
+ * when a `/` is in no part that the proxy learns, such as in
+ * `Key k1/a2b3 s3/c4d5e6`. Else its parts cover a copy of it, and a header
+ * such as a SigV4 `Authorization`, with a new value with `/` on each
+ * request, does not make the list longer.
  */
 function add(value: string, into: Set<string>, derived = into): void {
   const parts = value.split(/[\s;,=]+/);
@@ -671,13 +812,17 @@ function add(value: string, into: Set<string>, derived = into): void {
     // characters.
     into.add(JSON.stringify(part).slice(1, -1));
   }
-  for (const part of parts) {
+  const covered = parts.every(
+    (part) => !part.includes("/") || part.length >= MIN_LENGTH,
+  );
+  const whole = parts.length > 1 && !covered ? [value] : [];
+  for (const part of [...whole, ...parts]) {
     if (part.length < MIN_LENGTH || !part.includes("/")) continue;
     // A recording keeps such a body as it is, and its JSON text escapes
     // the `\` again.
-    const slashed = JSON.stringify(part).slice(1, -1).replaceAll("/", "\\/");
-    derived.add(slashed);
-    derived.add(JSON.stringify(slashed).slice(1, -1));
+    const json = JSON.stringify(part).slice(1, -1).replaceAll("/", "\\/");
+    derived.add(json);
+    derived.add(JSON.stringify(json).slice(1, -1));
   }
 }
 
@@ -703,6 +848,30 @@ export interface RequestToRedact {
   href: string;
   body: string;
   contentType: string | string[] | undefined;
+  /** The `keyHeaders` of the rule, which come before the body. */
+  keyHeaders: string[];
+  /** The names of the `values` of the rule. */
+  valueNames: string[];
+}
+
+/** The parts of a rule that `redactRequestWith` needs. */
+export interface RuleToRedact {
+  keyHeaders?: string[];
+  values?: Record<string, string>;
+}
+
+/** A proxied request and its rule, as `redactRequestWith` needs them. */
+export function toRedact(
+  request: { url: URL; headers: IncomingHttpHeaders; body: Buffer },
+  rule: RuleToRedact,
+): RequestToRedact {
+  return {
+    href: request.url.href,
+    body: request.body.toString("utf8"),
+    contentType: request.headers["content-type"],
+    keyHeaders: rule.keyHeaders ?? [],
+    valueNames: Object.keys(rule.values ?? {}),
+  };
 }
 
 /**
@@ -714,12 +883,14 @@ export interface RequestToRedact {
  * the value of each credential query parameter is replaced at any length,
  * and each parameter whose value is the value of a credential field.
  *
- * Then it checks the result, and returns `undefined` when the text can
- * still show the value of a credential field. A value pattern can take a
- * quote, a name, or a part of a value away. For a JSON body, it parses the
- * body of the text again: the body must be JSON, `showsNoField` must find
- * no value, and `keepsFields` must find each field in its place. For a
- * form body, `formShowsNoField` must find no value.
+ * Then it checks the body of the result, after the key headers, and
+ * returns `undefined` when the text can still show the value of a
+ * credential field. A value pattern can take a quote, a name, or a part
+ * of a value away. For a JSON body, it parses the body again: the body
+ * must be JSON, `showsNoField` must find no value, and `keepsFields` must
+ * find each field in its place. For a form body, `redactFormBody` must
+ * find no value and each field. It also returns `undefined` when a value
+ * name of the rule can change the structure of the text (`unsafeName`).
  * Each step reads the text once, so a long text or many values cost
  * little.
  */
@@ -728,39 +899,45 @@ export function redactRequestWith(
   text: string,
   request: RequestToRedact,
 ): string | undefined {
-  const form = isForm(request.contentType)
-    ? formFields(request.body.split("\n"))
-    : undefined;
+  const form = isForm(request.contentType);
   const json = form ? undefined : parseJson(request.body);
-  const fields = form
-    ? form.values
-    : credentialValues(json, isCredentialField, true);
-  const known = new Set(fields);
+  const fields = form ? formFields(request.body) : jsonFields(json);
+  const isValue = valueTest(fields.values);
   const href = redactUrl(
     request.href,
-    (name, value) => isCredentialParam(name, value) || known.has(value),
+    (name, value) => isCredentialParam(name, value) || isValue(value),
   );
   const result = text.replace(request.href, () => href);
-  if (form) {
-    const redacted = redactWith(values, redactForm(result, isCredentialField));
-    if (form.count === 0) return redacted;
-    // The body comes after the URL. A credential parameter of the URL is
-    // `<<redacted>>` too, and it must not count. A replacement does not
-    // add or take away a line.
-    const url = result.split("\n").indexOf(href);
-    const body = redacted.split("\n").slice(url + 1);
-    return formShowsNoField(body, known, form.count) ? redacted : undefined;
+  if (fields.count === 0) {
+    return redactWith(
+      values,
+      form ? redactForm(result, isCredentialField) : result,
+    );
   }
-  if (fields.length === 0) return redactWith(values, result);
-  const redacted = redactWith(values, replaceStrings(result, known));
-  // The body of a JSON request is the last line of the text of its key,
-  // because JSON text has no line break.
-  const body = parseJson(redacted.slice(redacted.lastIndexOf("\n") + 1));
-  return body !== undefined &&
-    showsNoField(body, known) &&
-    keepsFields(json, body)
-    ? redacted
-    : undefined;
+  // Only the body itself is checked, so a key header cannot take the
+  // place of a field. A value name that can change the structure of the
+  // text makes the check unsafe.
+  const at = bodyStart(result, href, request.keyHeaders);
+  if (at < 0 || request.valueNames.some(unsafeName)) {
+    return undefined;
+  }
+  const head = result.slice(0, at);
+  if (form) {
+    const body = redactFormBody(result.slice(at), isValue, fields.count);
+    if (body === undefined) return undefined;
+    return redactWith(values, redactForm(head, isCredentialField) + body);
+  }
+  const known = new Set(fields.values);
+  const body = redactWith(values, replaceStrings(result.slice(at), known));
+  const parsed = parseJson(body);
+  if (
+    parsed === undefined ||
+    !showsNoField(parsed, known) ||
+    !keepsFields(json, parsed)
+  ) {
+    return undefined;
+  }
+  return redactWith(values, replaceStrings(head, known)) + body;
 }
 
 /**
@@ -925,12 +1102,9 @@ export function createSecrets(initial: string[], limit: LearnLimit) {
     redactRequest(
       text: string,
       request: { url: URL; headers: IncomingHttpHeaders; body: Buffer },
+      rule: RuleToRedact,
     ): string | undefined {
-      return redactRequestWith(longestFirst(), text, {
-        href: request.url.href,
-        body: request.body.toString("utf8"),
-        contentType: request.headers["content-type"],
-      });
+      return redactRequestWith(longestFirst(), text, toRedact(request, rule));
     },
   };
 }

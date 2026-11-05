@@ -232,8 +232,9 @@ A run takes `RunConfig` (`packages/roach/src/types.ts`): `tenant`, `mode`, `rule
   a total of 16 Mi characters, for credentials that change on each
   request, such as AWS signatures. The whole value and each part of it
   count, also for the `secrets` of the run. The proxy also redacts each
-  part with `\/` for `/`, as some servers write it in JSON. These forms
-  do not count. A run whose `secrets` go past
+  part with `\/` for `/`, as some servers write it in JSON, and the whole
+  value when a `/` is only in parts shorter than 12 characters. These
+  forms do not count. A run whose `secrets` go past
   the limit gets HTTP 400 when it starts. Past the limit, a request with a
   new credential gets HTTP 431, and the proxy does not send or record it.
   A request with known credentials goes on. Start a new run to learn more.
@@ -312,9 +313,13 @@ A run takes `RunConfig` (`packages/roach/src/types.ts`): `tenant`, `mode`, `rule
   the text of a key, so then the proxy checks the result. It parses the
   body again, and the body must be JSON. Each field must hold
   `<<redacted>>` at its place, and no string can be one of the values.
-  When a check fails, the request sample has no text, and the proxy writes
-  a log line with the key. This occurs when a value pattern takes a quote,
-  or a name of a field, away. A miss has no change then.
+  Only the body counts, not a key header. When a check fails, the request
+  sample has no text, and the proxy writes a log line with the key. This
+  occurs when a value pattern takes a quote, or a name of a field, away.
+  A request with credential fields also gets no text when the name of a
+  value of its rule has `"`, `\`, `&`, `=`, `<`, `>`, or a control
+  character, because its `<<name>>` can add a field. A miss has no change
+  then.
 - The proxy parses a JSON body to find the fields, so a long string value
   cannot stop it. It does not find a field whose value is not a string,
   such as an array, or a field in JSON text that is itself a string, such
