@@ -37,7 +37,8 @@ gives its proxy variables to the test workers. The setup file
 record in parallel workers at the same time. A passed test writes its new
 recordings. A failed test drops them. In `replay` mode, a test with a miss
 fails. At the end, the global setup writes the stats of the run to stdout
-and to the job summary.
+and to the job summary. After you add Roach, do the check in
+[Find changing values](#find-changing-values).
 
 - `ROACH_TOKEN`: the write token. Only the global setup reads it. Without
   it, the run can only replay, as in jobs of forks.
@@ -270,6 +271,77 @@ Avoid nested quantifiers, such as `(a+)+`.
 The proxy adds each request without a recording to `stats().misses`, with
 its session and key. `describeRecordingMisses()` in `report.ts` gives the
 first miss of each test, which is the one to fix.
+
+## Find changing values
+
+Do this check when you add Roach to a project. Do it again when a test
+that passed does not replay on the next run.
+
+A value that changes on each run and that no pattern finds gives a new key
+on each run. In `auto` mode, that request goes live and records again on
+each run. The run is slow, and it costs as much as a run without Roach.
+The requests after it in the test also go live, because the live response
+is not the same as the recorded one. No error shows this. The tests pass.
+
+1. Run the suite two times with the token. On the second run, each test
+   that passed must replay all of its requests. Look at `live` in the stats
+   of the second run. It must be 0, or near 0. In CI, also compare the
+   time of each test. A test that replays takes about as long as its code
+   without the network. [`TELEMETRY.md`](TELEMETRY.md) shows how to find
+   the runs and keys that stay live.
+2. Find the first live request of a test that did not replay. Run only
+   that test with `ROACH_MODE=replay`. It needs no token. The test fails
+   at the first miss, and the run report shows its key. Fix the first miss
+   of a test before the others. The others often come from it.
+3. Get the body of that request from two runs, and compare them. A
+   recording does not keep the request body, so get it in the client. For
+   example, add this file to `setupFiles` after
+   `@sentry/roach/vitest/setup`, and run the test two times:
+
+   ```ts
+   // Local only. Writes each fetch request to DUMP_FILE.
+   import { appendFileSync } from "node:fs";
+   import { expect } from "vitest";
+
+   const dumpFile = process.env.DUMP_FILE ?? "requests.jsonl";
+   const fetchBefore = globalThis.fetch;
+   globalThis.fetch = async (input, init) => {
+     const request = new Request(input, init);
+     const record = {
+       test: expect.getState().currentTestName,
+       method: request.method,
+       url: request.url,
+       body: await request.clone().text(),
+     };
+     appendFileSync(dumpFile, JSON.stringify(record) + "\n");
+     return fetchBefore(request);
+   };
+   ```
+
+   The first difference between the two bodies is the changing value.
+   This file sees only `fetch`. A client that uses `node:http` directly
+   needs its own hook.
+
+4. Add a narrow pattern for the value to `values` of the rule. See
+   [Changing values](#changing-values). Then do step 1 again.
+
+Values that changed in real projects:
+
+- Ids that the code under test makes, such as UUIDs and random short ids.
+  For example, Warden gives each finding a random `XXX-XXX` id, and the
+  next model request quotes it.
+- Paths of temporary directories, commit SHAs of a repository that a test
+  makes, and times and dates.
+- The local environment. Global git config, such as a hook that adds a
+  commit trailer, commit signing, or `user.name`, changes the commits that
+  a test makes. `HOME`, the user name, the locale, and the time zone can
+  also show in a request. Then local keys are not the same as CI keys, so
+  a local `replay` misses while CI replays. Make the test harness ignore
+  them. For git, set `GIT_CONFIG_GLOBAL=/dev/null` and
+  `GIT_CONFIG_NOSYSTEM=1`, and set the author and committer in the test.
+- Order. The proxy sorts JSON object keys, but not arrays. An array whose
+  order depends on timing, such as the results of parallel tool calls,
+  gives a new key when the order changes.
 
 ## Service
 

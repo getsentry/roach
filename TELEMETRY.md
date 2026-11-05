@@ -80,6 +80,7 @@ sentry explore sentry/roach --dataset metrics --metric roach.recording.write \
 
 Runs with the most live requests. When the same tests stay live from run to
 run, a value in the key changes on each run. Then look at the keys of one run.
+"Find changing values" in `README.md` shows how to find the value.
 
 ```bash
 sentry explore sentry/roach --dataset spans --period 24h \
