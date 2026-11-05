@@ -58,6 +58,15 @@ export function toSample(file: string, text: string): RequestSample {
 }
 
 /**
+ * The sample of a recorded request whose text the proxy could not redact.
+ * It has no text, but it takes the place of an older sample, so a later
+ * miss does not compare with a request that is not the last one.
+ */
+export function withheldSample(file: string): RequestSample {
+  return { file, text: "", withheld: true };
+}
+
+/**
  * The first change from the text of `sample` to `text`. `undefined` when
  * the texts are the same, or when they differ only after the part that
  * the sample kept.

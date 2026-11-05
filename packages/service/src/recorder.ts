@@ -35,7 +35,7 @@ import type { IncomingHttpHeaders } from "node:http";
 import { promisify } from "node:util";
 import { brotliDecompress, gunzip, inflate, zstdDecompress } from "node:zlib";
 import { reportInternal } from "./errors.ts";
-import { firstChange, sampleKey, toSample } from "./misses.ts";
+import { firstChange, sampleKey, toSample, withheldSample } from "./misses.ts";
 import {
   keyInWorker,
   redactInWorker,
@@ -517,13 +517,16 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
     const places = owner ?? outside;
     if (places.explained) return;
     places.explained = true;
-    const recorded = (await store.read(sample).catch(() => undefined)) as
+    const read = (await store.read(sample).catch(() => undefined)) as
       | RequestSample
       | undefined;
+    const recorded = read?.withheld ? undefined : read;
     // The redacted text has a time limit. Past it, the change is left out.
     const redacted = recorded && (await text());
     const change = redacted && firstChange(recorded, redacted);
-    telemetry.annotate({ "miss.sample": recorded ? "found" : "none" });
+    telemetry.annotate({
+      "miss.sample": read ? (recorded ? "found" : "withheld") : "none",
+    });
     if (!change) return;
     telemetry.annotate({
       "miss.changed_at": change.at,
@@ -790,14 +793,19 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
         const text = secrets.redactRequest(keyed.text, request);
         if (text === undefined) {
           // A credential field of the request can stay in the text, so the
-          // recorder does not write the sample.
+          // recorder writes a sample without text.
           process.stderr.write(
-            `[roach] The ${rule.name} request sample was not written, because a credential field could not be redacted: ${key}\n`,
+            `[roach] The ${rule.name} request sample has no text, because a credential field could not be redacted: ${key}\n`,
           );
         }
         await record(owner, key, {
           recording: stored,
-          samples: text === undefined ? [] : [[sample, toSample(key, text)]],
+          samples: [
+            [
+              sample,
+              text === undefined ? withheldSample(key) : toSample(key, text),
+            ],
+          ],
         });
       }
       const response = fromRecording(recording, keyed.values);

@@ -171,12 +171,13 @@ const QUOTE = 0x22;
 const BACKSLASH = 0x5c;
 const LINE_BREAK = 0x0a;
 const COLON = 0x3a;
-/** `{` and `[`. */
-const OPEN = new Set([0x7b, 0x5b]);
-/** `}` and `]`. */
-const CLOSE = new Set([0x7d, 0x5d]);
-/** Space, tab, line feed, and carriage return. */
-const JSON_SPACE = new Set([0x20, 0x09, 0x0a, 0x0d]);
+/** `{` or `[`. A compare is faster than a set for each character. */
+const isOpen = (code: number) => code === 0x7b || code === 0x5b;
+/** `}` or `]`. */
+const isClose = (code: number) => code === 0x7d || code === 0x5d;
+/** Space, tab, line feed, or carriage return. */
+const isJsonSpace = (code: number) =>
+  code === 0x20 || code === 0x09 || code === 0x0a || code === 0x0d;
 
 /**
  * The escapes of a JSON string: it has none, all are valid, or one is not
@@ -184,26 +185,41 @@ const JSON_SPACE = new Set([0x20, 0x09, 0x0a, 0x0d]);
  */
 type Escapes = "none" | "valid" | "bad";
 /**
- * The character after the backslash of an escape that is not a `u` escape:
- * a quote, a backslash, a slash, `b`, `f`, `n`, `r`, or `t`.
+ * The escapes that are not `u` escapes, by the character after the
+ * backslash, and the character that each one gives.
  */
-const SIMPLE_ESCAPES = new Set([
-  0x22, 0x5c, 0x2f, 0x62, 0x66, 0x6e, 0x72, 0x74,
+const SIMPLE_ESCAPES = new Map([
+  [0x22, '"'],
+  [0x5c, "\\"],
+  [0x2f, "/"],
+  [0x62, "\b"],
+  [0x66, "\f"],
+  [0x6e, "\n"],
+  [0x72, "\r"],
+  [0x74, "\t"],
 ]);
-const HEX = /^[0-9a-fA-F]{4}$/;
+const U = 0x75;
 
-/** Tells whether the escape at `at` (a backslash) of `text` is valid JSON. */
-function validEscape(text: string, at: number): boolean {
-  const next = text.charCodeAt(at + 1);
-  if (SIMPLE_ESCAPES.has(next)) return true;
-  return next === 0x75 && HEX.test(text.slice(at + 2, at + 6));
+/** Tells whether the character at `at` of `text` is a hex digit. */
+function isHex(text: string, at: number): boolean {
+  const code = text.charCodeAt(at) | 0x20;
+  return (code >= 0x30 && code <= 0x39) || (code >= 0x61 && code <= 0x66);
 }
+
+/** Tells whether `text` has a valid `u` escape at `at` (its backslash). */
+const uEscape = (text: string, at: number) =>
+  text.charCodeAt(at + 1) === U &&
+  isHex(text, at + 2) &&
+  isHex(text, at + 3) &&
+  isHex(text, at + 4) &&
+  isHex(text, at + 5);
 
 /**
  * Call `visit` for each JSON string of `text`, in one pass: its start, its
  * end after the closing quote, the depth of objects and arrays around it,
- * whether it is a field name (a `:` follows it), and its escapes
- * (`Escapes`). A string ends at a line break, because JSON does not allow
+ * whether it is a field name (a `:` follows it), its escapes (`Escapes`),
+ * and the length of its value. The length is right only when the escapes
+ * are valid. A string ends at a line break, because JSON does not allow
  * one in a string. So a line that is not JSON, such as a header line in
  * the text of a key, cannot make it read the next lines wrong.
  */
@@ -215,29 +231,35 @@ function scanStrings(
     depth: number,
     name: boolean,
     escapes: Escapes,
+    length: number,
   ) => void,
 ): void {
   let depth = 0;
   let at = 0;
   while (at < text.length) {
     const code = text.charCodeAt(at);
-    if (OPEN.has(code)) depth += 1;
-    else if (CLOSE.has(code)) depth -= 1;
+    if (isOpen(code)) depth += 1;
+    else if (isClose(code)) depth -= 1;
     if (code !== QUOTE) {
       at += 1;
       continue;
     }
     let end = at + 1;
     let escapes: Escapes = "none";
+    let length = 0;
     while (end < text.length) {
       const next = text.charCodeAt(end);
       if (next === QUOTE) break;
       if (next === LINE_BREAK) break;
+      length += 1;
       if (next === BACKSLASH && text.charCodeAt(end + 1) !== LINE_BREAK) {
-        if (escapes !== "bad") {
-          escapes = validEscape(text, end) ? "valid" : "bad";
+        if (escapes === "none") escapes = "valid";
+        // The hex digits of a `u` escape cannot be a quote or a line break.
+        if (uEscape(text, end)) end += 6;
+        else {
+          if (!SIMPLE_ESCAPES.has(text.charCodeAt(end + 1))) escapes = "bad";
+          end += 2;
         }
-        end += 2;
       } else {
         // JSON does not allow a control character, such as a tab, in a
         // string. A header line can have one.
@@ -254,8 +276,8 @@ function scanStrings(
     }
     end += 1;
     let after = end;
-    while (JSON_SPACE.has(text.charCodeAt(after))) after += 1;
-    visit(at, end, depth, text.charCodeAt(after) === COLON, escapes);
+    while (isJsonSpace(text.charCodeAt(after))) after += 1;
+    visit(at, end, depth, text.charCodeAt(after) === COLON, escapes, length);
     at = end;
   }
 }
@@ -264,35 +286,21 @@ function scanStrings(
  * `text` with each JSON string that is one of `values` replaced by
  * `"<<redacted>>"`, in one pass. It compares the value of each string, so
  * a value written with `\/` or a unicode escape matches too. Only a whole
- * string matches, so a short value cannot change other text.
- *
- * `values` has a value one time for each field that holds it. When the
- * text has a value fewer times, such as when a value pattern takes a quote
- * away, it returns `undefined`, because the text can still show it.
+ * string matches, so a short value cannot change other text. It decodes
+ * only a string whose value has the length of one of `values`.
  */
-function replaceStrings(text: string, values: string[]): string | undefined {
-  if (values.length === 0) return text;
-  const fields = new Map<string, number>();
-  for (const value of values) fields.set(value, (fields.get(value) ?? 0) + 1);
-  const found = new Map<string, number>();
-  const lengths = new Set(values.map((value) => value.length));
-  let shortest = Infinity;
-  for (const length of lengths) shortest = Math.min(shortest, length);
+function replaceStrings(text: string, values: Set<string>): string {
+  if (values.size === 0) return text;
+  const lengths = new Set([...values].map((value) => value.length));
   const parts: string[] = [];
   let from = 0;
-  scanStrings(text, (start, end, _depth, _name, escapes) => {
-    const length = end - start - 2;
-    // An escape makes the text of a string longer than its value.
-    if (escapes === "none" ? !lengths.has(length) : length < shortest) return;
-    const value = decodeString(text.slice(start, end), escapes);
-    if (value === undefined || !fields.has(value)) return;
-    found.set(value, (found.get(value) ?? 0) + 1);
+  scanStrings(text, (start, end, _depth, _name, escapes, length) => {
+    if (!lengths.has(length)) return;
+    const value = decodeString(text, start, end, escapes);
+    if (value === undefined || !values.has(value)) return;
     parts.push(text.slice(from, start), REDACTED_JSON);
     from = end;
   });
-  for (const [value, count] of fields) {
-    if ((found.get(value) ?? 0) < count) return undefined;
-  }
   parts.push(text.slice(from));
   return parts.join("");
 }
@@ -308,14 +316,42 @@ const mintedValue = (json: Record<string, unknown>, name: string) => {
 };
 
 /**
- * The value of a JSON string token, or `undefined` when its escapes are
- * not valid. It parses only a token with valid escapes, so it does not
- * throw: a throw for each string is slow.
+ * The value of the JSON string from `start` to `end` of `text`, or
+ * `undefined` when its escapes are not valid (`scanStrings`). It decodes
+ * the escapes itself, so it does not throw and it costs little for each
+ * string. A `u` escape gives one UTF-16 code unit, as in `JSON.parse`, so a
+ * lone surrogate stays.
  */
-function decodeString(token: string, escapes: Escapes): string | undefined {
-  if (escapes === "none") return token.slice(1, -1);
+function decodeString(
+  text: string,
+  start: number,
+  end: number,
+  escapes: Escapes,
+): string | undefined {
+  if (escapes === "none") return text.slice(start + 1, end - 1);
   if (escapes === "bad") return undefined;
-  return JSON.parse(token) as string;
+  let value = "";
+  let from = start + 1;
+  let at = from;
+  while (at < end - 1) {
+    if (text.charCodeAt(at) !== BACKSLASH) {
+      at += 1;
+      continue;
+    }
+    value += text.slice(from, at);
+    const next = text.charCodeAt(at + 1);
+    if (next === U) {
+      value += String.fromCharCode(
+        Number.parseInt(text.slice(at + 2, at + 6), 16),
+      );
+      at += 6;
+    } else {
+      value += SIMPLE_ESCAPES.get(next)!;
+      at += 2;
+    }
+    from = at;
+  }
+  return value + text.slice(from, end - 1);
 }
 
 /**
@@ -347,11 +383,11 @@ function replaceMinted(text: string): { text: string; minted: string[] } {
       return;
     }
     if (field === undefined) return;
-    const of = decodeString(text.slice(field.start, field.end), field.escapes);
+    const of = decodeString(text, field.start, field.end, field.escapes);
     field = undefined;
     // Decode only the values of fields that can be minted.
     if (of === undefined || !mintedName(of)) return;
-    const value = decodeString(text.slice(start, end), escapes);
+    const value = decodeString(text, start, end, escapes);
     if (value === undefined || !isMinted(of, value)) return;
     minted.push(value);
     parts.push(text.slice(from, start), REDACTED_JSON);
@@ -440,9 +476,13 @@ export function redactUrl(
 
 /**
  * Add `value` and its parts to `into`, such as the token of
- * `Bearer <token>` or each value of a cookie header.
+ * `Bearer <token>` or each value of a cookie header. With `minted`, also
+ * add each part with `\/` for `/`, for a minted credential. A response can
+ * have a copy of it written so. A learned value does not get these forms:
+ * they would count toward the limit, and a header such as a SigV4
+ * `Authorization` has a new value with `/` on each request.
  */
-function add(value: string, into: Set<string>): void {
+function add(value: string, into: Set<string>, minted = false): void {
   for (const part of [value, ...value.split(/[\s;,=]+/)]) {
     if (part.length < MIN_LENGTH) continue;
     into.add(part);
@@ -450,7 +490,7 @@ function add(value: string, into: Set<string>): void {
     // characters.
     const json = JSON.stringify(part).slice(1, -1);
     into.add(json);
-    if (!part.includes("/")) continue;
+    if (!minted || !part.includes("/")) continue;
     // Some servers write `/` as `\/` in JSON. A recording keeps such a
     // body as it is, and its JSON text escapes the `\` again.
     const slashed = json.replaceAll("/", "\\/");
@@ -484,12 +524,36 @@ export interface RequestToRedact {
 }
 
 /**
+ * The most credential field values of one request that
+ * `redactRequestWith` checks for in its result. Each check reads the whole
+ * text, so a request with more values gets no text.
+ */
+const MAX_CHECKED_FIELDS = 64;
+
+/**
+ * The forms of a credential field value that the text of a request can
+ * show: as it is, as JSON writes it, and with `\/` for `/`. For a form
+ * body, also as it was sent.
+ */
+function fieldForms(value: string, sent?: string): string[] {
+  const json = JSON.stringify(value).slice(1, -1);
+  return [value, json, json.replaceAll("/", "\\/"), ...(sent ? [sent] : [])];
+}
+
+/**
  * The text of `request`, such as the text that its key hashes, with each
  * of `values` replaced. Give longer values first. It also replaces the
  * value of each credential field (`CREDENTIAL_FIELDS`) at any depth of a
  * JSON body, or of an `application/x-www-form-urlencoded` body. These
  * values do not join the known credentials. In the first copy of the URL,
  * the value of each credential query parameter is replaced at any length.
+ *
+ * It returns `undefined` when the result still has the value of a
+ * credential field at any place, because then the text can show it. This
+ * occurs when a value pattern takes a quote away, or when the value is
+ * also in other text, such as in a key of an object or in a field that is
+ * not a credential. It also returns `undefined` when the body has more
+ * than `MAX_CHECKED_FIELDS` different values.
  */
 export function redactRequestWith(
   values: string[],
@@ -498,13 +562,29 @@ export function redactRequestWith(
 ): string | undefined {
   const href = redactUrl(request.href);
   const result = text.replace(request.href, () => href);
+  let redacted: string;
+  const forms: string[] = [];
   if (isForm(request.contentType)) {
-    return redactWith(values, redactForm(result, isCredentialField));
+    const fields = new Map<string, string>();
+    for (const line of request.body.split("\n")) {
+      for (const { name, value } of paramParts(line)) {
+        const decoded = decode(value);
+        if (value && isCredentialField(decode(name), decoded)) {
+          fields.set(value, decoded);
+        }
+      }
+    }
+    if (fields.size > MAX_CHECKED_FIELDS) return undefined;
+    for (const [sent, value] of fields) forms.push(...fieldForms(value, sent));
+    redacted = redactWith(values, redactForm(result, isCredentialField));
+  } else {
+    const json = parseJson(request.body);
+    const fields = new Set(credentialValues(json, isCredentialField, true));
+    if (fields.size > MAX_CHECKED_FIELDS) return undefined;
+    for (const value of fields) forms.push(...fieldForms(value));
+    redacted = redactWith(values, replaceStrings(result, fields));
   }
-  const json = parseJson(request.body);
-  const fields = credentialValues(json, isCredentialField, true);
-  const replaced = replaceStrings(result, fields);
-  return replaced === undefined ? undefined : redactWith(values, replaced);
+  return forms.some((form) => redacted.includes(form)) ? undefined : redacted;
 }
 
 /**
@@ -629,12 +709,12 @@ export function createSecrets(initial: string[], limit: LearnLimit) {
       if (isForm(contentType)) {
         return redactForm(text, (name, value) => {
           if (!isMinted(name, value)) return false;
-          add(value, values);
+          add(value, values, true);
           return true;
         });
       }
       const result = replaceMinted(text);
-      for (const value of result.minted) add(value, values);
+      for (const value of result.minted) add(value, values, true);
       return result.text;
     },
 
@@ -649,7 +729,7 @@ export function createSecrets(initial: string[], limit: LearnLimit) {
     redactLocation(href: string): string {
       return redactUrl(href, (name, value) => {
         if (!isMinted(name, value)) return false;
-        add(value, values);
+        add(value, values, true);
         return true;
       });
     },

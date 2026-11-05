@@ -305,9 +305,12 @@ A run takes `RunConfig` (`packages/roach/src/types.ts`): `tenant`, `mode`, `rule
   `secret_key`, `private_key`, and `secret_access_key`. In JSON, these
   fields count at each depth. In an `application/x-www-form-urlencoded`
   body, the form fields count. No key uses this text, so this list can be
-  longer. When the text has a field value fewer times than the body, such
-  as when a value pattern takes a quote away, the proxy does not write the
-  sample. It writes a log line with the key.
+  longer. Then the proxy looks for each value of these fields in the
+  text. When it finds one, the request sample has no text, and the proxy
+  writes a log line with the key. This occurs when a value pattern takes
+  a quote away, or when the value is also in other text of the body, such
+  as in a key of an object. A body with more than 64 different values of
+  these fields gets a sample with no text too. A miss has no change then.
 - The proxy parses a JSON body to find the fields, so a long string value
   cannot stop it. It does not find a field whose value is not a string,
   such as an array, or a field in JSON text that is itself a string, such
@@ -453,8 +456,10 @@ shows it.
   change would let anyone guess the requests of a tenant back, one
   character at a time.
 - A miss has no change when there is no sample, such as for a recording
-  from an older version, or when the texts are the same in the part that
-  the sample keeps.
+  from an older version, when the sample has no text (`withheld`, see
+  [Config](#config)), or when the texts are the same in the part that the
+  sample keeps. A sample with no text still takes the place of the older
+  sample, so a miss never compares with a request that is not the last.
 - The proxy redacts the text of the miss before it compares it. This runs
   in the worker process of the keys, with the time limit of a key (see
   [Changing values](#changing-values)). Past it, the miss has no change.
@@ -616,10 +621,11 @@ Each proxied request is one trace. Each span has `roach.tenant`,
   response has token usage, the span also has the `gen_ai` attributes of
   the model call (`usage.ts`). Sentry then calculates its cost in USD as
   `gen_ai.cost.total_tokens`. The span of the first miss of a session also
-  has `miss.sample` (`found` or `none`), in every run. When the proxy finds
-  a change, the span also has `miss.changed_at` (the offset of the first
-  different character), `miss.compared` (the key of the recording), and
-  the redacted text of the change: `miss.recorded` and `miss.request`.
+  has `miss.sample` (`found`, `withheld`, or `none`), in every run. When
+  the proxy finds a change, the span also has `miss.changed_at` (the
+  offset of the first different character), `miss.compared` (the key of
+  the recording), and the redacted text of the change: `miss.recorded` and
+  `miss.request`.
   Only Sentry gets these texts ([Misses](#misses)). It contains:
   - `roach.key`: the key of the request, with `roach.rule` and
     `roach.key`.

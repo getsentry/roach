@@ -40,6 +40,11 @@ export interface RequestSample {
   text: string;
   /** Set when `text` was cut. */
   truncated?: boolean;
+  /**
+   * Set when the proxy could not redact the text, so `text` is empty. The
+   * sample still takes the place of an older sample of the same place.
+   */
+  withheld?: boolean;
 }
 
 /** A file in a store. */

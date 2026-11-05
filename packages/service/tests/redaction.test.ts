@@ -650,12 +650,12 @@ describe("redaction", () => {
   });
 
   it("redacts many credential fields of a request without blocking the event loop", async () => {
-    // 2,000 different passwords in about 8 MiB. Each is a field to redact
-    // in the request sample.
+    // 64 different passwords in about 8 MiB, the most that the proxy
+    // checks. Each is a field to redact in the request sample.
     const fields = Object.fromEntries(
-      Array.from({ length: 2000 }, (_, index) => [
+      Array.from({ length: 64 }, (_, index) => [
         `f${index}`,
-        { password: `${index}-${"p".repeat(4096)}` },
+        { password: `${index}-${"p".repeat(128 * 1024)}` },
       ]),
     );
     const body = JSON.stringify(fields);
@@ -679,10 +679,26 @@ describe("redaction", () => {
     expect(longest).toBeLessThan(2000);
     expect(performance.now() - started).toBeLessThan(5000);
     const [sample] = [...(await stored("_requests/api")).values()];
-    const { text } = JSON.parse(sample!) as RequestSample;
+    const { text, withheld } = JSON.parse(sample!) as RequestSample;
+    expect(withheld).toBeUndefined();
     // `includes`, so a failure does not print 8 MiB.
     expect(text.includes("p".repeat(4096))).toBe(false);
   }, 120_000);
+
+  it("writes no text in a request sample with more than 64 credential values", async () => {
+    // The proxy checks the text for each value, so it checks at most 64.
+    const fields = Object.fromEntries(
+      Array.from({ length: 65 }, (_, index) => [
+        `f${index}`,
+        { password: `password-${index}` },
+      ]),
+    );
+    const run = await start("auto");
+    const live = await send(run, "/v1/fields", JSON.stringify(fields));
+    expect(live.source).toBe("live");
+    const [sample] = [...(await stored("_requests/api")).values()];
+    expect(JSON.parse(sample!)).toMatchObject({ text: "", withheld: true });
+  });
 
   it("redacts a credential field of a request with escapes in its value", async () => {
     // `\/` and `\u` are other ways to write the same value. The key writes
@@ -713,7 +729,7 @@ describe("redaction", () => {
     });
   });
 
-  it("does not write a request sample when a pattern hides a credential field", async () => {
+  it("writes a request sample without text when a pattern hides a credential field", async () => {
     // The pattern takes the quote after the id, so the text of the key has
     // the password outside of a string.
     const values = { v: String.raw`id-[0-9]+"` };
@@ -724,7 +740,64 @@ describe("redaction", () => {
     expect([...(await stored("api")).values()]).toHaveLength(1);
     const samples = [...(await stored("_requests/api")).values()];
     expect(samples.join("")).not.toContain("SECRET");
-    expect(samples).toHaveLength(0);
+    expect(samples.map((sample) => JSON.parse(sample))).toEqual([
+      { file: expect.any(String), text: "", withheld: true },
+    ]);
+  });
+
+  /** A password, and bodies where a pattern can leave it in the text. */
+  const HIDDEN = "hunter2-SECRET-xyz";
+  it.each([
+    // `confirm_password` is not a credential field, and it sorts first.
+    [
+      "a field that is not a credential",
+      `{"confirm_password":"${HIDDEN}","id":"id-123","password":"${HIDDEN}"}`,
+    ],
+    [
+      "a key of an object",
+      `{"${HIDDEN}":1,"id":"id-123","password":"${HIDDEN}"}`,
+    ],
+    [
+      "an item of a list",
+      `{"a":["${HIDDEN}"],"b":"id-1","password":"${HIDDEN}"}`,
+    ],
+    // Two quotes go away, so the count of quotes is even again.
+    [
+      "two fields after two patterns",
+      `{"a":"id-1","password":"${HIDDEN}","q":"id-2","z":"${HIDDEN}"}`,
+    ],
+  ])(
+    "writes no text in a request sample when a credential value stays in %s",
+    async (_, body) => {
+      const values = { v: String.raw`id-[0-9]+"` };
+      const run = await start("auto", [{ ...rule(), values }]);
+      const live = await send(run, "/v1/fields", body);
+      expect(live.source).toBe("live");
+      const samples = [...(await stored("_requests/api")).values()];
+      expect(samples).toHaveLength(1);
+      expect(samples[0]).not.toContain("SECRET");
+      expect(JSON.parse(samples[0]!)).toMatchObject({
+        text: "",
+        withheld: true,
+      });
+    },
+  );
+
+  it("does not compare a miss with an older sample when a sample has no text", async () => {
+    const values = { v: String.raw`id-[0-9]+"` };
+    const rules = [{ ...rule(), values }];
+    // The first request of each run has the same place, so the same sample.
+    await send(await start("auto", rules), "/v1/fields", `{"n":1}`);
+    const hidden = `{"a":"id-1","password":"${HIDDEN}"}`;
+    await send(await start("auto", rules), "/v1/fields", hidden);
+    const [sample] = [...(await stored("_requests/api")).values()];
+    expect(JSON.parse(sample!)).toMatchObject({ text: "", withheld: true });
+    // A miss there has no change: the last request at the place has no text.
+    const replay = await start("replay", rules);
+    expect((await send(replay, "/v1/fields", `{"n":2}`)).source).toBe("missed");
+    const { misses } = await replay.stats();
+    expect(misses).toHaveLength(1);
+    expect(misses[0]!.change).toBeUndefined();
   });
 
   it("does not throw for each string with an escape that is not valid", async () => {
@@ -754,8 +827,34 @@ describe("redaction", () => {
     expect(sample).toBeDefined();
     const { text } = JSON.parse(sample!) as RequestSample;
     // The sample is cut to its first part, so it does not show the field.
-    // It is written, so the field matched.
     expect(text).not.toContain('"password":"x"');
+    expect(text).not.toBe("");
+  }, 60_000);
+
+  it("decodes only the strings that have the length of a credential value", async () => {
+    // Each string has a valid escape, and its value is shorter than the
+    // password, so none of them is decoded. About 8 MiB.
+    const run = await start("auto");
+    const strings = Array.from({ length: 1_650_000 }, () => '"\\n"');
+    const body = `{"a":[${strings.join(",")}],"password":"pw"}`;
+    let last = performance.now();
+    let longest = 0;
+    const timer = setInterval(() => {
+      const now = performance.now();
+      longest = Math.max(longest, now - last);
+      last = now;
+    }, 5);
+    try {
+      const live = await send(run, "/v1/fields", body);
+      expect(live.source).toBe("live");
+    } finally {
+      clearInterval(timer);
+    }
+    // About 200 ms, and 1.4 s with coverage. Most of it is the parse of the
+    // body. A `JSON.parse` of each string made it about two times longer.
+    expect(longest).toBeLessThan(3000);
+    const [sample] = [...(await stored("_requests/api")).values()];
+    expect(JSON.parse(sample!)).not.toHaveProperty("withheld");
   }, 60_000);
 
   it("reads a string that does not close only once", async () => {
@@ -783,6 +882,23 @@ describe("redaction", () => {
     expect(live.source).toBe("live");
     expect(live.body.equals(BOMB)).toBe(true);
     expect((await stored("api")).size).toBe(0);
+  });
+
+  it("learns a credential with `/` without more values toward the limit", async () => {
+    // A SigV4 `Authorization` header has a new value with `/` on each
+    // request. A run without the token learns at most 1,024 values, and
+    // this header has 401: the value and its 400 parts.
+    const run = await startRemoteRun(
+      { url: service.url },
+      { tenant: TENANT, mode: "replay", allow: [origin], rules: [rule()] },
+    );
+    runs.push(run);
+    const parts = Array.from({ length: 400 }, (_, i) => `scope/${i}/request`);
+    const live = await send(run, "/v1/fields", "{}", {
+      authorization: parts.join(", "),
+    });
+    expect(live.body.toString()).not.toMatch(/cannot learn more/);
+    expect(live.source).toBe("missed");
   });
 
   it("keeps the keys of requests with credentials", async () => {
