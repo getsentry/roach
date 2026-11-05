@@ -368,6 +368,20 @@ describe("redaction", () => {
     expect(text).not.toContain("api_token=x");
   });
 
+  it("redacts a parameter of the URL of a recording that holds a credential field of the body", async () => {
+    const run = await start("auto");
+    await send(
+      run,
+      `/v1/login?user=me&check=${HIDDEN}`,
+      JSON.stringify({ password: HIDDEN }),
+    );
+    const { text, file } = await onlyRecording();
+    expect(file.request.url).toBe(
+      `${origin}/v1/login?user=me&check=<<redacted>>`,
+    );
+    expect(text).not.toContain("SECRET");
+  });
+
   it("redacts a known credential in a binary body before it encodes it", async () => {
     const run = await start("auto");
     const live = await send(run, "/v1/binary", "{}", { "x-api-key": API_KEY });
@@ -469,6 +483,43 @@ describe("redaction", () => {
         expect(sample).not.toContain(secret);
       }
     }
+  });
+
+  it("redacts nested form fields and credential fields that are not strings", async () => {
+    const run = await start("auto");
+    await send(
+      run,
+      "/v1/login",
+      `user[name]=me&user%5Bpassword%5D=${HIDDEN}&note=hi`,
+      { "content-type": "application/x-www-form-urlencoded" },
+    );
+    await send(
+      run,
+      "/v1/fields",
+      JSON.stringify({
+        api_key: [HIDDEN, { v: HIDDEN }],
+        password: { value: HIDDEN, length: 18 },
+        tools: [{ properties: { password: { type: "string" } } }],
+        note: "hi",
+      }),
+    );
+    const samples = [...(await stored("_requests/api")).values()].map(
+      (text) => JSON.parse(text) as RequestSample,
+    );
+    expect(samples.filter((sample) => sample.withheld)).toEqual([]);
+    const [form, json] = samples
+      .map((sample) => sample.text)
+      .toSorted((a, b) => a.length - b.length);
+    expect(form).toContain(
+      "user[name]=me&user%5Bpassword%5D=<<redacted>>&note=hi",
+    );
+    // Each string in the value is replaced at its place. A number in it
+    // stays.
+    expect(json).toContain(
+      '"api_key":["<<redacted>>",{"v":"<<redacted>>"}],"note":"hi","password":{"length":18,"value":"<<redacted>>"}',
+    );
+    expect(json).toContain('"password":{"type":"<<redacted>>"}');
+    expect(JSON.stringify(samples)).not.toContain("SECRET");
   });
 
   it.each(Object.keys(TOOL_INPUTS))(
@@ -1159,9 +1210,12 @@ describe("redaction", () => {
     expect(replayed.source).toBe("replayed");
   });
 
-  it("writes no text in a request sample when a body that is not JSON has a credential field name", async () => {
-    // The proxy cannot find the fields of a body that is not JSON or a
-    // form, so the name of a credential field is enough.
+  it("writes no text in a request sample when a body without fields that it can read can show a credential", async () => {
+    // The proxy cannot find the fields of a body that is not a JSON object
+    // or array, or a form with a credential field. So the name of a
+    // credential field, also with escapes, or a credential prefix is
+    // enough. So is a credential field with a number.
+    const form = "application/x-www-form-urlencoded";
     const bodies: [string, string][] = [
       [`{"password":"${HIDDEN}",}`, "application/json"],
       [`{"a":1}\n{"accessToken":"${HIDDEN}"}`, "application/x-ndjson"],
@@ -1169,6 +1223,17 @@ describe("redaction", () => {
         `--b\r\nContent-Disposition: form-data; name="Secret-Access-Key"\r\n\r\n${HIDDEN}\r\n--b--`,
         "multipart/form-data; boundary=b",
       ],
+      [`{"password":"${HIDDEN}"}`, form],
+      [`<login><password>${HIDDEN}</password></login>`, form],
+      [`payload=%7B%22pass%77ord%22%3A%22${HIDDEN}%22%7D`, form],
+      [
+        JSON.stringify(JSON.stringify({ password: HIDDEN })),
+        "application/json",
+      ],
+      [`{"pass\\u0077ord":"${HIDDEN}",}`, "application/json"],
+      [`token=${GITHUB_TOKEN}`, "text/plain"],
+      [`{"token":"${JWT}",}`, "application/json"],
+      [`{"password":8675309123456789}`, "application/json"],
     ];
     // A body without a name keeps its text.
     const kept = `{"note":"tokens and keys",}`;
@@ -1183,9 +1248,13 @@ describe("redaction", () => {
     const samples = [...(await stored("_requests/api")).values()].map(
       (sample) => JSON.parse(sample) as RequestSample,
     );
-    expect(samples).toHaveLength(4);
-    expect(JSON.stringify(samples)).not.toContain("SECRET");
-    expect(samples.filter((sample) => sample.withheld)).toHaveLength(3);
+    expect(samples).toHaveLength(bodies.length);
+    for (const secret of ["SECRET", GITHUB_TOKEN, JWT, "8675309"]) {
+      expect(JSON.stringify(samples)).not.toContain(secret);
+    }
+    expect(samples.filter((sample) => sample.withheld)).toHaveLength(
+      bodies.length - 1,
+    );
     expect(samples.map((sample) => sample.text)).toContainEqual(
       expect.stringContaining(kept),
     );
