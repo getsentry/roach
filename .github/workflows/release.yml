@@ -50,7 +50,7 @@ jobs:
         run: .github/scripts/drop-floating-tags.sh
 
       - name: Prepare release
-        uses: getsentry/craft@3f2abdc5703191d12ef2cc013f792f1bd220f44d # v2
+        uses: getsentry/craft@78cac764e2316a8eb6ed6cd2736c5195d3db4d51 # v2
         env:
           GITHUB_TOKEN: ${{ steps.token.outputs.token }}
         with:
