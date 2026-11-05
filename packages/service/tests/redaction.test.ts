@@ -665,10 +665,10 @@ describe("redaction", () => {
     } finally {
       clearInterval(timer);
     }
-    // About 115 ms here, as on main without field redaction. A pass for
-    // each field took 16 s.
-    expect(longest).toBeLessThan(500);
-    expect(performance.now() - started).toBeLessThan(2000);
+    // About 115 ms, and 700 ms with coverage. A pass for each field took
+    // 16 s.
+    expect(longest).toBeLessThan(2000);
+    expect(performance.now() - started).toBeLessThan(5000);
     const [sample] = [...(await stored("_requests/api")).values()];
     const { text } = JSON.parse(sample!) as RequestSample;
     // `includes`, so a failure does not print 8 MiB.
