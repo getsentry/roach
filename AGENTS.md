@@ -31,6 +31,7 @@
 ## Key Conventions
 
 - Use Node built-ins and the `openssl` command. The npm package (the root, `src/`) has no runtime dependencies. The only one is `@sentry/node`, in the private `service/` package, and only `service/service.ts` imports it. Code in `src/` cannot resolve it, so the client and the action cannot load it.
+- The npm tarball has only the client files: the `files` list in `package.json`. When an export imports a new file in `src/`, add it to `files`. `tests/package.test.ts` fails if they do not agree.
 - `deploy/gcp/` is the production setup (Terraform). Change it in the same change when the service config (`RoachServiceConfig`) changes. CI runs `terraform validate` on it.
 - Node runs `src/` and `service/` as TypeScript with type stripping. Use only erasable syntax, and import local files with the `.ts` extension.
 - Use functions and plain objects, not classes.

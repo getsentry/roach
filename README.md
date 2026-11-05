@@ -648,6 +648,11 @@ the proxy code from `src/` and is the only package that depends on
 `@sentry/node`. Tests are in `tests/`. The production setup is in
 `deploy/gcp/` and `Dockerfile`.
 
+The npm tarball has only the files in `src/` that the package exports load.
+The `files` list in `package.json` sets them. `tests/package.test.ts` fails
+when this list and the imports of the exports do not agree. The other files
+in `src/` are for the service and the action.
+
 - `types.ts`: rules, modes, runs, sessions, and the results of a run.
 - `server.ts`: sockets, HTTPS interception, the allow list, and the control
   API.
