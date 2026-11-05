@@ -520,6 +520,11 @@ export async function listenProxy(
     }
     serveProxied(tunnel, incoming, outgoing, tunnel.origin);
   });
+  // Between two requests, Node sets the time limit of a socket to its
+  // `keepAliveTimeout`, and at the next request back to `timeout`. With
+  // the default `timeout` of 0, a later request in a tunnel without TLS
+  // had no idle limit. A TLS tunnel also keeps the limit of its raw socket.
+  tunnelServer.timeout = TUNNEL_IDLE_MS;
   const server = http.createServer(HTTP_OPTIONS, (incoming, outgoing) => {
     // A request to the proxy itself has a path. A proxied plain HTTP
     // request has an absolute URL.

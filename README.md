@@ -763,9 +763,9 @@ To see how well the cache works:
 - A `CONNECT` tunnel that sends no byte for 10 s after the `200` closes. A
   tunnel that sends and gets no byte for 10 minutes while a request waits
   for its response closes. Between two requests, a tunnel closes after
-  about 5 s without a new request (the `keepAliveTimeout` of Node), and
-  the client opens a new one. A gap: in a tunnel without TLS, Node removes
-  the 10-minute limit after the first request.
+  6 s without a new request (the `keepAliveTimeout` of Node, 5 s, and 1 s
+  that Node adds), and the client opens a new one. The 10-minute limit
+  holds for each request of a tunnel, with or without TLS.
 - The credentials that a run learns and the values that the sessions of
   a run without the token remember have limits. See [Config](#config) and
   [Changing values](#changing-values).
