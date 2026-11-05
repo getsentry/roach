@@ -16,11 +16,15 @@
  * Each response has an `x-roach` header: `replayed`, `live`,
  * `missed` (`replay` mode had no recording), or `passthrough` (no rule
  * matched).
+ *
+ * Behind a load balancer, each connection can start with a PROXY protocol
+ * v1 header (`proxyProtocol`). It gives the address of the client
+ * (`clientAddress()`).
  */
 import { timingSafeEqual } from "node:crypto";
 import http from "node:http";
 import https from "node:https";
-import { isIP, type Socket } from "node:net";
+import net, { isIP, type Socket } from "node:net";
 import tls from "node:tls";
 import {
   isPublicAddress,
@@ -44,7 +48,10 @@ const HOP_HEADERS = new Set([
   "upgrade",
 ]);
 const AUTHORITY = /^(\[[0-9a-f:.]+\]|[a-z0-9.-]+):(\d{1,5})$/i;
-/** A proxied request body over this size gets HTTP 413. */
+/**
+ * A proxied request body over this size gets HTTP 413, unless the target
+ * has a smaller `maxBodyBytes`.
+ */
 const MAX_BODY_BYTES = 64 * 1024 * 1024;
 /**
  * A control API body over this size gets HTTP 413. Anyone can call
@@ -58,6 +65,29 @@ const TUNNEL_FIRST_BYTE_MS = 10_000;
  * call can take minutes before its first byte, so this is long.
  */
 const TUNNEL_IDLE_MS = 10 * 60 * 1000;
+/**
+ * A PROXY protocol v1 header, such as
+ * `PROXY TCP4 203.0.113.7 10.0.0.2 51234 443`. It is at most 107 bytes,
+ * and it must come in this time.
+ */
+const PROXY_HEADER =
+  /^PROXY (?:TCP[46] ([0-9A-Fa-f:.]+) [0-9A-Fa-f:.]+ \d{1,5} \d{1,5}|UNKNOWN[^\r\n]*)\r\n/;
+const MAX_PROXY_HEADER_BYTES = 107;
+const PROXY_HEADER_MS = 10_000;
+
+/** The address of the client of each connection with a PROXY header. */
+const proxiedClients = new WeakMap<Socket, string>();
+
+/**
+ * The address of the client of a request. With `proxyProtocol`, it comes
+ * from the PROXY header of the connection, which only the load balancer
+ * writes. Else it is the address of the socket.
+ */
+export function clientAddress(incoming: http.IncomingMessage): string {
+  return (
+    proxiedClients.get(incoming.socket) ?? incoming.socket.remoteAddress ?? ""
+  );
+}
 
 /** An error that answers a request with its own status. */
 const httpError = (status: number, message: string) =>
@@ -203,7 +233,13 @@ function sendUpstream(
 
 /** Proxy one request to an allowed origin, through the recorder. */
 async function proxyRequest(
-  { recorder, origins, replayOnly, privateNetworks = false }: ProxyTarget,
+  {
+    recorder,
+    origins,
+    replayOnly,
+    privateNetworks = false,
+    maxBodyBytes = MAX_BODY_BYTES,
+  }: ProxyTarget,
   session: string | undefined,
   incoming: http.IncomingMessage,
   outgoing: http.ServerResponse,
@@ -224,7 +260,7 @@ async function proxyRequest(
     method: incoming.method ?? "GET",
     url,
     headers: incoming.headers,
-    body: await readBody(incoming, MAX_BODY_BYTES),
+    body: await readBody(incoming, maxBodyBytes),
   };
   const rule = recorder.ruleFor(request);
 
@@ -354,6 +390,8 @@ export interface ProxyTarget {
   privateNetworks?: boolean;
   /** Set when the target stops. Its tunnels then refuse new requests. */
   closed?: boolean;
+  /** A request body over this size gets HTTP 413. Default: 64 MiB. */
+  maxBodyBytes?: number;
   /** The time of the last proxied request, from `Date.now()`. */
   lastUsed?: number;
   /** Gets a span for each proxied request. */
@@ -383,6 +421,11 @@ export interface ListenOptions {
     incoming: http.IncomingMessage,
     outgoing: http.ServerResponse,
   ): Promise<void>;
+  /**
+   * Each connection starts with a PROXY protocol v1 header. A connection
+   * without a valid header closes.
+   */
+  proxyProtocol?: boolean;
 }
 
 /** A listening proxy socket. */
@@ -405,6 +448,41 @@ function refuse(status: 403 | 407, outgoing: http.ServerResponse): void {
   outgoing.end(
     `Roach: ${status === 407 ? "proxy credentials required" : "forbidden"}\n`,
   );
+}
+
+/**
+ * Read the PROXY protocol v1 header of a new connection, and keep the
+ * address of its client. Then give the connection to `server`. A
+ * connection without a valid header in time closes.
+ */
+function acceptProxied(socket: Socket, server: http.Server): void {
+  let read = Buffer.alloc(0);
+  const timer = setTimeout(() => socket.destroy(), PROXY_HEADER_MS);
+  const onData = (chunk: Buffer) => {
+    read = Buffer.concat([read, chunk]);
+    const end = read.indexOf("\r\n");
+    if (end < 0 || end + 2 > MAX_PROXY_HEADER_BYTES) {
+      if (end >= 0 || read.length >= MAX_PROXY_HEADER_BYTES) socket.destroy();
+      return;
+    }
+    socket.off("data", onData);
+    clearTimeout(timer);
+    const match = PROXY_HEADER.exec(read.subarray(0, end + 2).toString());
+    if (!match) {
+      socket.destroy();
+      return;
+    }
+    // `UNKNOWN`, such as from a health check, gives no address.
+    if (match[1] && isIP(match[1])) proxiedClients.set(socket, match[1]);
+    socket.pause();
+    const rest = read.subarray(end + 2);
+    if (rest.length > 0) socket.unshift(rest);
+    server.emit("connection", socket);
+    socket.resume();
+  };
+  socket.on("error", () => socket.destroy());
+  socket.on("close", () => clearTimeout(timer));
+  socket.on("data", onData);
 }
 
 /** Proxy one request through its target, and answer errors with 502. */
@@ -500,7 +578,12 @@ export async function listenProxy(
       });
     });
   });
-  server.on("connection", (socket: Socket) => {
+  // With `proxyProtocol`, a plain TCP server reads the PROXY header of each
+  // connection, and then gives it to `server`.
+  const listener = options.proxyProtocol
+    ? net.createServer((socket) => acceptProxied(socket, server))
+    : server;
+  listener.on("connection", (socket: Socket) => {
     sockets.add(socket);
     socket.on("close", () => sockets.delete(socket));
   });
@@ -579,10 +662,10 @@ export async function listenProxy(
   );
 
   await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(options.port, options.host, () => resolve());
+    listener.once("error", reject);
+    listener.listen(options.port, options.host, () => resolve());
   });
-  const address = server.address();
+  const address = listener.address();
   if (!address || typeof address === "string") {
     throw new Error("Roach did not bind to a TCP port");
   }
@@ -590,9 +673,10 @@ export async function listenProxy(
     port: address.port,
     async close() {
       await new Promise<void>((resolve) => {
-        server.close(() => resolve());
+        listener.close(() => resolve());
         for (const socket of sockets) socket.destroy();
       });
+      if (listener !== server) server.close();
       tunnelServer.close();
     },
   };

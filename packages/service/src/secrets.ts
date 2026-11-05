@@ -85,12 +85,38 @@ function add(value: string, into: Set<string>): void {
 }
 
 /**
- * The most values that one run learns from its requests, and their total
- * length in characters. The values of `initial` do not count.
+ * The most values that one run learns from its requests and its own
+ * `secrets`, and their total length in characters. The values of
+ * `initial` do not count.
  */
 export interface LearnLimit {
   values: number;
   length: number;
+}
+
+/** `text` with each of `values` replaced. Give longer values first. */
+function redactWith(values: string[], text: string): string {
+  let result = text;
+  for (const value of values) result = result.replaceAll(value, REDACTED);
+  return result;
+}
+
+/**
+ * The text of a request to `href`, such as the text that its key hashes,
+ * with each of `values` replaced. Give longer values first. In the first
+ * copy of the URL, the value of each credential query parameter is
+ * replaced at any length.
+ */
+export function redactRequestWith(
+  values: string[],
+  text: string,
+  href: string,
+): string {
+  const redacted = redactQuery(new URL(href));
+  return redactWith(
+    values,
+    text.replace(href, () => redacted),
+  );
 }
 
 /**
@@ -108,12 +134,29 @@ export function createSecrets(initial: string[], limit: LearnLimit) {
     [...values].toSorted((a, b) => b.length - a.length);
 
   /** `text` with each known credential replaced. */
-  const redact = (text: string): string => {
-    let result = text;
-    for (const value of longestFirst()) {
-      result = result.replaceAll(value, REDACTED);
+  const redact = (text: string): string => redactWith(longestFirst(), text);
+
+  /**
+   * Add the values in `seen` that are new. When they make the run go past
+   * `limit`, it throws an error with `status` and adds nothing.
+   */
+  const admit = (seen: Set<string>, status: number): void => {
+    const next = { ...learned };
+    for (const part of seen) {
+      if (values.has(part)) continue;
+      next.values += 1;
+      next.length += part.length;
     }
-    return result;
+    if (next.values > limit.values || next.length > limit.length) {
+      throw Object.assign(
+        new Error(
+          `this run cannot learn more credentials (${limit.values} values or ${limit.length} characters, with the parts of each value). Start a new run.`,
+        ),
+        { status },
+      );
+    }
+    learned = next;
+    for (const part of seen) values.add(part);
   };
 
   return {
@@ -136,34 +179,30 @@ export function createSecrets(initial: string[], limit: LearnLimit) {
         add(value, seen);
         add(decode(value), seen);
       }
-      const next = { ...learned };
-      for (const part of seen) {
-        if (values.has(part)) continue;
-        next.values += 1;
-        next.length += part.length;
-      }
-      if (next.values > limit.values || next.length > limit.length) {
-        throw Object.assign(
-          new Error(
-            `this run cannot learn more credentials (${limit.values} values or ${limit.length} characters), so it refuses a request with a new one. Start a new run.`,
-          ),
-          { status: 431 },
-        );
-      }
-      learned = next;
-      for (const part of seen) values.add(part);
+      admit(seen, 431);
+    },
+
+    /**
+     * Add the `secrets` of a run. Each value and each of its parts count
+     * toward the limit. Past it, it throws an error with HTTP status 400.
+     */
+    addRunSecrets(secrets: string[]): void {
+      const seen = new Set<string>();
+      for (const value of secrets) add(value, seen);
+      admit(seen, 400);
     },
 
     redact,
 
+    /** The known credentials, longer values first (`redactRequestWith`). */
+    list: longestFirst,
+
     /**
      * The text of a request to `url`, such as the text that its key hashes,
-     * with each known credential replaced. In the first copy of the URL, the
-     * value of each credential query parameter is replaced at any length.
+     * with each known credential replaced (`redactRequestWith`).
      */
     redactRequest(text: string, url: URL): string {
-      const href = redactQuery(url);
-      return redact(text.replace(url.href, () => href));
+      return redactRequestWith(longestFirst(), text, url.href);
     },
   };
 }

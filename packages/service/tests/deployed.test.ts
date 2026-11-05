@@ -4,7 +4,8 @@
  * - The service runs from the command line, with a config file, a fixed
  *   certificate authority, a GCS bucket, and Sentry.
  * - A TLS server in front of it does what the load balancer does: it ends
- *   TLS and passes the bytes to the service.
+ *   TLS, writes a PROXY protocol v1 header with the address of the client,
+ *   and passes the bytes to the service.
  * - A local server plays the GCS JSON API and the metadata server of the
  *   VM. Another one plays Sentry.
  * - Each CI job runs the GitHub Action (`packages/roach/src/action.ts`). Its command sends
@@ -347,6 +348,9 @@ beforeAll(async () => {
   servers.splice(servers.indexOf(probe), 1);
   const front = tls.createServer(host, (socket) => {
     const backend = net.connect(servicePort, "127.0.0.1");
+    backend.write(
+      `PROXY TCP4 ${socket.remoteAddress} 127.0.0.1 ${socket.remotePort} 443\r\n`,
+    );
     socket.pipe(backend).pipe(socket);
     backend.on("error", () => socket.destroy());
     socket.on("error", () => backend.destroy());
@@ -364,6 +368,7 @@ beforeAll(async () => {
     writeTokenHash: createHash("sha256").update(TOKEN).digest("hex"),
     ca: { cert: caCert, key: await readFile(caKeyFile, "utf8") },
     sentryDsn: `http://public@127.0.0.1:${sentryPort}/1`,
+    proxyProtocol: true,
   };
   const configFile = path.join(directory, "config.json");
   await writeFile(configFile, JSON.stringify(config));

@@ -92,6 +92,9 @@ resource "google_secret_manager_secret_version" "config" {
       publicUrl      = "https://${var.domain}"
       bucket         = google_storage_bucket.recordings.name
       writeTokenHash = sha256(random_password.write_token.result)
+      # The load balancer writes the address of the client in a PROXY
+      # header (proxy_header below). The service limits runs by it.
+      proxyProtocol = true
       ca = {
         cert = tls_self_signed_cert.ca.cert_pem
         key  = tls_private_key.ca.private_key_pem
@@ -210,6 +213,8 @@ resource "google_compute_health_check" "roach" {
   name = "roach"
   tcp_health_check {
     port = local.port
+    # The service closes a connection without the header.
+    proxy_header = "PROXY_V1"
   }
 }
 
@@ -249,6 +254,9 @@ resource "google_compute_target_ssl_proxy" "roach" {
   name             = "roach"
   backend_service  = google_compute_backend_service.roach.id
   ssl_certificates = [google_compute_managed_ssl_certificate.roach.id]
+  # Each connection to the VM starts with the address of the client
+  # (`proxyProtocol` of the service config).
+  proxy_header = "PROXY_V1"
 }
 
 resource "google_compute_global_address" "roach" {

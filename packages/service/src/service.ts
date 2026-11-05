@@ -21,8 +21,8 @@
  *   service. Two checks keep that safe for the other tenants. The proxy
  *   sends requests only to public addresses (`addresses.ts`), so a run
  *   cannot reach the metadata server or the VPC. The key of a request has
- *   a time limit (`request-key.ts`), so a slow pattern fails only its own
- *   request.
+ *   a time limit, and it is made in a worker thread (`key-worker.ts`), so
+ *   a slow pattern fails only its own request.
  * - The recordings of a tenant are under `<tenant>/`, in a directory or a
  *   GCS bucket (`gcs.ts`). Tenants never share recordings, because a key
  *   does not include credentials.
@@ -39,9 +39,10 @@ import {
   type CertificateAuthorityPem,
 } from "./certificates.ts";
 import { createGcsStore } from "./gcs.ts";
-import { createRecorder, type Telemetry } from "./recorder.ts";
+import { createRecorder, type Telemetry, type WorkLimit } from "./recorder.ts";
 import { createFileStore } from "./recordings.ts";
 import {
+  clientAddress,
   controlRecorder,
   listenProxy,
   parseOrigins,
@@ -97,6 +98,13 @@ export interface RoachServiceConfig {
   ca?: CertificateAuthorityPem;
   /** Without a DSN, the service sends nothing to Sentry. */
   sentryDsn?: string;
+  /**
+   * Each connection starts with a PROXY protocol v1 header, such as from a
+   * GCP proxy load balancer with `proxy_header = "PROXY_V1"`. The service
+   * takes the address of the client from it, for the limit of runs for
+   * each client. A connection without the header closes. Default: `false`.
+   */
+  proxyProtocol?: boolean;
 }
 
 /** A service that runs in this process. */
@@ -112,6 +120,8 @@ interface Run extends ProxyTarget {
   token: string;
   started: number;
   lastUsed: number;
+  /** The address of the client that started a run without a token. */
+  client?: string;
 }
 
 const MODES = new Set<RecordingMode>(["auto", "off", "record", "replay"]);
@@ -120,17 +130,42 @@ const TRACES_SAMPLE_RATE = 1;
 /** A run that is open longer than this ends as failed, such as a dead job. */
 const RUN_TIMEOUT_MS = 6 * 60 * 60 * 1000;
 /**
- * A run without a token that gets no proxied request and no control call
- * for this long ends. Anyone can start such runs, so they must not keep
- * the places of `MAX_PUBLIC_RUNS` for 6 hours.
+ * Anyone can start a run without a token, so such runs have smaller
+ * limits. One ends after 2 hours, or after 60 minutes without a proxied
+ * request or a control call. The action starts the run before the command
+ * of the job, so a long install or build step must not end it.
  */
-const PUBLIC_RUN_IDLE_MS = 15 * 60 * 1000;
+const PUBLIC_RUN_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+const PUBLIC_RUN_IDLE_MS = 60 * 60 * 1000;
 /**
  * The open runs without a token that the service can have, for all tenants.
  * Anyone can start them with any tenant name, so the cap is not per tenant.
  * It keeps memory bounded. Runs with the token have no cap.
  */
 const MAX_PUBLIC_RUNS = 100;
+/**
+ * The open runs without a token of one client address, so one client
+ * cannot take all places of `MAX_PUBLIC_RUNS`.
+ */
+const MAX_PUBLIC_RUNS_PER_CLIENT = 10;
+/** A proxied request body of a run without a token over this gets 413. */
+const PUBLIC_MAX_BODY_BYTES = 16 * 1024 * 1024;
+/**
+ * The time that a run can use in the key worker (`key-worker.ts`). A key
+ * has 1 s and 0.5 s for each MiB of its body. For a run without a token,
+ * one job has at most 5 s and all jobs 30 s. Past that, or when a key goes
+ * past its time limit, the run ends.
+ */
+const PUBLIC_WORK_LIMIT: WorkLimit = {
+  maxJobMs: 5000,
+  totalMs: 30_000,
+  untrusted: true,
+};
+const WRITE_WORK_LIMIT: WorkLimit = {
+  maxJobMs: Infinity,
+  totalMs: Infinity,
+  untrusted: false,
+};
 const MAX_RUN_NAME = 128;
 /**
  * Limits of the config of a run. Anyone can start a run, so they keep the
@@ -410,7 +445,11 @@ export async function startRoachService(
     return run.recorder.stats();
   };
 
-  const createRun = (runConfig: RunConfig, canWrite: boolean): RemoteRun => {
+  const createRun = (
+    runConfig: RunConfig,
+    canWrite: boolean,
+    client: string,
+  ): RemoteRun => {
     const id = randomBytes(8).toString("hex");
     const telemetry = runTelemetry(
       { tenant: runConfig.tenant, mode: runConfig.mode },
@@ -436,17 +475,28 @@ export async function startRoachService(
       ),
       // A public run must not be an open proxy to the allowed origins.
       replayOnly: !canWrite,
+      ...(canWrite ? {} : { client, maxBodyBytes: PUBLIC_MAX_BODY_BYTES }),
       privateNetworks: config.privateNetworks === true,
       // Each run learns only the credentials of its own requests.
       recorder: createRecorder(
         {
           mode: runConfig.mode,
           rules: runConfig.rules,
-          secrets: [...(config.secrets ?? []), ...(runConfig.secrets ?? [])],
+          secrets: config.secrets ?? [],
+          runSecrets: runConfig.secrets ?? [],
           // A change shows a part of a recorded request, and reads are
           // public, so only a run with the write token gets it.
           explainMisses: canWrite,
           learnLimit: canWrite ? WRITE_LEARN_LIMIT : PUBLIC_LEARN_LIMIT,
+          workLimit: canWrite ? WRITE_WORK_LIMIT : PUBLIC_WORK_LIMIT,
+          endRun: (reason) => {
+            process.stderr.write(`[roach] Run ${id} ended: ${reason}\n`);
+            endRun(run).catch((error: unknown) => {
+              process.stderr.write(
+                `[roach] Run ${id} did not end: ${String(error)}\n`,
+              );
+            });
+          },
           telemetry,
         },
         store,
@@ -510,14 +560,23 @@ export async function startRoachService(
         });
         return;
       }
+      const client = clientAddress(incoming);
       if (!canWrite) {
         let open = 0;
+        let ofClient = 0;
         for (const other of runs.values()) {
           if (other.replayOnly) open += 1;
+          if (other.client === client) ofClient += 1;
         }
         if (open >= MAX_PUBLIC_RUNS) {
           sendJson(outgoing, 429, {
             error: `The service has ${MAX_PUBLIC_RUNS} open runs without a token`,
+          });
+          return;
+        }
+        if (ofClient >= MAX_PUBLIC_RUNS_PER_CLIENT) {
+          sendJson(outgoing, 429, {
+            error: `Your address has ${MAX_PUBLIC_RUNS_PER_CLIENT} open runs without a token. End one first.`,
           });
           return;
         }
@@ -530,7 +589,7 @@ export async function startRoachService(
           attributes: { tenant, mode: valid.mode, write: canWrite },
         },
         (span) => {
-          const created = createRun(valid, canWrite);
+          const created = createRun(valid, canWrite, client);
           span.setAttribute("run", valid.name ?? created.id);
           return created;
         },
@@ -574,6 +633,7 @@ export async function startRoachService(
     authority,
     targetFor,
     control,
+    proxyProtocol: config.proxyProtocol === true,
   });
   publicUrl ??= `http://${host.includes(":") ? `[${host}]` : host}:${listening.port}`;
 
@@ -582,7 +642,8 @@ export async function startRoachService(
     const now = Date.now();
     for (const run of runs.values()) {
       const idle = run.replayOnly && now - run.lastUsed > PUBLIC_RUN_IDLE_MS;
-      if (idle || now - run.started > RUN_TIMEOUT_MS) {
+      const timeout = run.replayOnly ? PUBLIC_RUN_TIMEOUT_MS : RUN_TIMEOUT_MS;
+      if (idle || now - run.started > timeout) {
         process.stderr.write(
           `[roach] Run ${run.id} timed out${idle ? " without traffic" : ""}\n`,
         );

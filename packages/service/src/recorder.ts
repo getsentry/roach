@@ -28,7 +28,13 @@
 import { randomBytes } from "node:crypto";
 import type { IncomingHttpHeaders } from "node:http";
 import { firstChange, sampleKey, toSample } from "./misses.ts";
-import { keyRequest, type KeyedRequest } from "./request-key.ts";
+import {
+  keyInWorker,
+  redactInWorker,
+  type JobError,
+  type JobOptions,
+} from "./key-worker.ts";
+import { keyTimeLimit, type KeyedRequest } from "./request-key.ts";
 import { createSecrets, type LearnLimit } from "./secrets.ts";
 import {
   recordingKey,
@@ -228,8 +234,20 @@ export interface RecorderConfig {
   rules: RecordingRule[];
   /** Credentials to redact, in addition to the ones that it learns. */
   secrets?: string[];
+  /**
+   * The `secrets` of the run config. They count toward `learnLimit`, so
+   * too many of them throw an error with HTTP status 400.
+   */
+  runSecrets?: string[];
   /** The credentials that the recorder can learn from requests. */
   learnLimit: LearnLimit;
+  /** The time that the run can use in the key worker (`key-worker.ts`). */
+  workLimit: WorkLimit;
+  /**
+   * End the run, because it went past `workLimit`. The recorder then
+   * starts no more jobs of the run.
+   */
+  endRun(reason: string): void;
   /**
    * Add the first change from a request sample to the first miss of each
    * session in the stats (`misses.ts`). Only a run with the write token may
@@ -239,6 +257,22 @@ export interface RecorderConfig {
    */
   explainMisses?: boolean;
   telemetry: Telemetry;
+}
+
+/** The time that a run can use in the key worker (`key-worker.ts`). */
+export interface WorkLimit {
+  /**
+   * The most time of one job, in ms. A key also has the time limit of its
+   * body (`keyTimeLimit()`).
+   */
+  maxJobMs: number;
+  /** The time of all jobs of the run, in ms. Past it, the run ends. */
+  totalMs: number;
+  /**
+   * Set for a run without a token. A key that goes past its time limit
+   * ends the run. The jobs of the run go after the jobs of other runs.
+   */
+  untrusted: boolean;
 }
 
 /** Create the recorder of one run, with the store of its recordings. */
@@ -254,6 +288,23 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
     [...sessions.values()].filter((s) => s.passed === undefined);
   const { telemetry } = config;
   const secrets = createSecrets(config.secrets ?? [], config.learnLimit);
+  secrets.addRunSecrets(config.runSecrets ?? []);
+  const { workLimit } = config;
+  let closed = false;
+  let workMs = 0;
+  /** The options of a job of `bytes` bytes in the key worker. */
+  const jobOptions = (bytes: number): JobOptions => ({
+    timeLimitMs: Math.min(workLimit.maxJobMs, keyTimeLimit(bytes)),
+    first: !workLimit.untrusted,
+    skip: () => closed,
+  });
+  /** Count the time of a job. Past `workLimit.totalMs`, end the run. */
+  const countWork = (ms: number) => {
+    workMs += ms;
+    if (workMs > workLimit.totalMs && !closed) {
+      config.endRun(`it used over ${workLimit.totalMs} ms in the key worker`);
+    }
+  };
   const refused: NonNullable<RecordingStats["refused"]> = {};
   const stats: RecordingStats = {
     counts: Object.fromEntries(
@@ -344,7 +395,7 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
     key: string,
     owner: Session | undefined,
     sample: string,
-    text: () => string,
+    text: () => Promise<string | undefined>,
   ) => {
     const where = owner ? ` in "${owner.name}"` : "";
     process.stderr.write(`[roach] No ${rule.name} recording${where}: ${key}\n`);
@@ -359,7 +410,9 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
     const recorded = (await store.read(sample).catch(() => undefined)) as
       | RequestSample
       | undefined;
-    const change = recorded && firstChange(recorded, text());
+    // The redacted text has a time limit. Past it, the change is left out.
+    const redacted = recorded && (await text());
+    const change = redacted && firstChange(recorded, redacted);
     telemetry.annotate({ "miss.sample": recorded ? "found" : "none" });
     if (!change) return;
     telemetry.annotate({
@@ -445,10 +498,10 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
       const counts = stats.counts[rule.name]!;
       secrets.learn(request.headers, request.url);
       telemetry.annotate({ rule: rule.name });
-      const { keyed, key } = telemetry.span(
+      const { keyed, key } = await telemetry.span(
         { op: "roach.key", attributes: { rule: rule.name } },
-        () => {
-          const result = keyRequest(
+        async () => {
+          const result = await keyInWorker(
             rule,
             {
               method: request.method,
@@ -457,13 +510,38 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
               body: request.body.toString("utf8"),
             },
             owner?.known,
-          );
-          const name = recordingKey(rule.name, result.key);
+            jobOptions(request.body.length),
+          ).catch((error: JobError) => {
+            countWork(error.ms);
+            if (error.timedOut && workLimit.untrusted && !closed) {
+              config.endRun("a key went past its time limit");
+              error.message += " This run has ended.";
+            }
+            throw error;
+          });
+          countWork(result.ms);
+          const name = recordingKey(rule.name, result.value.key);
           telemetry.annotate({ key: name });
-          return { keyed: result, key: name };
+          return { keyed: result.value, key: name };
         },
       );
-      const redactedText = () => secrets.redactRequest(keyed.text, request.url);
+      /** The redacted text of the key, or `undefined` past the time limit. */
+      const redactedText = () =>
+        redactInWorker(
+          secrets.list(),
+          keyed.text,
+          request.url.href,
+          jobOptions(keyed.text.length),
+        ).then(
+          (result) => {
+            countWork(result.ms);
+            return result.value;
+          },
+          (error: JobError) => {
+            countWork(error.ms);
+            return undefined;
+          },
+        );
       // An ended session has no use for more values.
       if (owner && owner.passed === undefined) {
         for (const [name, list] of keyed.values) {
@@ -544,7 +622,12 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
       if (!isTemporaryStatus(recording.response.status)) {
         await record(owner, key, {
           recording,
-          samples: [[sample, toSample(key, redactedText())]],
+          samples: [
+            [
+              sample,
+              toSample(key, secrets.redactRequest(keyed.text, request.url)),
+            ],
+          ],
         });
       }
       const response = fromRecording(recording, keyed.values);
@@ -603,8 +686,9 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
       return stats;
     },
 
-    /** Fail the open sessions. */
+    /** Fail the open sessions, and start no more jobs of the run. */
     async close(): Promise<void> {
+      closed = true;
       for (const session of open()) await finish(session, false);
     },
   };
