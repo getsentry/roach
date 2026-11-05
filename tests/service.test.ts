@@ -11,6 +11,7 @@ import {
   type RemoteRoach,
 } from "../src/client.ts";
 import { startRoachService, type RoachService } from "../service/service.ts";
+import { describeRecordingMisses } from "../src/report.ts";
 import type { RunConfig } from "../src/types.ts";
 import { VALUE_PATTERNS } from "../src/values.ts";
 
@@ -67,6 +68,14 @@ async function send(
     body: await response.body.text(),
     source: response.headers["x-roach"],
   };
+}
+
+/** Send one request in a session named `public test name`, then end it. */
+async function sendInSession(run: RemoteRoach, prompt: string) {
+  const opened = await run.startSession("public test name");
+  const response = await send(opened.url, { prompt });
+  await opened.end(true);
+  return response;
 }
 
 async function recordings(tenant: string): Promise<string[]> {
@@ -165,6 +174,36 @@ describe("roach service", () => {
     expect(await recordings("acme/alpha")).toHaveLength(1);
     expect(await recordings("acme/beta")).toEqual([]);
     expect(await recordings("other-org/new.repo")).toHaveLength(1);
+  });
+
+  it("shows what changed in a miss only to a run with the write token", async () => {
+    // Reads are public. A change shows a part of the recorded request, so
+    // a run without the token could read back the prompts of a tenant.
+    const writer = await startRun("write-token", "auto");
+    await sendInSession(writer, "the stored prompt");
+    await writer.close();
+
+    const reader = await startRun(undefined, "replay");
+    expect(await sendInSession(reader, "\u0001")).toMatchObject({
+      status: 412,
+    });
+    const publicStats = await reader.stats();
+    expect(publicStats.misses).toEqual([
+      { rule: "model", session: "public test name", file: expect.any(String) },
+    ]);
+    expect(describeRecordingMisses(publicStats.misses).join("\n")).not.toMatch(
+      /Changed|stored prompt/,
+    );
+
+    const tokenRun = await startRun("write-token", "replay");
+    expect(await sendInSession(tokenRun, "\u0001")).toMatchObject({
+      status: 412,
+    });
+    const [miss] = (await tokenRun.stats()).misses;
+    expect(miss!.change).toMatchObject({
+      recorded: expect.stringContaining('{"prompt":"the stored prompt"}'),
+    });
+    expect(liveRequests).toBe(1);
   });
 
   it("keeps the sessions of concurrent runs apart", async () => {

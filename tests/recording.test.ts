@@ -4,7 +4,14 @@
  */
 import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { ProxyAgent, request } from "undici";
@@ -355,7 +362,7 @@ describe("recording", () => {
     ]);
   });
 
-  it("keeps the first 1 MiB of a request in its sample", async () => {
+  it("keeps the first 1,048,576 characters of a request in its sample", async () => {
     // Object keys are sorted, so `c` comes after the long text.
     const long = "x".repeat(1024 * 1024);
     const recording = await start("auto");
@@ -373,7 +380,8 @@ describe("recording", () => {
       expect(sample.text).toHaveLength(1024 * 1024);
     }
 
-    // A change after the first 1 MiB has no change. One before it has.
+    // A change after the part that the sample keeps has no change. One
+    // before it has.
     const first = await start("replay");
     await session(first, [{ a: "a", b: long, c: "changed" }]);
     const second = await start("replay");
@@ -389,6 +397,21 @@ describe("recording", () => {
       recorded: expect.stringMatching(/\{"a":"b","b":"x{100,}…$/),
       request: expect.stringMatching(/\{"a":"changed","b":"x{100,}…$/),
     });
+  });
+
+  it("keeps a recording when its request sample cannot be written", async () => {
+    // A file where the directory of the samples must be makes each sample
+    // write fail. The request and its session still pass.
+    await mkdir(path.join(directory, TENANT), { recursive: true });
+    await writeFile(path.join(directory, TENANT, "_requests"), "");
+    const running = await start("auto");
+    const recorded = await session(running, [{ model: "m" }]);
+    expect(recorded.map(({ source }) => source)).toEqual(["live"]);
+    await expect(running.stats()).resolves.toMatchObject({ written: 1 });
+
+    const [replayed] = await session(running, [{ model: "m" }]);
+    expect(replayed!.source).toBe("replayed");
+    expect(liveRequests).toBe(1);
   });
 
   it("replays a recording without a request sample", async () => {

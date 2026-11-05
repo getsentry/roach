@@ -441,9 +441,10 @@ describe("deployed roach", () => {
     expect(miss.response.status).toBe(412);
     expect(miss.exitCode).toBe(1);
     expect(miss.summary).toMatch(/^- test: model\/[0-9a-f]{64}\.json$/m);
-    // It also shows what changed from the recorded request.
-    expect(miss.summary).toContain(String.raw`\"prompt\":\"hi\"}"`);
-    expect(miss.summary).toContain(String.raw`\"prompt\":\"bye\"}"`);
+    // A run without the token does not see what changed, because that
+    // shows a part of the recorded request.
+    expect(miss.summary).not.toContain("Changed at character");
+    expect(miss.summary).not.toContain(String.raw`\"prompt\":\"hi\"`);
     expect(liveRequests).toBe(1);
 
     // The service sends its metrics when it stops.
@@ -481,9 +482,10 @@ describe("deployed roach", () => {
     ]);
 
     // Only the spans of Roach: 4 for each run, 2 for the live request, and
-    // 3 for request samples: one write and the reads of 2 first misses.
+    // 2 for request samples: one write, and one read for the first miss of
+    // the run with the token.
     const ops = spans.map(({ attributes }) => attributes["sentry.op"]);
-    expect(ops).toHaveLength(17);
+    expect(ops).toHaveLength(16);
     expect(new Set(ops)).toEqual(
       new Set([
         "roach.run.start",

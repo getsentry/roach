@@ -413,6 +413,9 @@ export async function startRoachService(
           mode: runConfig.mode,
           rules: runConfig.rules,
           secrets: [...(config.secrets ?? []), ...(runConfig.secrets ?? [])],
+          // A change shows a part of a recorded request, and reads are
+          // public, so only a run with the write token gets it.
+          explainMisses: canWrite,
           telemetry,
         },
         store,

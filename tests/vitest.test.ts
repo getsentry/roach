@@ -232,7 +232,11 @@ https.request = refuse;
     await runVitest({ ROACH_TOKEN: TOKEN });
     await writeFile(path.join(project, "a.fixture.ts"), testFile("a-changed"));
 
-    const result = await runVitest({});
+    // Only a run with the write token gets the change.
+    const result = await runVitest({
+      ROACH_TOKEN: TOKEN,
+      ROACH_MODE: "replay",
+    });
 
     expect(result.code).toBe(1);
     expect(result.output).toMatch(

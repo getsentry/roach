@@ -279,7 +279,8 @@ its session and key. `describeRecordingMisses()` in `report.ts` gives the
 first miss of each test, which is the one to fix. The run report of the
 vitest integration and of the GitHub Action shows these misses.
 
-The first miss of each session also tells what changed (`misses.ts`):
+In a run with the write token, the first miss of each session also tells
+what changed (`misses.ts`):
 
 ```text
 - a.fixture.ts > passes: model/074d….json
@@ -292,11 +293,16 @@ The first miss of each session also tells what changed (`misses.ts`):
   `_requests/<rule>/<hash>.json`. The sample has the text that the key
   hashes: the rule, the method, the URL, the key headers, and the body
   with `<<name>>` for each changing value. The proxy redacts credentials
-  in it, as in a recording. It keeps the first 1 MiB of the text.
+  in it, as in a recording. It keeps the first 1,048,576 characters
+  (UTF-16 code units) of the text.
 - The hash of a sample is the place of the request: its session (test)
   and the number of requests of the rule that the session sent before
   it. So a sample is the last recorded request at the same place of the
   same test. A replay writes no sample.
+- Only runs with the write token get the change of a miss. A run without
+  the token, such as CI of a fork, gets no change in its stats or its
+  report. Reads are public, so a change would let anyone read back the
+  requests of a tenant.
 - At the first miss of a session, the proxy reads the sample of the place
   of the request. It shows the first character that is not the same, with
   40 characters before it, and at most 120 characters from it. This is
@@ -304,7 +310,7 @@ The first miss of each session also tells what changed (`misses.ts`):
 - `change` of the miss has the key of the recording that the sample came
   from, the offset, and the two texts. A miss has no `change` when there
   is no sample, such as for a recording from an older version, or when
-  the texts are the same in the first 1 MiB.
+  the texts are the same in the part that the sample keeps.
 - When the requests of a test run in parallel, their order can change.
   Then a sample can come from another request of the test.
 
@@ -329,9 +335,10 @@ is not the same as the recorded one. No error shows this. The tests pass.
    that test with `ROACH_MODE=replay`. It needs no token. The test fails
    at the first miss, and the run report shows its key. Fix the first miss
    of a test before the others. The others often come from it.
-3. Read the change of the first miss in the run report. See
-   [Misses](#misses). It shows the changing value, with the text before
-   it. When the miss has no change, get the body of that request from two
+3. Run the test again with `ROACH_TOKEN` and `ROACH_MODE=replay`, and read
+   the change of the first miss in the run report. See [Misses](#misses).
+   It shows the changing value, with the text before it. Only a run with
+   the token shows it. When the miss has no change, get the body of that request from two
    runs, and compare them. For example, add this file to `setupFiles`
    after `@sentry/roach/vitest/setup`, and run the test two times:
 
@@ -400,9 +407,9 @@ Values that changed in real projects:
   refuses a request that no rule records, so nothing goes live. Every
   other mode needs the write token. So treat each recording as readable by
   anyone who can make its request. Do not record responses that must stay
-  private. This is also true for request samples (see [Misses](#misses)):
-  a miss shows a part of the redacted text of a recorded request, so do
-  not record requests whose bodies must stay private.
+  private. Only runs with the write token get the change of a miss, which
+  shows a part of a recorded request (see [Misses](#misses)). So CI of a
+  fork does not show it.
 - **Runs.** Each run has its own id, token, mode, rules, sessions, and
   stats. A proxied request names its run in `Proxy-Authorization`, as
   `Basic base64(<id>:<token>)`. The proxy URL of the run has them, so
@@ -448,8 +455,8 @@ Each proxied request is one trace. Each span has `tenant`, `mode`, and
   calculates its cost in USD as `gen_ai.cost.total_tokens`. It contains:
   - `roach.key`: the key of the request, with `rule` and `key`.
   - `roach.store.read`: a read of a recording, with `key` and `result`:
-    `hit` or `miss`. The first miss of a session also reads a request
-    sample. Its `key` starts with `_requests/`.
+    `hit` or `miss`. In a run with the write token, the first miss of a
+    session also reads a request sample. Its `key` starts with `_requests/`.
   - `roach.upstream`: the live request, with `origin` and
     `http.response.status_code`.
 - `roach.store.write`: a write of recordings, with `recordings` and

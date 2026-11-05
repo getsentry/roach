@@ -14,7 +14,7 @@ import { createHash } from "node:crypto";
 import type { RequestSample } from "./store.ts";
 import type { RecordingChange } from "./types.ts";
 
-/** The longest text that a sample keeps, in characters. */
+/** The longest text that a sample keeps, in UTF-16 characters. */
 const MAX_SAMPLE_LENGTH = 1024 * 1024;
 /** Characters shown before the first different character. */
 const BEFORE = 40;

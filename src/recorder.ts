@@ -17,8 +17,9 @@
  * result of that session. A request outside a session is written at once.
  *
  * With each new recording, the recorder writes the redacted text of its
- * request as a sample. The first miss of a session reads the sample of its
- * place and reports the first change (`misses.ts`).
+ * request as a sample. In a run with the write token, the first miss of a
+ * session reads the sample of its place and reports the first change
+ * (`misses.ts`).
  *
  * The recorder never writes a known credential (`secrets.ts`). It reports
  * spans and metrics through the `Telemetry` hooks of `service/service.ts`.
@@ -199,6 +200,13 @@ export interface RecorderConfig {
   rules: RecordingRule[];
   /** Credentials to redact, in addition to the ones that it learns. */
   secrets?: string[];
+  /**
+   * Add the first change from a request sample to the first miss of each
+   * session (`misses.ts`). Only a run with the write token may set it: a
+   * change shows a part of a recorded request, so a public run could read
+   * the requests of a tenant back.
+   */
+  explainMisses?: boolean;
   telemetry: Telemetry;
 }
 
@@ -242,7 +250,15 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
     stats.written += await store.write(
       recordings.map(([key, { recording }]) => [key, recording]),
     );
-    await store.write(recordings.map(([, { sample }]) => sample));
+    // A sample only explains a later miss, so a failed write does not fail
+    // the request or the session.
+    await store
+      .write(recordings.map(([, { sample }]) => sample))
+      .catch((error: unknown) => {
+        process.stderr.write(
+          `[roach] Request samples were not written: ${(error as Error).message}\n`,
+        );
+      });
     countRecordings(
       recordings.map(([key]) => key),
       "written",
@@ -279,9 +295,10 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
   };
 
   /**
-   * Report a miss. The first miss of a session reads the sample of its
-   * place (`sample`), and adds the first change from it to the text of
-   * the request (`text`). A failed read only leaves the change out.
+   * Report a miss. With `explainMisses`, the first miss of a session reads
+   * the sample of its place (`sample`), and adds the first change from it
+   * to the text of the request (`text`). A failed read only leaves the
+   * change out.
    */
   const reportMiss = async (
     rule: RecordingRule,
@@ -300,7 +317,7 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
     };
     stats.misses.push(miss);
     const places = owner ?? outside;
-    if (places.explained) return;
+    if (!config.explainMisses || places.explained) return;
     places.explained = true;
     const recorded = (await store.read(sample).catch(() => undefined)) as
       | RequestSample
