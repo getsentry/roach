@@ -4,7 +4,10 @@
  * The proxy learns the values of credential headers and query parameters
  * from each request that it sees, and the config can add more values. It
  * replaces each known value with `<<redacted>>` before it writes a
- * recording.
+ * recording, in text and in bytes. It also replaces the value of each
+ * credential field (`CREDENTIAL_FIELDS`), such as an `access_token` that a
+ * server mints in a JSON body, and the value of each credential query parameter of the URL
+ * that a recording keeps.
  */
 import type { IncomingHttpHeaders } from "node:http";
 
@@ -26,6 +29,67 @@ const NOT_CREDENTIAL_HEADERS = new Set(["x-session-affinity"]);
 /** Shorter parts, such as `Bearer`, are not credentials. */
 const MIN_LENGTH = 12;
 const REDACTED = "<<redacted>>";
+const REDACTED_BYTES = Buffer.from(REDACTED);
+
+/**
+ * Fields whose value is a credential, such as a token that a server mints
+ * or a secret that a client sends in a body. The names compare without
+ * case, `_`, and `-`, so `access_token`, `accessToken`, and `access-token`
+ * are the same. The list is narrow on purpose: a replay gives
+ * `<<redacted>>` in place of each such value, and a broad match would
+ * change responses that have no credential. A bare `token` is not in it,
+ * because model APIs use it for text, such as in log probabilities.
+ */
+const CREDENTIAL_FIELDS = new Set(
+  [
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "auth_token",
+    "bearer_token",
+    "session_token",
+    "client_secret",
+    "client_assertion",
+    "password",
+    "api_key",
+    "secret_key",
+    "private_key",
+    "secret_access_key",
+  ].map(fieldName),
+);
+/** A JSON field with a string value: its name, the separator, its value. */
+const JSON_FIELD = /"([\w-]{1,64})"(\s*:\s*)"((?:[^"\\]|\\.)*)"/g;
+/**
+ * A form or query field, at the start of a line or after `?` or `&`: the
+ * part before it, its name, and its value.
+ */
+const FORM_FIELD = /(^|[?&])([\w-]{1,64})=([^&\s"#\\]*)/gm;
+
+/** The name of a field, as `CREDENTIAL_FIELDS` compares it. */
+function fieldName(name: string): string {
+  return name.replaceAll(/[_-]/g, "").toLowerCase();
+}
+
+/** Whether a field holds a credential that is not redacted yet. */
+const isCredentialField = (name: string, value: string) =>
+  value !== "" && value !== REDACTED && CREDENTIAL_FIELDS.has(fieldName(name));
+
+/** `text` with the value of each credential field replaced. */
+const replaceFields = (
+  text: string,
+  found: (value: string, form: boolean) => void = () => {},
+) =>
+  text
+    .replace(JSON_FIELD, (all, name: string, colon: string, value: string) => {
+      if (!isCredentialField(name, value)) return all;
+      found(value, false);
+      return `"${name}"${colon}"${REDACTED}"`;
+    })
+    .replace(FORM_FIELD, (all, before: string, name: string, value: string) => {
+      if (!isCredentialField(name, value)) return all;
+      found(value, true);
+      return `${before}${name}=${REDACTED}`;
+    });
 
 /** Decode a part of a query, or keep it when it is not valid. */
 const decode = (part: string) => {
@@ -57,10 +121,11 @@ const queryParts = (url: URL) =>
     });
 
 /**
- * The URL of `url`, with the value of each credential query parameter
- * replaced at any length. The other parts do not change.
+ * The URL of `url`, as a recording and a request sample keep it: the value
+ * of each credential query parameter is replaced at any length. The other
+ * parts do not change.
  */
-const redactQuery = (url: URL) => {
+export function redactUrl(url: URL): string {
   if (!url.search) return url.href;
   const search = queryParts(url)
     .map(({ part, name, value, credential }) =>
@@ -68,7 +133,7 @@ const redactQuery = (url: URL) => {
     )
     .join("&");
   return url.href.replace(url.search, () => `?${search}`);
-};
+}
 
 /** Create the secret list of one proxy run, with the values of `initial`. */
 export function createSecrets(initial: string[] = []) {
@@ -119,13 +184,54 @@ export function createSecrets(initial: string[] = []) {
     redact,
 
     /**
+     * `body` with each known credential replaced, as bytes. Only the bytes
+     * of a known value change, so a binary body stays binary.
+     */
+    redactBytes(body: Buffer): Buffer {
+      let result = body;
+      for (const value of longestFirst()) {
+        const needle = Buffer.from(value);
+        let at = result.indexOf(needle);
+        if (at < 0) continue;
+        const parts: Buffer[] = [];
+        let from = 0;
+        while (at >= 0) {
+          parts.push(result.subarray(from, at), REDACTED_BYTES);
+          from = at + needle.length;
+          at = result.indexOf(needle, from);
+        }
+        parts.push(result.subarray(from));
+        result = Buffer.concat(parts);
+      }
+      return result;
+    },
+
+    /**
+     * The text of a response body with the value of each credential field
+     * replaced (`CREDENTIAL_FIELDS`), in JSON and in form fields. The
+     * values join the known credentials, so later recordings of the run do
+     * not show them either.
+     */
+    redactFields(text: string): string {
+      return replaceFields(text, (value, form) => {
+        if (form) return add(decode(value));
+        try {
+          add(JSON.parse(`"${value}"`) as string);
+        } catch {
+          add(value);
+        }
+      });
+    },
+
+    /**
      * The text of a request to `url`, such as the text that its key hashes,
-     * with each known credential replaced. In the first copy of the URL, the
-     * value of each credential query parameter is replaced at any length.
+     * with each known credential and the value of each credential field
+     * replaced. In the first copy of the URL, the value of each
+     * credential query parameter is replaced at any length.
      */
     redactRequest(text: string, url: URL): string {
-      const href = redactQuery(url);
-      return redact(text.replace(url.href, () => href));
+      const href = redactUrl(url);
+      return redact(replaceFields(text.replace(url.href, () => href)));
     },
   };
 }

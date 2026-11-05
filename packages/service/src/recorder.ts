@@ -22,14 +22,18 @@
  * always gets the change and its text. Only a run with the write token gets
  * the change in its stats, and never its text.
  *
- * The recorder never writes a known credential (`secrets.ts`). It reports
- * spans and metrics through the `Telemetry` hooks of `service.ts`.
+ * The recorder never writes a known credential (`secrets.ts`). It redacts
+ * a body that is not text as bytes, before it encodes it. It also redacts
+ * the credentials that the upstream mints, such as `access_token` in a
+ * response body. The live client gets these, so the run can use them. A
+ * replay gives `<<redacted>>` in their place. The recorder reports spans
+ * and metrics through the `Telemetry` hooks of `service.ts`.
  */
 import { randomBytes } from "node:crypto";
 import type { IncomingHttpHeaders } from "node:http";
 import { firstChange, sampleKey, toSample } from "./misses.ts";
 import { keyRequest, type KeyedRequest } from "./request-key.ts";
-import { createSecrets } from "./secrets.ts";
+import { createSecrets, redactUrl } from "./secrets.ts";
 import {
   recordingKey,
   RULE_NAME,
@@ -147,6 +151,8 @@ const OTHER_ORIGINS = "other origins";
 const MAX_ENDED_SESSIONS = 1000;
 /** Open sessions of a run, such as one for each test worker. */
 const MAX_OPEN_SESSIONS = 64;
+/** Content types that a recording keeps as text. Other bodies are base64. */
+const TEXT_CONTENT_TYPE = /^text\/|json|xml|x-www-form-urlencoded/i;
 /** Response headers that a recording keeps. Other headers change each run. */
 const RECORDED_HEADERS = ["content-type", "location"];
 const NULL_BODY_STATUSES = new Set([101, 204, 205, 304]);
@@ -170,13 +176,17 @@ function matches(
 
 /**
  * The response as a recording keeps it. A stream gets one delta per content
- * block, and each value of the request becomes a placeholder.
+ * block, and each value of the request becomes a placeholder. A body that
+ * is not text gets `redactBytes` before it is encoded, because a redaction
+ * of the encoded text cannot find a credential in it. The URL has the
+ * value of each credential query parameter redacted.
  */
 function toRecording(
   request: ProxyRequest,
   keyed: KeyedRequest,
   session: string | undefined,
   response: ProxyResponse,
+  redactBytes: (body: Buffer) => Buffer,
 ): Recording {
   const contentType = response.headers["content-type"];
   const headers: Record<string, string> = {};
@@ -184,9 +194,11 @@ function toRecording(
     const value = response.headers[name];
     if (typeof value === "string") headers[name] = value;
   }
-  let body = response.body.toString("base64");
+  let body = "";
   let bodyEncoding: Recording["response"]["bodyEncoding"] = "base64";
-  if (/^text\/|json|xml/i.test(contentType ?? "")) {
+  if (!TEXT_CONTENT_TYPE.test(contentType ?? "")) {
+    body = redactBytes(response.body).toString("base64");
+  } else {
     const text = response.body.toString("utf8");
     const template = (part: string) => templateValues(part, keyed.values);
     body = isEventStream(contentType)
@@ -196,7 +208,7 @@ function toRecording(
   }
   return {
     session,
-    request: { method: request.method, url: request.url.href },
+    request: { method: request.method, url: redactUrl(request.url) },
     response: { status: response.status, headers, body, bodyEncoding },
   };
 }
@@ -512,16 +524,32 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
       // Count it only when it went out. A refused address counts as
       // refused (`server.ts`).
       counts.live += 1;
-      // The client gets the redacted response too, so a live run and a
-      // replay give the same body.
-      const recording = JSON.parse(
-        secrets.redact(
-          JSON.stringify(toRecording(request, keyed, owner?.name, live)),
+      // The client gets the known credentials redacted too, so a live run
+      // and a replay give the same body.
+      const redact = (from: Recording) =>
+        JSON.parse(secrets.redact(JSON.stringify(from))) as Recording;
+      const recording = redact(
+        toRecording(request, keyed, owner?.name, live, (body) =>
+          secrets.redactBytes(body),
         ),
-      ) as Recording;
+      );
       if (!isTemporaryStatus(recording.response.status)) {
+        // Only the stored recording loses the credentials that the upstream
+        // minted. The client needs them for its next live requests. Their
+        // values are known from now on, so redact the recording again.
+        const { response } = recording;
+        const stored =
+          response.bodyEncoding === "utf8"
+            ? redact({
+                ...recording,
+                response: {
+                  ...response,
+                  body: secrets.redactFields(response.body),
+                },
+              })
+            : recording;
         await record(owner, key, {
-          recording,
+          recording: stored,
           samples: [[sample, toSample(key, redactedText())]],
         });
       }
