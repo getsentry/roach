@@ -418,8 +418,12 @@ describe("deployed roach", () => {
     expect(writer.trusted).toContain(
       (await readFile(hostCertFile, "utf8")).trim(),
     );
+    // The recording, and the sample of its request.
     expect([...objects.keys()]).toEqual([
       expect.stringMatching(/^getsentry\/junior\/model\/[0-9a-f]{64}\.json$/),
+      expect.stringMatching(
+        /^getsentry\/junior\/_requests\/model\/[0-9a-f]{64}\.json$/,
+      ),
     ]);
 
     // Without the token, the action only replays.
@@ -437,6 +441,9 @@ describe("deployed roach", () => {
     expect(miss.response.status).toBe(412);
     expect(miss.exitCode).toBe(1);
     expect(miss.summary).toMatch(/^- test: model\/[0-9a-f]{64}\.json$/m);
+    // It also shows what changed from the recorded request.
+    expect(miss.summary).toContain(String.raw`\"prompt\":\"hi\"}"`);
+    expect(miss.summary).toContain(String.raw`\"prompt\":\"bye\"}"`);
     expect(liveRequests).toBe(1);
 
     // The service sends its metrics when it stops.
@@ -473,9 +480,10 @@ describe("deployed roach", () => {
       ...requestMetrics("replay", "missed"),
     ]);
 
-    // Only the spans of Roach: 4 for each run, and 2 for the live request.
+    // Only the spans of Roach: 4 for each run, 2 for the live request, and
+    // 3 for request samples: one write and the reads of 2 first misses.
     const ops = spans.map(({ attributes }) => attributes["sentry.op"]);
-    expect(ops).toHaveLength(14);
+    expect(ops).toHaveLength(17);
     expect(new Set(ops)).toEqual(
       new Set([
         "roach.run.start",

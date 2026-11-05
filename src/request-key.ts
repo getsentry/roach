@@ -45,6 +45,12 @@ export interface KeyedRequest {
   /** The name of the recording file, without `.json`. */
   key: string;
   /**
+   * The text that the key hashes: the rule, the method, the URL, the key
+   * headers, and the normalized body. A miss compares it with the text of
+   * a recorded request (`misses.ts`).
+   */
+  text: string;
+  /**
    * The changing values of the request outside thinking blocks, in their
    * order. They fill the placeholders of a replayed response.
    */
@@ -151,15 +157,13 @@ function keyRequestNow(
     json === undefined
       ? extractValues(request.body, rule.values, known)
       : normalizeJson(json, rule.values, known);
-  const key = sha256(
-    [
-      KEY_VERSION,
-      rule.name,
-      request.method,
-      request.url,
-      ...Object.entries(headers).map(([name, value]) => `${name}: ${value}`),
-      text,
-    ].join("\n"),
-  );
-  return { key, values };
+  const keyText = [
+    KEY_VERSION,
+    rule.name,
+    request.method,
+    request.url,
+    ...Object.entries(headers).map(([name, value]) => `${name}: ${value}`),
+    text,
+  ].join("\n");
+  return { key: sha256(keyText), text: keyText, values };
 }

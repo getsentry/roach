@@ -141,4 +141,11 @@ and the next run makes it again. Compare `roach.recording.write` with
 - Telemetry never has a body, a credential, or the path or query of a URL.
   From a model call, it has only the model name and the token counts. So
   you cannot see the prompt or the test name in Sentry.
+- Telemetry does not show what changed in the request of a miss. The run
+  report shows it ("Misses" in `README.md`).
+- `roach.store.read` spans with a `key` that starts with `_requests/` read
+  a request sample, not a recording. Leave them out of a hit rate of
+  `roach.store.read`. Each write of recordings has a second
+  `roach.store.write` span for their samples. The `roach.recording.write`
+  metric does not count samples.
 - Cost is on spans only, not on metrics.

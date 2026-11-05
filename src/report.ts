@@ -2,7 +2,11 @@
  * Text reports of a Roach run, for logs and CI summaries.
  */
 import { appendFile } from "node:fs/promises";
-import type { RecordingMiss, RecordingStats } from "./types.ts";
+import type {
+  RecordingChange,
+  RecordingMiss,
+  RecordingStats,
+} from "./types.ts";
 
 /** Describe the totals of a run in one line. */
 export function describeRecordingStats(stats: RecordingStats): string {
@@ -19,11 +23,20 @@ export function describeRecordingStats(stats: RecordingStats): string {
   return `${rules}. ${stats.written} recordings new or changed, ${stats.discarded} dropped from failed sessions. Not recorded: ${passthrough}.`;
 }
 
+/** Describe the first change of a miss, in indented lines. */
+const describeChange = ({ file, at, recorded, request }: RecordingChange) =>
+  [
+    `\n  Changed at character ${at} of the request of ${file}:`,
+    `\n  - recorded: ${JSON.stringify(recorded)}`,
+    `\n  - request:  ${JSON.stringify(request)}`,
+  ].join("");
+
 /**
- * Describe the first request without a recording of each test, one line
- * each. The first miss of a test is the one to fix. Each later miss of the
- * test usually follows from it, because the live response differs from
- * the recording.
+ * Describe the first request without a recording of each test. The first
+ * miss of a test is the one to fix. Each later miss of the test usually
+ * follows from it, because the live response differs from the recording.
+ * When the proxy has the text of the closest recorded request, the
+ * description also shows the first change from it, in indented lines.
  */
 export function describeRecordingMisses(misses: RecordingMiss[]): string[] {
   const seen = new Set<string | undefined>();
@@ -33,7 +46,10 @@ export function describeRecordingMisses(misses: RecordingMiss[]): string[] {
       seen.add(miss.session);
       return first;
     })
-    .map((miss) => `${miss.session ?? "outside a test"}: ${miss.file}`);
+    .map(
+      (miss) =>
+        `${miss.session ?? "outside a test"}: ${miss.file}${miss.change ? describeChange(miss.change) : ""}`,
+    );
 }
 
 /**

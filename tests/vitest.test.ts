@@ -227,4 +227,23 @@ https.request = refuse;
     expect(result.output).toContain("had no recording in replay mode");
     expect(liveRequests).toHaveLength(0);
   });
+
+  it("shows what changed in the request of a miss", async () => {
+    await runVitest({ ROACH_TOKEN: TOKEN });
+    await writeFile(path.join(project, "a.fixture.ts"), testFile("a-changed"));
+
+    const result = await runVitest({});
+
+    expect(result.code).toBe(1);
+    expect(result.output).toMatch(
+      /- a\.fixture\.ts > passes: model\/[0-9a-f]{64}\.json\n {2}Changed at character \d+ of the request of model\/[0-9a-f]{64}\.json:\n/,
+    );
+    // The end of the text that the key hashes is the URL and the body.
+    expect(result.output).toContain(
+      String.raw`/v1/messages\n{\"model\":\"a\"}"` + `\n  - request:  "…`,
+    );
+    expect(result.output).toContain(
+      String.raw`/v1/messages\n{\"model\":\"a-changed\"}"`,
+    );
+  });
 });

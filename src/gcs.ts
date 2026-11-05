@@ -13,7 +13,7 @@
  */
 import {
   formatRecording,
-  type Recording,
+  type StoredFile,
   type RecordingStore,
 } from "./store.ts";
 
@@ -96,7 +96,7 @@ export function createGcsStore(bucket: string, prefix: string): RecordingStore {
   const token = createTokenSource(hosts.metadata);
   const bucketPath = `b/${encodeURIComponent(bucket)}/o`;
 
-  const writeOne = async ([key, recording]: [string, Recording]) => {
+  const writeOne = async ([key, file]: [string, StoredFile]) => {
     const name = encodeURIComponent(`${prefix}${key}`);
     const response = await call(
       `${hosts.storage}/upload/storage/v1/${bucketPath}?uploadType=media&name=${name}`,
@@ -106,7 +106,7 @@ export function createGcsStore(bucket: string, prefix: string): RecordingStore {
           authorization: `Bearer ${await token()}`,
           "content-type": "application/json",
         },
-        body: formatRecording(recording),
+        body: formatRecording(file),
       },
     );
     if (!response.ok) {
@@ -133,7 +133,7 @@ export function createGcsStore(bucket: string, prefix: string): RecordingStore {
           `GCS read of ${key} failed with HTTP ${response.status}: ${await response.text()}`,
         );
       }
-      return (await response.json()) as Recording;
+      return (await response.json()) as StoredFile;
     },
 
     // GCS does not say if an object changed, so each write counts.
