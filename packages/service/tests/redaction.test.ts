@@ -39,6 +39,8 @@ const TOOL_INPUTS: Record<string, Record<string, unknown>> = {
   fragment: { url: "https://app.test/cb#access_token=abc123def&expires_in=60" },
   nested: { grant: { refresh_token: "tool-refresh-token-123" } },
 };
+/** A minted token with `/` in it. */
+const SLASHED = "minted/access/token-0123456789";
 /**
  * A minted token with the same text as a message, in JSON with its own
  * spaces and order of fields.
@@ -301,6 +303,13 @@ beforeEach(async () => {
         // The same token, with each `-` as a unicode escape.
         outgoing.writeHead(200, { "content-type": "application/json" });
         outgoing.end(`{"access_token":"${MINTED.replaceAll("-", "\\u002d")}"}`);
+      } else if (pathname === "/v1/slashed") {
+        // A copy of the token deeper in the body, with each `/` as `\/`.
+        outgoing.writeHead(200, { "content-type": "application/json" });
+        const slashed = SLASHED.replaceAll("/", "\\/");
+        outgoing.end(
+          `{"access_token":"${SLASHED}","data":{"copy":"${slashed}"}}`,
+        );
       } else if (pathname === "/v1/same-text") {
         outgoing.writeHead(200, { "content-type": "application/json" });
         outgoing.end(SAME_TEXT);
@@ -692,6 +701,62 @@ describe("redaction", () => {
       expect(text).toContain(`"password":"<<redacted>>"`);
     }
   });
+
+  it("redacts a copy of a minted token with `\\/` in the same body", async () => {
+    const run = await start("auto");
+    await send(run, "/v1/slashed", "{}");
+    const { text, file } = await onlyRecording();
+    expect(text).not.toContain("token-0123456789");
+    expect(JSON.parse(file.response.body)).toEqual({
+      access_token: "<<redacted>>",
+      data: { copy: "<<redacted>>" },
+    });
+  });
+
+  it("does not write a request sample when a pattern hides a credential field", async () => {
+    // The pattern takes the quote after the id, so the text of the key has
+    // the password outside of a string.
+    const values = { v: String.raw`id-[0-9]+"` };
+    const run = await start("auto", [{ ...rule(), values }]);
+    const body = JSON.stringify({ a: "id-123", password: "hunter2-SECRET" });
+    const live = await send(run, "/v1/fields", body);
+    expect(live.source).toBe("live");
+    expect([...(await stored("api")).values()]).toHaveLength(1);
+    const samples = [...(await stored("_requests/api")).values()];
+    expect(samples.join("")).not.toContain("SECRET");
+    expect(samples).toHaveLength(0);
+  });
+
+  it("does not throw for each string with an escape that is not valid", async () => {
+    // The pattern makes each `\u0001` an escape that is not valid, and the
+    // short password makes each string worth a look. About 8 MiB.
+    const values = { v: "u0001" };
+    const run = await start("auto", [{ ...rule(), values }]);
+    const strings = Array.from({ length: 900_000 }, () => '"\\u0001"');
+    const body = `{"a":[${strings.join(",")}],"password":"x"}`;
+    let last = performance.now();
+    let longest = 0;
+    const timer = setInterval(() => {
+      const now = performance.now();
+      longest = Math.max(longest, now - last);
+      last = now;
+    }, 5);
+    try {
+      const live = await send(run, "/v1/fields", body);
+      expect(live.source).toBe("live");
+    } finally {
+      clearInterval(timer);
+    }
+    // About 300 ms, and 1.2 s with coverage. A throw for each string took
+    // 5.9 s.
+    expect(longest).toBeLessThan(3000);
+    const [sample] = [...(await stored("_requests/api")).values()];
+    expect(sample).toBeDefined();
+    const { text } = JSON.parse(sample!) as RequestSample;
+    // The sample is cut to its first part, so it does not show the field.
+    // It is written, so the field matched.
+    expect(text).not.toContain('"password":"x"');
+  }, 60_000);
 
   it("reads a string that does not close only once", async () => {
     // The pattern takes the quotes from around a long value of escaped

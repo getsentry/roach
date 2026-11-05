@@ -787,11 +787,17 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
         } catch (error) {
           return notRecorded("it could not be redacted", error);
         }
+        const text = secrets.redactRequest(keyed.text, request);
+        if (text === undefined) {
+          // A credential field of the request can stay in the text, so the
+          // recorder does not write the sample.
+          process.stderr.write(
+            `[roach] The ${rule.name} request sample was not written, because a credential field could not be redacted: ${key}\n`,
+          );
+        }
         await record(owner, key, {
           recording: stored,
-          samples: [
-            [sample, toSample(key, secrets.redactRequest(keyed.text, request))],
-          ],
+          samples: text === undefined ? [] : [[sample, toSample(key, text)]],
         });
       }
       const response = fromRecording(recording, keyed.values);

@@ -305,7 +305,9 @@ A run takes `RunConfig` (`packages/roach/src/types.ts`): `tenant`, `mode`, `rule
   `secret_key`, `private_key`, and `secret_access_key`. In JSON, these
   fields count at each depth. In an `application/x-www-form-urlencoded`
   body, the form fields count. No key uses this text, so this list can be
-  longer.
+  longer. When the text has a field value fewer times than the body, such
+  as when a value pattern takes a quote away, the proxy does not write the
+  sample. It writes a log line with the key.
 - The proxy parses a JSON body to find the fields, so a long string value
   cannot stop it. It does not find a field whose value is not a string,
   such as an array, or a field in JSON text that is itself a string, such
