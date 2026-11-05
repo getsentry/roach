@@ -858,19 +858,19 @@ describe("limits of the service", () => {
     const reader = await startRun(undefined, "replay");
     const writer = await startRun("write-token", "auto");
     for (const run of [reader, writer]) {
-      for (const levels of [1001, 100_000]) {
+      for (const levels of [65, 100_000]) {
         const deep = await sendText(run.url, nested(levels));
         expect(deep.status).toBe(400);
-        expect(deep.body).toMatch(/nested over 1000 levels deep/);
+        expect(deep.body).toMatch(/nested over 64 levels deep/);
       }
     }
     expect(liveRequests).toBe(0);
     expect(log.mock.calls.map(([text]) => String(text)).join("")).not.toMatch(
       /Request failed/,
     );
-    // 1000 levels still get a key, and the runs go on.
-    expect((await sendText(reader.url, nested(1000))).status).toBe(412);
-    expect((await sendText(writer.url, nested(1000))).status).toBe(200);
+    // 64 levels still get a key, and the runs go on.
+    expect((await sendText(reader.url, nested(64))).status).toBe(412);
+    expect((await sendText(writer.url, nested(64))).status).toBe(200);
     expect((await send(reader.url, { prompt: "hi" })).status).toBe(412);
     expect((await send(writer.url, { prompt: "hi" })).status).toBe(200);
   });

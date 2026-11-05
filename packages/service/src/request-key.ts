@@ -14,6 +14,7 @@
  */
 import { createHash } from "node:crypto";
 import type { IncomingHttpHeaders } from "node:http";
+import { httpError } from "./errors.ts";
 import { parseJson } from "./json-strings.ts";
 import { THINKING_BLOCK_TYPES } from "./streams.ts";
 import type { RecordingRule } from "@sentry/roach/types";
@@ -154,10 +155,10 @@ function normalizeJson(
 
 /**
  * A JSON body nested deeper than this gets HTTP 400. The key walks a body
- * with recursion, and a few thousand levels fill the call stack. Where
- * that happens changes from run to run, so the limit is well below it.
+ * with recursion, and a few thousand levels fill the call stack. Model
+ * request bodies nest far less than this.
  */
-const MAX_JSON_DEPTH = 1000;
+const MAX_JSON_DEPTH = 64;
 
 /** Whether `json` has arrays or objects nested deeper than `limit`. */
 function nestedDeeperThan(json: unknown, limit: number): boolean {
@@ -215,9 +216,9 @@ function keyRequestNow(
   const json = parseJson(request.body);
   if (json !== undefined && nestedDeeperThan(json, MAX_JSON_DEPTH)) {
     // It is the fault of the client, so it does not go to Sentry.
-    throw Object.assign(
-      new Error(`the JSON body is nested over ${MAX_JSON_DEPTH} levels deep`),
-      { status: 400 },
+    throw httpError(
+      400,
+      `the JSON body is nested over ${MAX_JSON_DEPTH} levels deep`,
     );
   }
   const { text, values } =
