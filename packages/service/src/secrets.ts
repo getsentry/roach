@@ -87,10 +87,12 @@ const CREDENTIAL_FIELDS = new Set(CREDENTIAL_NAMES.map(fieldName));
  * with `_`, `-`, or nothing between two words, so `accessToken` and
  * `secret-access_key` match too.
  */
-const CREDENTIAL_NAME = new RegExp(
-  CREDENTIAL_NAMES.map((name) => name.split("_").join("[-_]?")).join("|"),
-  "i",
-);
+const CREDENTIAL_NAME_SOURCE = CREDENTIAL_NAMES.map((name) =>
+  name.split("_").join("[-_]?"),
+).join("|");
+const CREDENTIAL_NAME = new RegExp(CREDENTIAL_NAME_SOURCE, "i");
+/** A text that is only a name of `CREDENTIAL_NAME`. */
+const CREDENTIAL_WORD = new RegExp(`^(?:${CREDENTIAL_NAME_SOURCE})$`, "i");
 /**
  * A value of a bare `token` field that is a credential: a GitHub token, a
  * JWT, or a Slack token. Model APIs also use `token` for text, such as in
@@ -99,11 +101,14 @@ const CREDENTIAL_NAME = new RegExp(
 const TOKEN_VALUE =
   /^(?:gh[pousr]_|github_pat_|xox[abprs]-|eyJ[^.\s"]*\.[^.\s"]*\.)/;
 /**
- * A credential prefix of `TOKEN_VALUE` at any place of a text. A JWT
- * counts from a word start, with a header and a payload that both start
- * with `eyJ`, so each character is read once.
+ * A credential prefix of `TOKEN_VALUE` at any place of a text: a JWT, with
+ * a header and a payload that both start with `eyJ`. A header with `-`
+ * in its base64url counts from the start of a run of base64url
+ * characters, and a header without `-` counts from a word start, so each
+ * character is read a few times at most.
  */
-const TOKEN_TEXT = /gh[pousr]_|github_pat_|xox[abprs]-|\beyJ\w*\.eyJ/;
+const TOKEN_TEXT =
+  /gh[pousr]_|github_pat_|xox[abprs]-|(?<![\w-])eyJ[\w-]*\.eyJ|\beyJ\w*\.eyJ/;
 
 /**
  * Tells whether a field or a parameter holds a credential, from its
@@ -432,13 +437,16 @@ function showsNoField(json: unknown, values: Set<string>): boolean {
 
 /**
  * Tells whether each string in a parsed JSON value, such as the value of
- * a credential field that is an object, is `<<redacted>>` or empty. The
- * names of its fields and its numbers do not count. It walks with a list.
+ * a credential field that is an object, is `<<redacted>>` or empty, and
+ * it has no number. A number cannot hold `<<redacted>>`, and it can be a
+ * part of a credential, such as a byte of a key. The names of its fields
+ * do not count. It walks with a list.
  */
 function allRedacted(json: unknown): boolean {
   const pending = [json];
   while (pending.length > 0) {
     const value = pending.pop();
+    if (typeof value === "number") return false;
     if (typeof value === "string") {
       if (value !== "" && value !== REDACTED) return false;
     } else if (value !== null && typeof value === "object") {
@@ -522,11 +530,24 @@ function eachPart(
 
 /**
  * The name of a form field as the field lists compare it: the last part of
- * a nested name, such as `password` of `user[password]`, as Rails and PHP
- * write it.
+ * a nested name that is not empty and not a number, as Rails and PHP
+ * write it. So `user[password]`, `password[]`, and `user[password][0]`
+ * are all `password`.
  */
-const formName = (name: string) =>
-  name.endsWith("]") ? (/\[([^[\]]+)\]$/.exec(name)?.[1] ?? name) : name;
+function formName(name: string): string {
+  // Read the parts from the end, so a name with many parts costs little.
+  let close = name.length - 1;
+  while (name.charCodeAt(close) === 0x5d) {
+    const open = name.lastIndexOf("[", close);
+    if (open < 0) break;
+    const part = name.slice(open + 1, close);
+    if (part.includes("]")) break;
+    if (part && !/^\d+$/.test(part)) return part;
+    close = open - 1;
+  }
+  const open = name.indexOf("[");
+  return open > 0 && name.endsWith("]") ? name.slice(0, open) : name;
+}
 
 /**
  * The decoded name (`formName`) and value of a part of a form body
@@ -572,8 +593,10 @@ function valueTest(values: string[]): (text: string) => boolean {
  * The credential fields of a parsed JSON body at any depth, as
  * `formFields` gives them for a form: their number, and the values that
  * are strings. A field whose value is a number, an object, or an array
- * counts too. `keepsFields` checks each place. It walks with a list, not
- * with recursion, so a deep value cannot overflow the stack.
+ * counts too, and each string in an object or an array is a value, so
+ * its copies at other places are found. `keepsFields` checks each place.
+ * It walks with a list, not with recursion, so a deep value cannot
+ * overflow the stack.
  */
 function jsonFields(json: unknown): { count: number; values: string[] } {
   const values: string[] = [];
@@ -603,7 +626,10 @@ function jsonFields(json: unknown): { count: number; values: string[] } {
         typeof item === "number" ||
         (item !== null && typeof item === "object")
       ) {
-        if (fieldKind(name) === "credential") count += 1;
+        if (fieldKind(name) === "credential") {
+          count += 1;
+          if (typeof item === "object") addStrings(item, values);
+        }
       }
       if (item !== null && typeof item === "object") pending.push(item);
     }
@@ -612,14 +638,32 @@ function jsonFields(json: unknown): { count: number; values: string[] } {
 }
 
 /**
+ * Add each string in a parsed JSON value that is not empty or
+ * `<<redacted>>` to `strings`, at any depth, without the names of its
+ * fields. It walks with a list.
+ */
+function addStrings(json: object, strings: string[]): void {
+  const pending: unknown[] = [json];
+  while (pending.length > 0) {
+    const value = pending.pop();
+    if (typeof value === "string") {
+      if (value !== "" && value !== REDACTED) strings.push(value);
+    } else if (value !== null && typeof value === "object") {
+      for (const item of Object.values(value)) pending.push(item);
+    }
+  }
+}
+
+/**
  * The text of a form body, after a value pattern changed it, with the
  * value of each credential field replaced, in one pass. It is `undefined`
  * when the result can still show a value: when a name or a value of
- * another field is a credential value (`isValue`), or when fewer than
- * `expected` fields hold `<<redacted>>` (`formFields`). Then a value
- * pattern took a field away, such as with its name. A field that held
- * `<<redacted>>` before counts in `expected`, so it cannot take the place
- * of that field.
+ * another field is a credential value (`isValue`), when another field can
+ * show a credential (`mayShowCredential`), such as `user.password` or
+ * JSON with URL escapes, or when fewer than `expected` fields hold
+ * `<<redacted>>` (`formFields`). Then a value pattern took a field away,
+ * such as with its name. A field that held `<<redacted>>` before counts
+ * in `expected`, so it cannot take the place of that field.
  */
 function redactFormBody(
   body: string,
@@ -637,12 +681,42 @@ function redactFormBody(
       from = end;
       count += 1;
     } else if (value === REDACTED && credentialName(name)) count += 1;
-    else if (isValue(name) || isValue(value)) shows = true;
+    else if (
+      isValue(name) ||
+      isValue(value) ||
+      // The name of a credential field with an empty value, or a bare
+      // `token` without a credential prefix, shows no credential.
+      (!credentialName(name) && partMayShow(body, start, equals, end, value))
+    ) {
+      shows = true;
+    }
     return !shows;
   });
   if (shows || count < expected) return undefined;
   parts.push(body.slice(from));
   return parts.join("");
+}
+
+/**
+ * Tells whether a part of a form body (`eachPart`) that is not a
+ * credential field can still show a credential (`mayShowCredential`),
+ * such as `user.password=` or JSON with URL escapes in its value. A value
+ * that is only the name of a credential field, such as the `password` of
+ * `grant_type=password`, shows none.
+ */
+function partMayShow(
+  body: string,
+  start: number,
+  equals: number,
+  end: number,
+  value: string,
+): boolean {
+  if (equals < 0) return mayShowCredential(body.slice(start, end));
+  return (
+    mayShowCredential(body.slice(start, equals)) ||
+    (!CREDENTIAL_WORD.test(value) &&
+      mayShowCredential(body.slice(equals + 1, end)))
+  );
 }
 
 /**
@@ -980,17 +1054,23 @@ export function redactRequestUrl(
  * Tells whether the text of a body that `redactRequestWith` cannot read
  * field by field can show a credential: it has the name of a field of
  * `CREDENTIAL_FIELDS`, also with JSON unicode escapes or URL escapes in
- * it, or a credential prefix of a bare `token` (`TOKEN_TEXT`). Each test
- * reads the body once.
+ * it, or a credential prefix of a bare `token` (`TOKEN_TEXT`). It decodes
+ * each escape by itself, so an escape that is not valid does not stop the
+ * test of the others. Each test reads the body once.
  */
 function mayShowCredential(body: string): boolean {
   if (CREDENTIAL_NAME.test(body) || TOKEN_TEXT.test(body)) return true;
-  const unescaped = body.includes("\\u")
-    ? body.replaceAll(/\\u([0-9a-fA-F]{4})/g, (_, hex: string) =>
-        String.fromCharCode(Number.parseInt(hex, 16)),
-      )
-    : body;
-  return CREDENTIAL_NAME.test(unescaped) || CREDENTIAL_NAME.test(decode(body));
+  const unescape = (pattern: RegExp) =>
+    body.replaceAll(pattern, (_, hex: string) =>
+      String.fromCharCode(Number.parseInt(hex, 16)),
+    );
+  // The names are ASCII, so a URL escape can give one character for each
+  // byte.
+  return (
+    (body.includes("\\u") &&
+      CREDENTIAL_NAME.test(unescape(/\\u([0-9a-fA-F]{4})/g))) ||
+    (body.includes("%") && CREDENTIAL_NAME.test(unescape(/%([0-9a-fA-F]{2})/g)))
+  );
 }
 
 /**
