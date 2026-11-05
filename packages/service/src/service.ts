@@ -165,22 +165,32 @@ const MAX_PUBLIC_RUNS_PER_CLIENT = 10;
 /** A proxied request body of a run without a token over this gets 413. */
 const PUBLIC_MAX_BODY_BYTES = 16 * 1024 * 1024;
 /**
- * The time that a run can use in the key worker (`key-worker.ts`). A key
- * has 1 s and 0.5 s for each MiB of its body. For a run without a token,
- * one job has at most 5 s and all jobs 30 s. Past that, or when a key goes
- * past its time limit, the run ends. In the 14 days to 2026-11-05, the key
- * time of a run was at most 9.5 s (p99 9.1 s, about 1,000 keys). A request
- * of a run without a token can have at most 100,000 changing values.
+ * The work of a run without a token (`WorkLimit`). A key has 1 s and 0.5 s
+ * for each MiB of its body. One job in the key worker (`key-worker.ts`) has
+ * at most 5 s, and all jobs 30 s. Past that, or when a key goes past its
+ * time limit, the run ends. In the 14 days to 2026-11-05, the key time of
+ * a run was at most 9.5 s (p99 9.1 s, about 1,000 keys).
+ *
+ * A request can have at most 100,000 changing values. The sessions of a
+ * run can remember (`known`) at most 10,000 values with 256 Ki characters.
+ * Past that, the run ends, so 100 runs keep at most about 200 MiB. The
+ * largest model request in the 14 days to 2026-11-05 had 162,707 input
+ * tokens, about 0.65 MB. In 24 model requests of Junior, the patterns of
+ * its evals found at most 770 values with 15 K characters for each MiB. So
+ * a session has about 500 values with 10 K characters, and the limits are
+ * about 20 times that. The evals run one session at a time.
  */
 const PUBLIC_WORK_LIMIT: WorkLimit = {
   maxJobMs: 5000,
   maxValues: 100_000,
+  maxKnown: { values: 10_000, chars: 256 * 1024 },
   totalMs: 30_000,
   untrusted: true,
 };
 const WRITE_WORK_LIMIT: WorkLimit = {
   maxJobMs: Infinity,
   maxValues: Infinity,
+  maxKnown: { values: Infinity, chars: Infinity },
   totalMs: Infinity,
   untrusted: false,
 };

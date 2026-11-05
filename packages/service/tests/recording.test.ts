@@ -31,7 +31,7 @@ import {
 import { startRoachService, type RoachService } from "../src/service.ts";
 import { keyRequest } from "../src/request-key.ts";
 import type { RecordingMode, RecordingRule } from "@sentry/roach/types";
-import { VALUE_PATTERNS } from "@sentry/roach/values";
+import { extractValues, VALUE_PATTERNS } from "@sentry/roach/values";
 
 const TOKEN = "write-token";
 const TENANT = "acme/alpha";
@@ -646,6 +646,32 @@ describe("recording", () => {
     expect([...(await session(narrow, [{ model: "m" }]))]).toEqual([
       { body: "data: 2\n\n", source: "passthrough" },
     ]);
+  });
+
+  it("finds the values that replace() finds", () => {
+    // `extractValues()` counts each value when it finds it. It must find
+    // the same values as `replace()`, also empty ones, and with known
+    // values.
+    const patterns = { x: "x*", d: String.raw`\d{0,2}`, w: "ab|a" };
+    const known = new Map([["zz", "z"]]);
+    const search = new RegExp(
+      `(x*)|(\\d{0,2})|(ab|a)|((?<!(?:^|[^\\\\])[0-9A-Za-z])(?:zz)(?![0-9A-Za-z]))`,
+      "g",
+    );
+    for (const text of ["", "x", "axxb123", "abab zz 9", "\uE000 xx 😀 1"]) {
+      const names = ["x", "d", "w", "z"];
+      const values = new Map<string, string[]>();
+      const expected = text.replace(search, (...match: string[]) => {
+        const name =
+          names[match.slice(1, 5).findIndex((group) => group !== undefined)]!;
+        values.set(name, [...(values.get(name) ?? []), match[0]!]);
+        return `<<${name}>>`;
+      });
+      expect(extractValues(text, patterns, known)).toEqual({
+        text: expected,
+        values,
+      });
+    }
   });
 
   it("keeps the keys of earlier versions", () => {

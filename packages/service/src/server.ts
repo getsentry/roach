@@ -100,32 +100,41 @@ export function clientAddress(incoming: http.IncomingMessage): string {
 /**
  * The group of a client address for the limit of runs for each client. An
  * IPv6 client often has a whole /64, so the group of an IPv6 address is
- * its /64, such as `2001:db8:0:1::/64`. An IPv4 address, also in IPv6
- * form (`::ffff:192.0.2.1`), is its own group.
+ * its /64, such as `2001:db8:0:1::/64`. An IPv4 address is its own group,
+ * also in each IPv6 form, such as `::ffff:192.0.2.1`, `::ffff:c000:201`,
+ * and `0:0:0:0:0:ffff:192.0.2.1`.
  */
 export function clientGroup(address: string): string {
-  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(address);
-  if (mapped) return mapped[1]!;
   if (isIP(address) !== 6) return address;
-  // Write `::` as its zero groups. An address that ends in IPv4 form has
-  // two groups in it, but only the first four groups count.
-  const [head = "", tail] = address.toLowerCase().split("::");
+  const groups = ipv6Groups(address);
+  if (
+    groups.slice(0, 5).every((group) => group === 0) &&
+    groups[5] === 0xffff
+  ) {
+    const [high = 0, low = 0] = groups.slice(6);
+    return [high >> 8, high & 0xff, low >> 8, low & 0xff].join(".");
+  }
+  return `${groups
+    .slice(0, 4)
+    .map((group) => group.toString(16))
+    .join(":")}::/64`;
+}
+
+/** The eight 16-bit groups of an IPv6 address. */
+function ipv6Groups(address: string): number[] {
+  // The URL parser writes each IPv6 form with hex groups only, such as
+  // `::ffff:c000:201`. A zone, such as `%eth0`, is not part of it.
+  const [head = "", tail] = new URL(
+    `http://[${address.split("%")[0]}]`,
+  ).hostname
+    .slice(1, -1)
+    .split("::");
   const front = head ? head.split(":") : [];
   const back = tail ? tail.split(":") : [];
-  const groups =
-    tail === undefined
-      ? front
-      : [
-          ...front,
-          ...Array<string>(Math.max(0, 8 - front.length - back.length)).fill(
-            "0",
-          ),
-          ...back,
-        ];
-  const prefix = groups
-    .slice(0, 4)
-    .map((group) => Number.parseInt(group, 16).toString(16));
-  return `${prefix.join(":")}::/64`;
+  const zeros = Array<string>(8 - front.length - back.length).fill("0");
+  return [...front, ...zeros, ...back].map((group) =>
+    Number.parseInt(group, 16),
+  );
 }
 
 /** An error that answers a request with its own status. */

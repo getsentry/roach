@@ -155,7 +155,8 @@ export type KnownValues = ReadonlyMap<string, string>;
  * value at the same place.
  *
  * Past `maxValues` values, it stops and throws an error with HTTP status
- * 400. So a text with millions of values cannot fill the memory.
+ * 400. It counts each value when it finds it, so a text with millions of
+ * values cannot fill the memory before the error.
  */
 export function extractValues(
   text: string,
@@ -174,27 +175,50 @@ export function extractValues(
   const search = hasKnown
     ? new RegExp(`${pattern.source}|(${literals([...known.keys()])})`, "g")
     : pattern;
+  // An `exec()` loop, not `replace()`: `replace()` finds all matches
+  // before it calls its function, so it cannot stop at `maxValues`. The
+  // loop finds the same matches, also the empty ones.
+  const parts: string[] = [];
   let count = 0;
-  const result = text.replace(search, (...match: unknown[]) => {
-    count += 1;
-    if (count > maxValues) {
-      throw Object.assign(
-        new Error("the request has too many changing values"),
-        { status: 400 },
-      );
+  let end = 0;
+  search.lastIndex = 0;
+  try {
+    for (let match = search.exec(text); match; match = search.exec(text)) {
+      count += 1;
+      if (count > maxValues) {
+        throw Object.assign(
+          new Error("the request has too many changing values"),
+          { status: 400 },
+        );
+      }
+      const value = match[0];
+      const name =
+        hasKnown && match[knownGroup] !== undefined
+          ? known.get(value)!
+          : names[groups.findIndex((group) => match[group] !== undefined)]!;
+      const list = values.get(name) ?? [];
+      list.push(value);
+      values.set(name, list);
+      parts.push(text.slice(end, match.index), `<<${name}>>`);
+      end = match.index + value.length;
+      if (value.length === 0) search.lastIndex += 1;
     }
-    const value = match[0] as string;
-    const name =
-      hasKnown && match[knownGroup] !== undefined
-        ? known.get(value)!
-        : names[groups.findIndex((group) => match[group] !== undefined)]!;
-    const list = values.get(name) ?? [];
-    list.push(value);
-    values.set(name, list);
-    return `<<${name}>>`;
-  });
-  return { text: result, values };
+  } finally {
+    // `pattern` is shared, so it must not keep a position.
+    search.lastIndex = 0;
+  }
+  parts.push(text.slice(end));
+  return { text: parts.join(""), values };
 }
+
+/**
+ * Whether `value` can be in `known` or in a template (`templateValues()`).
+ * V8 does not run a pattern with a literal of over 32,767 characters on a
+ * text that can hold it. Such a value in `known` would fail each later
+ * request of its session that could repeat it, so to leave it out changes
+ * no key.
+ */
+export const canBeKnown = (value: string): boolean => value.length <= 32_767;
 
 const escape = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -212,13 +236,13 @@ const literals = (values: string[]) =>
 /**
  * Write each value of the request that a recorded response repeats as
  * `<<name:n>>`. A value is replaced only where it is not part of a longer
- * word or number.
+ * word or number. A value that `canBeKnown()` refuses stays as it is.
  */
 export function templateValues(text: string, values: RequestValues): string {
   const placeholders = new Map<string, string>();
   for (const [name, list] of values) {
     list.forEach((value, index) => {
-      if (!placeholders.has(value)) {
+      if (!placeholders.has(value) && canBeKnown(value)) {
         placeholders.set(value, `<<${name}:${index + 1}>>`);
       }
     });
