@@ -25,7 +25,6 @@
   },
   "scripts": {
     "prepack": "cp ../../README.md README.md",
-    "postpack": "rm README.md",
     "test": "vitest run",
     "typecheck": "tsc -p ."
   },
