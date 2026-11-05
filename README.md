@@ -320,6 +320,12 @@ A run takes `RunConfig` (`packages/roach/src/types.ts`): `tenant`, `mode`, `rule
   value of its rule has `"`, `\`, `&`, `=`, `<`, `>`, or a control
   character, because its `<<name>>` can add a field. A miss has no change
   then.
+- The proxy cannot find the fields of a body that is not JSON or a form,
+  such as JSON with a comma at the end, JSON lines, or a multipart body.
+  So the request sample of such a body has no text when the body has the
+  name of a field above anywhere. The name can be in any case, with `_`,
+  `-`, or nothing between its words, such as `accessToken`. This is one
+  search of the body, so a long body costs little.
 - The proxy parses a JSON body to find the fields, so a long string value
   cannot stop it. It does not find a field whose value is not a string,
   such as an array, or a field in JSON text that is itself a string, such

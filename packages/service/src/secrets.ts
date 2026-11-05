@@ -55,32 +55,39 @@ function fieldName(name: string): string {
  * that request. The names compare without case, `_`, and `-`, so
  * `accessToken` is `access_token`.
  */
-const MINTED_FIELDS = new Set(
-  [
-    "access_token",
-    "refresh_token",
-    "id_token",
-    "session_token",
-    "auth_token",
-    "client_secret",
-  ].map(fieldName),
-);
+const MINTED_NAMES = [
+  "access_token",
+  "refresh_token",
+  "id_token",
+  "session_token",
+  "auth_token",
+  "client_secret",
+];
+const MINTED_FIELDS = new Set(MINTED_NAMES.map(fieldName));
 /**
  * Fields whose value is a credential, for the text of a request: a request
  * sample and the text of a miss. No key uses this text, so the list can be
  * longer than `MINTED_FIELDS`.
  */
-const CREDENTIAL_FIELDS = new Set(
-  [
-    ...MINTED_FIELDS,
-    "bearer_token",
-    "client_assertion",
-    "password",
-    "api_key",
-    "secret_key",
-    "private_key",
-    "secret_access_key",
-  ].map(fieldName),
+const CREDENTIAL_NAMES = [
+  ...MINTED_NAMES,
+  "bearer_token",
+  "client_assertion",
+  "password",
+  "api_key",
+  "secret_key",
+  "private_key",
+  "secret_access_key",
+];
+const CREDENTIAL_FIELDS = new Set(CREDENTIAL_NAMES.map(fieldName));
+/**
+ * A name of `CREDENTIAL_FIELDS` as a body can write it: in any case, and
+ * with `_`, `-`, or nothing between two words, so `accessToken` and
+ * `secret-access_key` match too.
+ */
+const CREDENTIAL_NAME = new RegExp(
+  CREDENTIAL_NAMES.map((name) => name.split("_").join("[-_]?")).join("|"),
+  "i",
 );
 /**
  * A value of a bare `token` field that is a credential: a GitHub token, a
@@ -909,6 +916,13 @@ export function redactRequestWith(
   );
   const result = text.replace(request.href, () => href);
   if (fields.count === 0) {
+    // A body that is not JSON or a form, such as JSON with a comma at the
+    // end, can hold a credential field that the proxy cannot find. So it
+    // fails closed when the body has the name of one. This is one search
+    // of the body, so a long body costs little.
+    if (!form && json === undefined && CREDENTIAL_NAME.test(request.body)) {
+      return undefined;
+    }
     return redactWith(
       values,
       form ? redactForm(result, isCredentialField) : result,

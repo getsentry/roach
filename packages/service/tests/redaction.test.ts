@@ -1158,4 +1158,36 @@ describe("redaction", () => {
     const replayed = await send(await start("replay"), url, body, headers);
     expect(replayed.source).toBe("replayed");
   });
+
+  it("writes no text in a request sample when a body that is not JSON has a credential field name", async () => {
+    // The proxy cannot find the fields of a body that is not JSON or a
+    // form, so the name of a credential field is enough.
+    const bodies: [string, string][] = [
+      [`{"password":"${HIDDEN}",}`, "application/json"],
+      [`{"a":1}\n{"accessToken":"${HIDDEN}"}`, "application/x-ndjson"],
+      [
+        `--b\r\nContent-Disposition: form-data; name="Secret-Access-Key"\r\n\r\n${HIDDEN}\r\n--b--`,
+        "multipart/form-data; boundary=b",
+      ],
+    ];
+    // A body without a name keeps its text.
+    const kept = `{"note":"tokens and keys",}`;
+    bodies.push([kept, "text/plain"]);
+    const run = await start("auto");
+    for (const [body, contentType] of bodies) {
+      const live = await send(run, "/v1/fields", body, {
+        "content-type": contentType,
+      });
+      expect(live.source).toBe("live");
+    }
+    const samples = [...(await stored("_requests/api")).values()].map(
+      (sample) => JSON.parse(sample) as RequestSample,
+    );
+    expect(samples).toHaveLength(4);
+    expect(JSON.stringify(samples)).not.toContain("SECRET");
+    expect(samples.filter((sample) => sample.withheld)).toHaveLength(3);
+    expect(samples.map((sample) => sample.text)).toContainEqual(
+      expect.stringContaining(kept),
+    );
+  });
 });
