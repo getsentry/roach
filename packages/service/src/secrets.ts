@@ -4,7 +4,17 @@
  * The proxy learns the values of credential headers and query parameters
  * from each request that it sees, and the config can add more values. It
  * replaces each known value with `<<redacted>>` before it writes a
- * recording.
+ * recording, in text and in bytes. It also replaces the value of each
+ * credential field, such as an `access_token` that a server mints in a
+ * JSON body, and the value of each credential parameter of a URL that a
+ * recording keeps.
+ *
+ * It parses a JSON body and walks it to find the fields. It does not run a
+ * regular expression on JSON text, because a long string value can
+ * overflow the stack of the expression. So it finds a field whose name
+ * has a unicode escape. It does not find a field whose value is not a
+ * string, such as an array, or a field in JSON text that is itself a
+ * string, such as the escaped arguments of a tool call.
  */
 import type { IncomingHttpHeaders } from "node:http";
 
@@ -26,6 +36,132 @@ const NOT_CREDENTIAL_HEADERS = new Set(["x-session-affinity"]);
 /** Shorter parts, such as `Bearer`, are not credentials. */
 const MIN_LENGTH = 12;
 const REDACTED = "<<redacted>>";
+const REDACTED_BYTES = Buffer.from(REDACTED);
+
+/** The name of a field, as the field lists compare it. */
+function fieldName(name: string): string {
+  return name.replaceAll(/[_-]/g, "").toLowerCase();
+}
+
+/**
+ * Fields of a response body whose value is a credential that a server
+ * mints, such as the token of an OAuth server. The recorder replaces their
+ * values only in what it writes, so a replay gives `<<redacted>>` there.
+ * The list is short, and only the top of a JSON body counts, on purpose. A
+ * model can repeat a part of its response in a later request, such as the
+ * input of a tool call, and a redacted value there would change the key of
+ * that request. The names compare without case, `_`, and `-`, so
+ * `accessToken` is `access_token`.
+ */
+const MINTED_FIELDS = new Set(
+  [
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "session_token",
+    "auth_token",
+    "client_secret",
+  ].map(fieldName),
+);
+/**
+ * Fields whose value is a credential, for the text of a request: a request
+ * sample and the text of a miss. No key uses this text, so the list can be
+ * longer than `MINTED_FIELDS`.
+ */
+const CREDENTIAL_FIELDS = new Set(
+  [
+    ...MINTED_FIELDS,
+    "bearer_token",
+    "client_assertion",
+    "password",
+    "api_key",
+    "secret_key",
+    "private_key",
+    "secret_access_key",
+  ].map(fieldName),
+);
+/**
+ * A value of a bare `token` field that is a credential: a GitHub token, a
+ * JWT, or a Slack token. Model APIs also use `token` for text, such as in
+ * log probabilities, so only these prefixes count, and never the length.
+ */
+const TOKEN_VALUE =
+  /^(?:gh[pousr]_|github_pat_|xox[abprs]-|eyJ[^.\s"]*\.[^.\s"]*\.)/;
+
+/**
+ * Tells whether a field or a parameter holds a credential, from its
+ * decoded name and value.
+ */
+type CredentialTest = (name: string, value: string) => boolean;
+
+/**
+ * The test for the fields of `fields`, and for a bare `token` field with a
+ * credential prefix.
+ */
+const fieldTest =
+  (fields: Set<string>): CredentialTest =>
+  (name, value) => {
+    if (value === "" || value === REDACTED) return false;
+    const key = fieldName(name);
+    return fields.has(key) || (key === "token" && TOKEN_VALUE.test(value));
+  };
+const isMinted = fieldTest(MINTED_FIELDS);
+const isCredentialField = fieldTest(CREDENTIAL_FIELDS);
+/** A query parameter whose name can mean a credential, at any value. */
+const isCredentialParam: CredentialTest = (name) =>
+  CREDENTIAL_HEADER.test(name);
+
+/** The parsed value of a JSON text, or `undefined` when it is not JSON. */
+const parseJson = (text: string): unknown => {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+};
+
+/**
+ * The string values of the credential fields of a JSON value. With `deep`,
+ * it looks in each object at each depth, and else only in the object at the
+ * top. It walks with a list, not with recursion, so a deep value cannot
+ * overflow the stack. It does not look in the value of a credential field
+ * that is not a string, such as an array.
+ */
+function credentialValues(
+  json: unknown,
+  test: CredentialTest,
+  deep: boolean,
+): string[] {
+  const found: string[] = [];
+  const pending = [json];
+  while (pending.length > 0) {
+    const value = pending.pop();
+    if (value === null || typeof value !== "object") continue;
+    for (const [name, item] of Object.entries(value)) {
+      if (typeof item === "string" && test(name, item)) found.push(item);
+      else if (deep) pending.push(item);
+    }
+  }
+  return found;
+}
+
+/**
+ * `text` with each JSON string of `values` replaced by `"<<redacted>>"`.
+ * Only a whole string value matches, so a short value cannot change other
+ * text. A value matches as `JSON.stringify` writes it, and with `\/` for
+ * each `/`, as some servers write it.
+ */
+function replaceStrings(text: string, values: string[]): string {
+  const quoted = values.flatMap((value) => {
+    const json = JSON.stringify(value);
+    return [json, json.replaceAll("/", "\\/")];
+  });
+  let result = text;
+  for (const json of new Set(quoted.toSorted((a, b) => b.length - a.length))) {
+    result = result.replaceAll(json, `"${REDACTED}"`);
+  }
+  return result;
+}
 
 /** Decode a part of a query, or keep it when it is not valid. */
 const decode = (part: string) => {
@@ -37,38 +173,64 @@ const decode = (part: string) => {
 };
 
 /**
- * The parts of the query of `url`, as they are sent: each part, its value,
- * and whether its name can mean a credential.
+ * The parts of a query, a fragment, or a form without its `?` or `#`, as
+ * they are sent: each part, its name, and its value.
  */
-const queryParts = (url: URL) =>
-  url.search
-    .slice(1)
-    .split("&")
-    .map((part) => {
-      const at = part.indexOf("=");
-      const name = at < 0 ? part : part.slice(0, at);
-      const value = at < 0 ? "" : part.slice(at + 1);
-      return {
-        part,
-        name,
-        value,
-        credential: CREDENTIAL_HEADER.test(decode(name)),
-      };
-    });
+const paramParts = (params: string) =>
+  params.split("&").map((part) => {
+    const at = part.indexOf("=");
+    const name = at < 0 ? part : part.slice(0, at);
+    const value = at < 0 ? "" : part.slice(at + 1);
+    return { part, name, value };
+  });
 
 /**
- * The URL of `url`, with the value of each credential query parameter
- * replaced at any length. The other parts do not change.
+ * `params` with the value of each parameter that `test` finds replaced.
+ * `test` gets the decoded name and value.
  */
-const redactQuery = (url: URL) => {
-  if (!url.search) return url.href;
-  const search = queryParts(url)
-    .map(({ part, name, value, credential }) =>
-      credential && value ? `${name}=${REDACTED}` : part,
+const redactParams = (params: string, test: CredentialTest) =>
+  paramParts(params)
+    .map(({ part, name, value }) =>
+      value && test(decode(name), decode(value)) ? `${name}=${REDACTED}` : part,
     )
     .join("&");
-  return url.href.replace(url.search, () => `?${search}`);
-};
+
+/**
+ * The text of an `application/x-www-form-urlencoded` body, line by line,
+ * with the value of each field that `test` finds replaced.
+ */
+const redactForm = (text: string, test: CredentialTest) =>
+  text
+    .split("\n")
+    .map((line) => redactParams(line, test))
+    .join("\n");
+
+/** Tells whether a content type is `application/x-www-form-urlencoded`. */
+const isForm = (contentType: string | string[] | undefined) =>
+  /^application\/x-www-form-urlencoded\b/i.test(String(contentType ?? ""));
+
+/**
+ * A URL as a recording and a request sample keep it, such as the URL of a
+ * request: the value of each parameter of its query and its fragment that
+ * `test` finds is replaced at any length. By default, that is each
+ * parameter whose name can mean a credential. The other parts do not
+ * change, and a relative URL stays relative.
+ */
+export function redactUrl(
+  href: string,
+  test: CredentialTest = isCredentialParam,
+): string {
+  const hash = href.indexOf("#");
+  const beforeHash = hash < 0 ? href : href.slice(0, hash);
+  const question = beforeHash.indexOf("?");
+  let result = beforeHash;
+  if (question >= 0) {
+    const query = redactParams(beforeHash.slice(question + 1), test);
+    result = `${beforeHash.slice(0, question)}?${query}`;
+  }
+  if (hash >= 0) result += `#${redactParams(href.slice(hash + 1), test)}`;
+  return result;
+}
 
 /**
  * Add `value` and its parts to `into`, such as the token of
@@ -101,21 +263,35 @@ function redactWith(values: string[], text: string): string {
   return result;
 }
 
+/** A request as its redacted text needs it (`redactRequestWith`). */
+export interface RequestToRedact {
+  href: string;
+  body: string;
+  contentType: string | string[] | undefined;
+}
+
 /**
- * The text of a request to `href`, such as the text that its key hashes,
- * with each of `values` replaced. Give longer values first. In the first
- * copy of the URL, the value of each credential query parameter is
- * replaced at any length.
+ * The text of `request`, such as the text that its key hashes, with each
+ * of `values` replaced. Give longer values first. It also replaces the
+ * value of each credential field (`CREDENTIAL_FIELDS`) at any depth of a
+ * JSON body, or of an `application/x-www-form-urlencoded` body. These
+ * values do not join the known credentials. In the first copy of the URL,
+ * the value of each credential query parameter is replaced at any length.
  */
 export function redactRequestWith(
   values: string[],
   text: string,
-  href: string,
+  request: RequestToRedact,
 ): string {
-  const redacted = redactQuery(new URL(href));
+  const href = redactUrl(request.href);
+  const result = text.replace(request.href, () => href);
+  if (isForm(request.contentType)) {
+    return redactWith(values, redactForm(result, isCredentialField));
+  }
+  const json = parseJson(request.body);
   return redactWith(
     values,
-    text.replace(href, () => redacted),
+    replaceStrings(result, credentialValues(json, isCredentialField, true)),
   );
 }
 
@@ -159,6 +335,29 @@ export function createSecrets(initial: string[], limit: LearnLimit) {
     for (const part of seen) values.add(part);
   };
 
+  /**
+   * `body` with each known credential replaced, as bytes. Only the bytes of
+   * a known value change, so a binary body stays binary.
+   */
+  const redactBytes = (body: Buffer): Buffer => {
+    let result = body;
+    for (const value of longestFirst()) {
+      const needle = Buffer.from(value);
+      let at = result.indexOf(needle);
+      if (at < 0) continue;
+      const parts: Buffer[] = [];
+      let from = 0;
+      while (at >= 0) {
+        parts.push(result.subarray(from, at), REDACTED_BYTES);
+        from = at + needle.length;
+        at = result.indexOf(needle, from);
+      }
+      parts.push(result.subarray(from));
+      result = Buffer.concat(parts);
+    }
+    return result;
+  };
+
   return {
     /**
      * Learn the credentials in the headers of a request, and in the query
@@ -174,8 +373,10 @@ export function createSecrets(initial: string[], limit: LearnLimit) {
           add(item, seen);
         }
       }
-      for (const { value, credential } of url ? queryParts(url) : []) {
-        if (!credential) continue;
+      for (const { name, value } of url
+        ? paramParts(url.search.slice(1))
+        : []) {
+        if (!CREDENTIAL_HEADER.test(decode(name))) continue;
         add(value, seen);
         add(decode(value), seen);
       }
@@ -194,15 +395,67 @@ export function createSecrets(initial: string[], limit: LearnLimit) {
 
     redact,
 
+    redactBytes,
+
     /** The known credentials, longer values first (`redactRequestWith`). */
     list: longestFirst,
 
     /**
-     * The text of a request to `url`, such as the text that its key hashes,
-     * with each known credential replaced (`redactRequestWith`).
+     * The text of a response body with the value of each minted credential
+     * replaced: each field of `MINTED_FIELDS`, and a bare `token` with a
+     * credential prefix. In JSON, only the fields of the object at the top
+     * count, because a server puts a minted credential there. A field at a
+     * lower depth, such as in the input of a tool call, does not change,
+     * because a later request can repeat it, and its key must not change.
+     * In an `application/x-www-form-urlencoded` body, the form fields
+     * count. Other text does not change. The values join the known
+     * credentials, so later recordings of the run do not show them either.
+     * They do not count toward the limit, because only a run that records
+     * gets them, from an upstream that `allow` names.
      */
-    redactRequest(text: string, url: URL): string {
-      return redactRequestWith(longestFirst(), text, url.href);
+    redactFields(text: string, contentType?: string): string {
+      if (isForm(contentType)) {
+        return redactForm(text, (name, value) => {
+          if (!isMinted(name, value)) return false;
+          add(value, values);
+          return true;
+        });
+      }
+      const minted = credentialValues(parseJson(text), isMinted, false);
+      for (const value of minted) add(value, values);
+      return replaceStrings(text, minted);
+    },
+
+    /**
+     * A `location` header as a recording keeps it: the value of each
+     * minted credential parameter of its query and its fragment is
+     * replaced (`MINTED_FIELDS`, and a bare `token` with a credential
+     * prefix), such as `#access_token=`. Other parameters do not change,
+     * so a replay can follow the redirect. The values join the known
+     * credentials, as in `redactFields`.
+     */
+    redactLocation(href: string): string {
+      return redactUrl(href, (name, value) => {
+        if (!isMinted(name, value)) return false;
+        add(value, values);
+        return true;
+      });
+    },
+
+    /**
+     * The text of `request`, such as the text that its key hashes, with
+     * each known credential and each credential field replaced
+     * (`redactRequestWith`).
+     */
+    redactRequest(
+      text: string,
+      request: { url: URL; headers: IncomingHttpHeaders; body: Buffer },
+    ): string {
+      return redactRequestWith(longestFirst(), text, {
+        href: request.url.href,
+        body: request.body.toString("utf8"),
+        contentType: request.headers["content-type"],
+      });
     },
   };
 }

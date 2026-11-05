@@ -218,13 +218,15 @@ A run takes `RunConfig` (`packages/roach/src/types.ts`): `tenant`, `mode`, `rule
   or of the run. Use `secrets` of the run for the credentials of a CI job
   that a response can show but no request header has, such as a token that
   goes to a model in a prompt. The service keeps them only in memory, for
-  the run. A run can have 32 of them. It also learns the value of each request header and query parameter whose name can mean a credential,
+  the run. A run can have 32 of them. It also learns the value of each
+  request header and query parameter whose name can mean a credential,
   such as one with `auth`, `token`, `key`, `secret`, `cookie`, or `session`.
   The match is broad on purpose. It does not learn `x-session-affinity`,
   because that header has a conversation id and not a credential.
-  Recordings show `<<redacted>>` in place of each known value. A request
-  sample and the text of a miss in Sentry also show `<<redacted>>` for the
-  value of each such query parameter, at any length (see [Misses](#misses)).
+  Recordings show `<<redacted>>` in place of each known value. The URL of
+  a recording, a request sample, and the text of a miss in Sentry also show
+  `<<redacted>>` for the value of each such query parameter, at any length
+  (see [Misses](#misses)). The other parameters do not change.
   A run without the token learns at most 1,024 values, with a total of
   1 Mi characters. A run with the token learns at most 16,384 values, with
   a total of 16 Mi characters, for credentials that change on each
@@ -233,6 +235,72 @@ A run takes `RunConfig` (`packages/roach/src/types.ts`): `tenant`, `mode`, `rule
   the limit gets HTTP 400 when it starts. Past the limit, a request with a
   new credential gets HTTP 431, and the proxy does not send or record it.
   A request with known credentials goes on. Start a new run to learn more.
+- Compressed bodies: the proxy asks the upstream for a body without a
+  content encoding. When the upstream sends `gzip`, `deflate`, or `br`
+  all the same, the proxy decodes the body before it redacts and records
+  it. It decodes 64 MiB at most. When the body does not decode, or when
+  it decodes to more than 64 MiB, the proxy does not record it. It
+  writes a log line, and the client gets the body as it came.
+- Bodies that are not text: a recording keeps such a body, such as
+  `application/octet-stream`, as base64. The proxy redacts the known
+  values in its bytes before it encodes it. Only the bytes of a known
+  value change, so a binary body stays binary. The client gets the same
+  bytes as a replay gives.
+- Credentials that the upstream makes: in a response body, the proxy also
+  redacts the value of each field that holds a credential that a server
+  mints, such as the token of an OAuth server. In JSON, only the fields
+  of the object at the top count, because a server puts a minted
+  credential there. In an `application/x-www-form-urlencoded` body, the
+  form fields count. The fields are `access_token`, `refresh_token`, `id_token`,
+  `session_token`, `auth_token`, and `client_secret`. A bare `token`
+  field counts only when its value starts like a credential: a GitHub
+  token (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`, or `github_pat_`), a JWT
+  (`eyJ` and two dots), or a Slack token (`xoxa-`, `xoxb-`, `xoxp-`,
+  `xoxr-`, or `xoxs-`). Model APIs use `token` for text, such as in log
+  probabilities, so the length alone never counts. The names compare
+  without case, `_`, and `-`, so `accessToken` is the same as
+  `access_token`.
+  - The list is short, and only the top of a JSON body counts, on
+    purpose. A model can repeat a part of its response in a later
+    request, such as the input of a tool call. A redacted value there
+    gives a new key, so the request misses on replay. So the proxy does
+    not redact a field such as `password` in a response, or a field at a
+    lower depth, or text in a string, such as `?access_token=` in a
+    command.
+  - A recording shows `<<redacted>>` in place of the value. A JSON body
+    stays valid JSON. The proxy also does this for a body that is valid
+    UTF-8 JSON when its content type is not JSON, or when it has none.
+    A recording keeps an `application/x-www-form-urlencoded` body as
+    text. The `location` header of a recording shows `<<redacted>>` for
+    each known value, and for each of these fields in its query and its
+    fragment, such as `#access_token=`. Other parameters do not change,
+    such as `keyword` or `pageToken`, so a replay can follow the redirect.
+  - A live response gives the client the real value, so the run can use
+    the credential in its next requests. From then on, the run also
+    redacts that value where it knows credentials, when it is 12
+    characters or longer. These values do not count toward the limit
+    above, because only a run that records gets them, from an upstream
+    that `allow` names.
+  - A replay gives `<<redacted>>` in place of the value. A client that
+    only sends the credential back in a header, such as `Authorization`,
+    replays without a change, because the key does not use that header.
+    A client that reads the credential, such as one that decodes a JWT
+    `id_token`, or that sends it in a body or a key header, does not work
+    on replay. Do not record such requests with a rule.
+- Credentials in a request body: a request sample and the text of a miss
+  in Sentry show `<<redacted>>` for the fields above, and also for
+  `bearer_token`, `client_assertion`, `password`, `api_key`,
+  `secret_key`, `private_key`, and `secret_access_key`. In JSON, these
+  fields count at each depth. In an `application/x-www-form-urlencoded`
+  body, the form fields count. No key uses this text, so this list can be
+  longer.
+- The proxy parses a JSON body to find the fields, so a long string value
+  cannot stop it. It does not find a field whose value is not a string,
+  such as an array, or a field in JSON text that is itself a string, such
+  as the escaped arguments of a tool call.
+- Keys: redaction never changes the key of a request. The key is the hash
+  of the request as the client sent it, so recordings from before stay
+  valid.
 
 Requests that match no rule go live without a change, and their responses
 stream. Each response has an `x-roach` header: `replayed`, `live`,
@@ -350,9 +418,10 @@ shows it.
   `_requests/<rule>/<hash>.json`. The sample has the text that the key
   hashes: the rule, the method, the URL, the key headers, and the body
   with `<<name>>` for each changing value. The proxy redacts credentials
-  in it, as in a recording, and the value of each credential query
-  parameter. It keeps the first 1,048,576 characters (UTF-16 code units)
-  of the text.
+  in it, as in a recording, the value of each credential query parameter,
+  and the value of each credential field of the body, such as
+  `client_secret` (see [Config](#config)). It keeps the first 1,048,576
+  characters (UTF-16 code units) of the text.
 - The hash of a sample is the place of the request: its session (test)
   and the number of requests of the rule that the session sent before
   it. So a sample is the last recorded request at the same place of the
