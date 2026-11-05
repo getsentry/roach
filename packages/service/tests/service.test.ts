@@ -806,11 +806,11 @@ describe("limits of the service", () => {
         },
       ],
     });
-    // 7 bodies of 4 MiB fit in the 32 MiB that the runs of one client can
+    // 3 bodies of 4 MiB fit in the 16 MiB that the runs of one client can
     // hold.
     const prompt = "a".repeat(4 * 1024 * 1024);
     const sent = Promise.allSettled(
-      Array.from({ length: 7 }, () => send(run.url, { prompt })),
+      Array.from({ length: 3 }, () => send(run.url, { prompt })),
     );
     const waits = await caWaitsUntil(sent);
     // The keys are made in a worker, so the service answers at once.
@@ -861,7 +861,7 @@ describe("limits of the service", () => {
     const results = await Promise.all(
       Array.from({ length: 12 }, () => send(reader.url, { prompt })),
     );
-    // The runs of one client can hold 32 MiB, 2 of these bodies. The bytes
+    // The runs of one client can hold 16 MiB, 1 of these bodies. The bytes
     // count when they come, so parts of more bodies can fill it.
     const busy = results.filter((result) => result.status === 503);
     expect(busy.length).toBeGreaterThanOrEqual(4);
@@ -872,10 +872,7 @@ describe("limits of the service", () => {
     }
     // The run goes on, and the bodies gave their bytes back.
     await expect(reader.stats()).resolves.toBeDefined();
-    const again = await Promise.all(
-      Array.from({ length: 2 }, () => send(reader.url, { prompt })),
-    );
-    expect(again.map((result) => result.status)).toEqual([412, 412]);
+    expect((await send(reader.url, { prompt })).status).toBe(412);
 
     // A client that declares large bodies and then stops holds only the
     // bytes that it sent.
@@ -942,12 +939,12 @@ describe("limits of the service", () => {
     await realWait(500);
     const small = 700 * 1024;
     expect(await answer(local.url, other, small)).toBe(412);
-    // The runs of the attacker can hold only 32 MiB, 2 of the bodies.
+    // The runs of the attacker can hold only 16 MiB, 1 of the bodies.
     await until(
-      () => stalls.filter(({ status }) => status() === 503).length >= 6,
+      () => stalls.filter(({ status }) => status() === 503).length >= 7,
     );
     const holders = stalls.filter(({ status }) => status() === 0);
-    expect(holders.length).toBeLessThanOrEqual(2);
+    expect(holders.length).toBeLessThanOrEqual(1);
 
     // A body that does not come in 30 s gets HTTP 408, and its tunnel
     // closes. Then the attacker has its part again.

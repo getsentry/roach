@@ -698,7 +698,7 @@ To see how well the cache works:
   run without the token. A control API body over 1 MiB gets HTTP 413
   before the service parses it.
 - The requests of all runs without the token can hold 128 MiB of bodies
-  at one time, and the runs of one client 32 MiB. The client of a run is
+  at one time, and the runs of one client 16 MiB. The client of a run is
   the client that started it, grouped as for the limit of runs. A request
   holds its body until it finishes, also while its key waits for the key
   worker. A request whose body does not fit gets HTTP 503 with
@@ -725,7 +725,8 @@ To see how well the cache works:
 - A gap: a client with an IPv6 /48 has 65,536 /64s, so it can open runs
   until the service has 100 runs without a token. Then other clients get
   HTTP 429 until its runs end. Its runs can also hold all of the budget of
-  bodies, for 30 s at a time.
+  bodies. A body gets HTTP 408 after 30 s, but the client can start the
+  next one at once, so it holds the budget for as long as it sends.
 - GCS deletes each recording 30 days after it was written, also when runs
   still replay it. Then `auto` mode records it again, and `replay` mode
   fails the request with HTTP 412.
