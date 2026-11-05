@@ -23,9 +23,8 @@
  * `missed` (`replay` mode had no recording), or `passthrough` (no rule
  * matched).
  *
- * Behind a load balancer, a connection can start with a PROXY protocol v1
- * header (`proxyProtocol`). It gives the address of the client
- * (`clientAddress()`).
+ * Request bodies and their shared budget are in `bodies.ts`. The PROXY
+ * protocol header and the address of the client are in `clients.ts`.
  */
 import { timingSafeEqual } from "node:crypto";
 import http from "node:http";
@@ -42,6 +41,14 @@ import type { CertificateAuthority } from "./certificates.ts";
 import { reportInternal } from "./errors.ts";
 import type { ProxyRequest, Recorder, Telemetry } from "./recorder.ts";
 import type { OpenedSession } from "@sentry/roach/types";
+import {
+  type BodyBudget,
+  type Held,
+  readBody,
+  readJson,
+  release,
+} from "./bodies.ts";
+import { acceptProxied } from "./clients.ts";
 
 /** Headers for one connection, which the proxy must not forward. */
 const HOP_HEADERS = new Set([
@@ -60,16 +67,12 @@ const AUTHORITY = /^(\[[0-9a-f:.]+\]|[a-z0-9.-]+):(\d{1,5})$/i;
  * has a smaller `maxBodyBytes`.
  */
 const MAX_BODY_BYTES = 64 * 1024 * 1024;
-/**
- * A control API body over this size gets HTTP 413. Anyone can call
- * `POST /runs`, so the service reads no more before it checks the token.
- */
-const MAX_CONTROL_BODY_BYTES = 1024 * 1024;
 /** A tunnel that sends no byte this long after its `200` closes. */
 const TUNNEL_FIRST_BYTE_MS = 10_000;
 /**
  * A tunnel that sends and gets no byte this long closes. A live model
- * call can take minutes before its first byte, so this is long.
+ * call can take minutes before its first byte, so this is long. Between
+ * two requests, Node closes the tunnel sooner (`keepAliveTimeout`, 5 s).
  */
 const TUNNEL_IDLE_MS = 10 * 60 * 1000;
 /**
@@ -81,75 +84,6 @@ const HTTP_OPTIONS: http.ServerOptions = {
   headersTimeout: 10_000,
   connectionsCheckingInterval: 1000,
 };
-/**
- * A PROXY protocol v1 header, such as
- * `PROXY TCP4 203.0.113.7 10.0.0.2 51234 443`. It is at most 107 bytes.
- * The first bytes of a connection must come in `PROXY_HEADER_MS`.
- */
-const PROXY_PREFIX = Buffer.from("PROXY ");
-const PROXY_HEADER =
-  /^PROXY (?:TCP[46] ([0-9A-Fa-f:.]+) [0-9A-Fa-f:.]+ \d{1,5} \d{1,5}|UNKNOWN[^\r\n]*)\r\n/;
-const MAX_PROXY_HEADER_BYTES = 107;
-const PROXY_HEADER_MS = 10_000;
-
-/** The address of the client of each connection with a PROXY header. */
-const proxiedClients = new WeakMap<Socket, string>();
-
-/**
- * The address of the client of a request. With `proxyProtocol`, it comes
- * from the PROXY header of the connection, when the connection has one.
- * Else it is the address of the socket.
- */
-export function clientAddress(incoming: http.IncomingMessage): string {
-  return (
-    proxiedClients.get(incoming.socket) ?? incoming.socket.remoteAddress ?? ""
-  );
-}
-
-/**
- * The group of a client address for the limit of runs for each client. An
- * IPv6 client often has a whole /64, so the group of an IPv6 address is
- * its /64, such as `2001:db8:0:1::/64`. An IPv4 address is its own group,
- * also in each IPv6 form, such as `::ffff:192.0.2.1`, `::ffff:c000:201`,
- * and `0:0:0:0:0:ffff:192.0.2.1`.
- */
-export function clientGroup(address: string): string {
-  if (isIP(address) !== 6) return address;
-  const groups = ipv6Groups(address);
-  if (
-    groups.slice(0, 5).every((group) => group === 0) &&
-    groups[5] === 0xffff
-  ) {
-    const [high = 0, low = 0] = groups.slice(6);
-    return [high >> 8, high & 0xff, low >> 8, low & 0xff].join(".");
-  }
-  return `${groups
-    .slice(0, 4)
-    .map((group) => group.toString(16))
-    .join(":")}::/64`;
-}
-
-/** The eight 16-bit groups of an IPv6 address. */
-function ipv6Groups(address: string): number[] {
-  // The URL parser writes each IPv6 form with hex groups only, such as
-  // `::ffff:c000:201`. A zone, such as `%eth0`, is not part of it.
-  const [head = "", tail] = new URL(
-    `http://[${address.split("%")[0]}]`,
-  ).hostname
-    .slice(1, -1)
-    .split("::");
-  const front = head ? head.split(":") : [];
-  const back = tail ? tail.split(":") : [];
-  const zeros = Array<string>(8 - front.length - back.length).fill("0");
-  return [...front, ...zeros, ...back].map((group) =>
-    Number.parseInt(group, 16),
-  );
-}
-
-/** An error that answers a request with its own status. */
-const httpError = (status: number, message: string) =>
-  Object.assign(new Error(message), { status });
-
 /** Parse the allowed origins, by origin. A value that is not one throws. */
 export function parseOrigins(values: string[]): Map<string, URL> {
   return new Map(
@@ -170,159 +104,6 @@ export function parseOrigins(values: string[]): Map<string, URL> {
 function authorityOf(origin: URL): string {
   const port = origin.port || (origin.protocol === "https:" ? "443" : "80");
   return `${origin.hostname}:${port}`;
-}
-
-/**
- * The bytes of request bodies that the requests of many targets can hold
- * at one time (`ProxyTarget.bodyBudget`). `used` counts the bodies of the
- * requests that did not finish, and `clients` counts them for each client
- * (`ProxyTarget.client`). One client can hold at most `perClient` bytes,
- * so it cannot take all of `max`. A body that takes longer than `readMs`
- * to come fails with HTTP 408 and gives its bytes back.
- */
-export interface BodyBudget {
-  max: number;
-  perClient: number;
-  readMs: number;
-  used: number;
-  clients: Map<string, number>;
-}
-
-/** The bytes that one request holds of its `BodyBudget`. */
-interface Held {
-  budget: BodyBudget | undefined;
-  client: string;
-  bytes: number;
-}
-
-/** Hold `bytes` more of the budget. Returns `false` when they do not fit. */
-function hold(held: Held, bytes: number): boolean {
-  const { budget, client } = held;
-  if (!budget) return true;
-  const ofClient = budget.clients.get(client) ?? 0;
-  if (budget.used + bytes > budget.max || ofClient + bytes > budget.perClient) {
-    return false;
-  }
-  budget.used += bytes;
-  budget.clients.set(client, ofClient + bytes);
-  held.bytes += bytes;
-  return true;
-}
-
-/** Give back all bytes that a request holds. */
-function release(held: Held): void {
-  const { budget, client, bytes } = held;
-  held.bytes = 0;
-  if (!budget || bytes === 0) return;
-  budget.used -= bytes;
-  const left = (budget.clients.get(client) ?? 0) - bytes;
-  if (left > 0) budget.clients.set(client, left);
-  else budget.clients.delete(client);
-}
-
-const busyError = () =>
-  httpError(
-    503,
-    "the service has too many large requests at this time. Send the request again later.",
-  );
-
-/**
- * Read a whole body. A body over `maxBytes` fails with HTTP 413. A body
- * that does not fit in the budget of `held` fails with HTTP 503, and one
- * that does not come in the `readMs` of the budget fails with HTTP 408.
- * Only request bodies have a limit: the client sends them, and a large
- * upstream response is not the fault of the client.
- */
-function readBody(
-  stream: http.IncomingMessage,
-  maxBytes = Infinity,
-  held: Held = { budget: undefined, client: "", bytes: 0 },
-): Promise<Buffer> {
-  const declared = Number(stream.headers["content-length"]);
-  if (declared > maxBytes) {
-    // Drop the body without a look at it, so it costs no memory.
-    stream.resume();
-    return Promise.reject(httpError(413, `body is over ${maxBytes} bytes`));
-  }
-  // Hold the bytes when they come, not the declared length. So a client
-  // that declares a large body and then sends nothing holds nothing.
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    let size = 0;
-    let failed = false;
-    const fail = (error: Error) => {
-      // Read the rest without keeping it, so the client gets the error.
-      failed = true;
-      chunks.length = 0;
-      clearTimeout(deadline);
-      reject(error);
-    };
-    // Node gives a whole request 300 s (`HTTP_OPTIONS`). That is too long
-    // to hold a part of the budget, so these bodies have a shorter limit.
-    const readMs = held.budget?.readMs;
-    const deadline =
-      readMs === undefined
-        ? undefined
-        : setTimeout(
-            () =>
-              fail(
-                httpError(408, `the body did not come in ${readMs / 1000} s`),
-              ),
-            readMs,
-          );
-    stream.on("data", (chunk: Buffer) => {
-      if (failed) return;
-      size += chunk.length;
-      if (size > maxBytes) {
-        fail(httpError(413, `body is over ${maxBytes} bytes`));
-      } else if (!hold(held, chunk.length)) {
-        fail(busyError());
-      } else {
-        chunks.push(chunk);
-      }
-    });
-    stream.on("end", () => {
-      clearTimeout(deadline);
-      resolve(Buffer.concat(chunks));
-    });
-    stream.on("error", (error: Error & { code?: string }) => {
-      clearTimeout(deadline);
-      // A client that closes its connection before its body came is not a
-      // failure of the proxy, so it does not go to Sentry. `method` is set
-      // only on a request, not on an upstream response.
-      const aborted = stream.method !== null && error.code === "ECONNRESET";
-      reject(aborted ? abortedError() : error);
-    });
-  });
-}
-
-/** The error of a request whose client closed it before its body came. */
-const abortedError = () =>
-  Object.assign(
-    httpError(400, "the client closed the request before its body came"),
-    { aborted: true },
-  );
-
-/**
- * Read a JSON object body of a control API call. A body over
- * `MAX_CONTROL_BODY_BYTES` fails with HTTP 413 before it is parsed. Any
- * other body that is not a JSON object fails with HTTP 400.
- */
-export async function readJson<T>(incoming: http.IncomingMessage): Promise<T> {
-  const text = (await readBody(incoming, MAX_CONTROL_BODY_BYTES)).toString(
-    "utf8",
-  );
-  let value: unknown;
-  try {
-    value = JSON.parse(text || "{}");
-  } catch {
-    throw httpError(400, "body is not JSON");
-  }
-  // Callers read fields, so `null`, a list, or a single value is a bad body.
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw httpError(400, "body is not a JSON object");
-  }
-  return value as T;
 }
 
 /** Compare tokens in constant time. */
@@ -613,54 +394,6 @@ function refuse(status: 403 | 407, outgoing: http.ServerResponse): void {
   outgoing.end(
     `Roach: ${status === 407 ? "proxy credentials required" : "forbidden"}\n`,
   );
-}
-
-/**
- * Read the PROXY protocol v1 header of a new connection, when it has one,
- * and keep the address of its client. Then give the connection to
- * `server`. A connection without the header keeps the address of its
- * socket. A header that is not valid closes the connection.
- *
- * The load balancer writes its header first, so a client cannot put a
- * header before it. Without a load balancer, a client can send its own
- * header. That changes only the address for the limit of runs for each
- * client.
- */
-function acceptProxied(socket: Socket, server: http.Server): void {
-  let read = Buffer.alloc(0);
-  const timer = setTimeout(() => socket.destroy(), PROXY_HEADER_MS);
-  const accept = (rest: Buffer) => {
-    socket.off("data", onData);
-    clearTimeout(timer);
-    socket.pause();
-    if (rest.length > 0) socket.unshift(rest);
-    server.emit("connection", socket);
-    socket.resume();
-  };
-  const onData = (chunk: Buffer) => {
-    read = Buffer.concat([read, chunk]);
-    const prefix = Math.min(read.length, PROXY_PREFIX.length);
-    if (!read.subarray(0, prefix).equals(PROXY_PREFIX.subarray(0, prefix))) {
-      accept(read);
-      return;
-    }
-    const end = read.indexOf("\r\n");
-    if (end < 0 || end + 2 > MAX_PROXY_HEADER_BYTES) {
-      if (end >= 0 || read.length >= MAX_PROXY_HEADER_BYTES) socket.destroy();
-      return;
-    }
-    const match = PROXY_HEADER.exec(read.subarray(0, end + 2).toString());
-    if (!match) {
-      socket.destroy();
-      return;
-    }
-    // `UNKNOWN`, such as from a health check, gives no address.
-    if (match[1] && isIP(match[1])) proxiedClients.set(socket, match[1]);
-    accept(read.subarray(end + 2));
-  };
-  socket.on("error", () => socket.destroy());
-  socket.on("close", () => clearTimeout(timer));
-  socket.on("data", onData);
 }
 
 /** Proxy one request through its target, and answer errors with 502. */

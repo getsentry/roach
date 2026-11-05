@@ -66,11 +66,11 @@ For metrics, use `-f dataset=tracemetrics`,
 | Pivot                       | Meaning                                    | Found In                          |
 | --------------------------- | ------------------------------------------ | --------------------------------- |
 | `roach.tenant`              | repository of the run                      | metrics, spans, errors            |
-| `roach.mode`                | `auto`, `replay`, `record`                 | metrics, spans, errors            |
+| `roach.mode`                | `auto`, `replay`, `record`, `off`          | metrics, spans, errors            |
 | `roach.rule`                | recording rule, such as `model`            | metrics, spans                    |
 | `roach.result`              | `replayed`, `live`, and others (see Words) | metrics, spans                    |
 | `roach.origin`              | upstream origin                            | metrics, spans                    |
-| `roach.reason`              | why the proxy refused a request            | `roach.request`                   |
+| `roach.reason`              | why the proxy refused a request            | `roach.request` metric and span   |
 | `roach.run.id`              | `name` of the run, else the service id     | spans, errors                     |
 | `roach.ci.run_id`           | `GITHUB_RUN_ID` of the run                 | spans, errors                     |
 | `roach.ci.job`              | `GITHUB_JOB` of the run                    | spans, errors                     |
