@@ -101,10 +101,14 @@ interface Places {
   explained: boolean;
 }
 
-/** A new recording, and the sample of its request. */
+/**
+ * A new recording, and the samples of its requests. A session can send the
+ * same request at more than one place, so one recording can have more than
+ * one sample.
+ */
 interface NewRecording {
   recording: Recording;
-  sample: [string, RequestSample];
+  samples: Array<[string, RequestSample]>;
 }
 
 interface Session extends Places {
@@ -267,7 +271,7 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
     // A sample only explains a later miss, so a failed write does not fail
     // the request or the session.
     await store
-      .write(recordings.map(([, { sample }]) => sample))
+      .write(recordings.flatMap(([, { samples }]) => samples))
       .catch((error: unknown) => {
         process.stderr.write(
           `[roach] Request samples were not written: ${(error as Error).message}\n`,
@@ -289,7 +293,12 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
     recording: NewRecording,
   ) => {
     if (owner && owner.passed === undefined) {
-      owner.recorded.set(key, recording);
+      // The last response wins, but each place keeps its sample.
+      const earlier = owner.recorded.get(key)?.samples ?? [];
+      owner.recorded.set(key, {
+        ...recording,
+        samples: [...earlier, ...recording.samples],
+      });
     } else if (owner?.passed === false) {
       drop([key]);
     } else {
@@ -508,7 +517,7 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
       if (!isTemporaryStatus(recording.response.status)) {
         await record(owner, key, {
           recording,
-          sample: [sample, toSample(key, redactedText())],
+          samples: [[sample, toSample(key, redactedText())]],
         });
       }
       const response = fromRecording(recording, keyed.values);

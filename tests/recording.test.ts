@@ -367,6 +367,25 @@ describe("recording", () => {
     ]);
   });
 
+  it("keeps a request sample for each place of a repeated request", async () => {
+    // The same request at two places of a test has one recording. Each
+    // place still gets its sample, so a later change at either place shows.
+    const recording = await start("auto");
+    await session(recording, [{ model: "same" }, { model: "same" }]);
+    await recording.close();
+    const samples = path.join(directory, TENANT, "_requests", "model");
+    expect(await readdir(samples)).toHaveLength(2);
+    expect(await files()).toHaveLength(1);
+
+    const running = await start("replay");
+    await session(running, [{ model: "changed" }]);
+    const [miss] = (await running.stats()).misses;
+    expect(miss!.change).toEqual({
+      file: expect.stringMatching(/^model\/[0-9a-f]{64}\.json$/),
+      at: expect.any(Number),
+    });
+  });
+
   it("keeps the first 1,048,576 characters of a request in its sample", async () => {
     // Object keys are sorted, so `c` comes after the long text.
     const long = "x".repeat(1024 * 1024);
