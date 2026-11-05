@@ -130,7 +130,9 @@ without it in `replay` mode. It runs `run` in bash with the proxy variables
 of the run, then ends the run and writes its stats to the job summary.
 
 - Only `run` uses the proxy. Later steps, such as cache and artifact
-  uploads, do not. `run` does not get the write token.
+  uploads, do not. `run` does not get the write token or the `ACTIONS_*`
+  variables of the runner, such as `ACTIONS_RUNTIME_TOKEN` and
+  `ACTIONS_ID_TOKEN_REQUEST_TOKEN`. So `run` cannot get an OIDC token.
 - `run` is one session. When it fails, the run drops its new recordings. A
   miss in `replay` mode fails the step. The summary names the job, not the
   test, of each miss. For a session per test, use
@@ -178,12 +180,13 @@ directory or the closest parent directory (`packages/roach/src/config.ts`):
 - `noProxy`: hosts that do not use the proxy. Default: loopback.
 
 The `name` of the run is `<GITHUB_RUN_ID>-<GITHUB_RUN_ATTEMPT>` in GitHub
-Actions.
+Actions. The run also sends `ci`: `GITHUB_RUN_ID`, `GITHUB_JOB`,
+`GITHUB_REPOSITORY`, and `GITHUB_REF`. Only the spans in Sentry use it.
 
 ## Config
 
 A run takes `RunConfig` (`packages/roach/src/types.ts`): `tenant`, `mode`, `rules`,
-`allow`, `name`, and `secrets`.
+`allow`, `name`, `secrets`, and `ci`.
 
 - `mode`: `auto` replays recordings and records misses. `replay` replays
   recordings and fails a miss with HTTP 412, so nothing goes live. `record`
@@ -401,63 +404,84 @@ config is `RoachServiceConfig` in `packages/service/src/service.ts`. `deploy/gcp
   - The key of a request has a time limit (`request-key.ts`), so a slow
     pattern fails only its own request.
 - **Sentry.** With `sentryDsn`, each read and write of a recording sends
-  a span to Sentry. Each proxied request sends a span and metrics. See
-  [Sentry](#sentry).
+  a span to Sentry. Each proxied request sends a span and metrics. Each
+  unexpected error sends an error event. See [Sentry](#sentry).
+- **Errors.** An error that is the fault of the client, such as HTTP 400,
+  409, 413, or 429, keeps its message. Any other error, such as a failure
+  of the upstream or of GCS, gets HTTP 502 for a proxied request or HTTP
+  500 for a control call. Its text is only `internal error, Sentry event
+  <id>`, because the message of the error can have a response body. Only
+  Sentry gets the error. The service log gets its class and HTTP status.
 - **Certificate authority.** `ca` holds the PEM certificate and key that
   clients trust. Keep it across restarts. Host certificates live for 7
   days, and the service makes new ones before they expire.
 
 ### Sentry
 
-With `sentryDsn`, the service sends metrics and spans to Sentry. It keeps
-all traces. Metrics have only attributes with few values: `tenant`, `mode`,
-`rule`, `origin`, and `result`. Spans also have `run` (the `name` of the
-run) and `key`.
+With `sentryDsn`, the service sends metrics, spans, and unexpected errors
+to Sentry. It keeps all traces. `TELEMETRY.md` has the queries. Each
+attribute of Roach starts with `roach.`. Metrics have only attributes with
+few values: `roach.tenant`, `roach.mode`, `roach.rule`, `roach.origin`,
+`roach.result`, and `roach.reason`.
 
-| Metric                   | Type              | Value                                                                                                                                                |
-| ------------------------ | ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `roach.request`          | counter           | 1 for each proxied request. `result` is the `x-roach` header: `replayed`, `live`, `missed`, or `passthrough`. A `passthrough` request has no `rule`. |
-| `roach.request.duration` | distribution (ms) | The time to answer a request that a rule records, by `result`.                                                                                       |
-| `roach.recording.write`  | counter           | Recordings by `rule`. `result` is `written` (the proxy sent them to the store) or `dropped` (their session failed).                                  |
+| Metric                   | Type              | Value                                                                                                                                                                                                                                                |
+| ------------------------ | ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `roach.request`          | counter           | 1 for each proxied request. `roach.result` is `replayed`, `live`, `missed`, `passthrough`, or `refused`. A `passthrough` or `refused` request has no `roach.rule`. A `refused` request has `roach.reason`, and `other` for an origin not in `allow`. |
+| `roach.request.duration` | distribution (ms) | The time to answer a request that a rule records, by `roach.result`.                                                                                                                                                                                 |
+| `roach.recording.write`  | counter           | Recordings by `roach.rule`. `roach.result` is `written` (the proxy sent them to the store) or `dropped` (their session failed).                                                                                                                      |
 
-Each proxied request is one trace. Each span has `tenant`, `mode`, and
-`run`.
+Each proxied request is one trace. Each span has `roach.tenant`,
+`roach.mode`, `roach.run.id` (the `name` of the run, else its id), and the
+`roach.ci.*` attributes of the CI job of the run: `roach.ci.run_id`,
+`roach.ci.job`, `roach.ci.repo`, and `roach.ci.ref`.
 
-- `roach.run.start`: a new run, with `write` (the run has the write token).
+- `roach.run.start`: a new run, with `roach.write` (the run has the write
+  token).
 - `roach.request`: one proxied request, named `<method> <origin>`, with
-  `origin`, `rule`, `result`, and `http.response.status_code`. When a
-  replayed or live response has token usage, the span also has the
-  `gen_ai` attributes of the model call (`usage.ts`). Sentry then
-  calculates its cost in USD as `gen_ai.cost.total_tokens`. It contains:
-  - `roach.key`: the key of the request, with `rule` and `key`.
-  - `roach.store.read`: a read of a recording, with `key` and `result`:
-    `hit` or `miss`.
-  - `roach.upstream`: the live request, with `origin` and
+  `roach.origin`, `roach.rule`, `roach.result`, `roach.session` (the name
+  of the session, such as the test), and `http.response.status_code`. A
+  refused request also has `roach.reason`. When a replayed or live
+  response has token usage, the span also has the `gen_ai` attributes of
+  the model call (`usage.ts`). Sentry then calculates its cost in USD as
+  `gen_ai.cost.total_tokens`. It contains:
+  - `roach.key`: the key of the request, with `roach.rule` and
+    `roach.key`.
+  - `roach.store.read`: a read of a recording, with `roach.key` and
+    `roach.result`: `replayed` (the store has the recording) or `missed`.
+  - `roach.upstream`: the live request, with `roach.origin` and
     `http.response.status_code`.
-- `roach.store.write`: a write of recordings, with `recordings` and
-  `written`. A session writes when it ends, so this span is usually its
-  own trace.
+- `roach.store.write`: a write of recordings, with `roach.recordings` and
+  `roach.written`. A session writes when it ends, so this span is usually
+  its own trace.
+- `roach.run.end`: the end of a run, with its totals: `roach.replayed`,
+  `roach.live`, `roach.missed`, `roach.passthrough`, `roach.refused`,
+  `roach.written`, `roach.dropped`, and `roach.run.duration_ms`.
 
-Telemetry never has a credential, a body, or the path or query of a URL.
-From a model call, it has only the model name and the token counts.
+An error event has the tags of the spans of its run. An error of the
+control API has no run tags.
+
+Spans never have a credential, a body, or the path or query of a URL.
+From a model call, they have only the model name and the token counts.
 So the service turns off the request data and the HTTP spans of the SDK,
-and it adds no trace headers to the requests that it sends.
+removes the path from the name of an error event, and adds no trace
+headers to the requests that it sends. An error event has the message of
+the error, which can have a response body.
 
 To see how well the cache works:
 
-- **Hit rate.** Sum `roach.request`, group by `result`, and filter by
-  `tenant` and `rule`. The hit rate is `replayed / (replayed + live +
-  missed)`.
+- **Hit rate.** Sum `roach.request`, group by `roach.result`, and filter
+  by `roach.tenant` and `roach.rule`. The hit rate is `replayed / (replayed
+  - live + missed)`.
 - **Misses.** `missed` is a request that failed in `replay` mode. `live`
   in `auto` mode is a new recording. When `live` stays high from run to
   run, a value in the key changes on each run.
 - **Time.** Compare `roach.request.duration` for `live` and `replayed`.
-- **Dropped.** `roach.recording.write` with `result:dropped` counts
+- **Dropped.** `roach.recording.write` with `roach.result:dropped` counts
   recordings of failed sessions. The next run sends these requests live
   again.
 - **Changing keys.** Search spans for `span.op:roach.key`, group by
-  `key`, and count the runs. A key that only one run uses shows that a
-  value changes on each run.
+  `roach.key`, and count the runs. A key that only one run uses shows that
+  a value changes on each run.
 
 ### Limits
 
@@ -581,7 +605,8 @@ The calls of a run are under `/__roach/runs/<id>`. They need
   you to deploy a newer service.
 - `POST /session/end` with `{"name": "...", "passed": true}`: end it.
   Returns `{"missed": 0}`, the misses that `replay` mode failed. Returns
-  HTTP 409 when the session is not open.
+  HTTP 409 when the session is not open, and HTTP 500 when the store fails
+  (see "Errors" in [Service](#service)).
 - `GET /stats`: the totals of the run.
 
 The service also has:
