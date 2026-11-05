@@ -51,7 +51,8 @@ and to the job summary. After you add Roach, do the check in
 A project that has its own global setup calls `startRoach(project)` from
 `@sentry/roach/vitest` in it, and returns its teardown.
 
-- It needs Node 24.14 or later (`http.setGlobalProxyFromEnv`).
+- It needs Node 24.14 or later (`http.setGlobalProxyFromEnv`), except in
+  `off` mode.
 - Put `@sentry/roach/vitest/setup` before a setup file that starts an HTTP
   mock, such as MSW or nock. The setup file keeps the request functions of
   `node:http` and `node:https` as it loads, so its calls to the service do

@@ -44,9 +44,6 @@ declare module "vitest" {
 export async function startRoach(
   project: Pick<TestProject, "provide">,
 ): Promise<() => Promise<void>> {
-  if (typeof http.setGlobalProxyFromEnv !== "function") {
-    throw new Error("Roach needs Node 24.14 or later for vitest");
-  }
   const token = readEnv("ROACH_TOKEN");
   delete process.env.ROACH_TOKEN;
   const file = await readRoachFile();
@@ -54,6 +51,10 @@ export async function startRoach(
   if (config.mode === "off") {
     project.provide("roach", null);
     return async () => {};
+  }
+  // Only a run needs it, so `off` mode works on older Node too.
+  if (typeof http.setGlobalProxyFromEnv !== "function") {
+    throw new Error("Roach needs Node 24.14 or later for vitest");
   }
   const noProxy = file.noProxy ?? "localhost,127.0.0.1,::1";
   const run = await startRemoteRun(
