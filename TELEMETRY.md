@@ -3,8 +3,9 @@
 Use this file to answer questions about Roach from its Sentry data. Examples:
 "how many requests replayed?", "why does this run miss?", and "how much time
 do recordings save?". "Sentry" in `README.md` lists the metrics, spans, and
-errors. The code in `packages/service/src/service.ts` and
-`packages/service/src/recorder.ts` is authoritative.
+errors. The code in `packages/service/src/service.ts`,
+`packages/service/src/server.ts`, and `packages/service/src/recorder.ts` is
+authoritative.
 
 ## Where To Query
 
@@ -63,29 +64,33 @@ For metrics, use `-f dataset=tracemetrics`,
 
 ## Pivots
 
-| Pivot                       | Meaning                                    | Found In                          |
-| --------------------------- | ------------------------------------------ | --------------------------------- |
-| `roach.tenant`              | repository of the run                      | metrics, spans, errors            |
-| `roach.mode`                | `auto`, `replay`, `record`, `off`          | metrics, spans, errors            |
-| `roach.rule`                | recording rule, such as `model`            | metrics, spans                    |
-| `roach.result`              | `replayed`, `live`, and others (see Words) | metrics, spans                    |
-| `roach.origin`              | upstream origin                            | metrics, spans                    |
-| `roach.reason`              | why the proxy refused a request            | `roach.request` metric and span   |
-| `roach.run.id`              | `name` of the run, else the service id     | spans, errors                     |
-| `roach.ci.run_id`           | `GITHUB_RUN_ID` of the run                 | spans, errors                     |
-| `roach.ci.job`              | `GITHUB_JOB` of the run                    | spans, errors                     |
-| `roach.ci.repo`             | `GITHUB_REPOSITORY` of the run             | spans, errors                     |
-| `roach.ci.ref`              | `GITHUB_REF` of the run                    | spans, errors                     |
-| `roach.session`             | session (test) name of a request           | `roach.request`                   |
-| `roach.key`                 | recording key of a request                 | `roach.key`, `roach.store.read`   |
-| `roach.write`               | the run has the write token (boolean)      | `roach.run.start`                 |
-| `http.response.status_code` | status to the client                       | `roach.request`, `roach.upstream` |
-| `gen_ai.request.model`      | model of a model call                      | `roach.request`                   |
-| `miss.sample`               | `found`, `withheld`, or `none` for a miss  | `roach.request`                   |
-| `miss.changed_at`           | offset of the change of a miss             | `roach.request`                   |
-| `miss.compared`             | recording key of a miss change             | `roach.request`                   |
-| `miss.recorded`             | recorded text of a miss change             | `roach.request`                   |
-| `miss.request`              | sent text of a miss change                 | `roach.request`                   |
+| Pivot                       | Meaning                                          | Found In                             |
+| --------------------------- | ------------------------------------------------ | ------------------------------------ |
+| `roach.tenant`              | repository of the run                            | metrics, spans, errors               |
+| `roach.mode`                | `auto`, `replay`, `record`, `off`                | metrics, spans, errors               |
+| `roach.rule`                | recording rule, such as `model`                  | metrics, spans                       |
+| `roach.result`              | `replayed`, `live`, and others (see Words)       | metrics, spans                       |
+| `roach.origin`              | upstream origin                                  | metrics, spans                       |
+| `roach.reason`              | why the proxy refused a request                  | `roach.request` metric and span      |
+| `roach.run.id`              | `name` of the run, else the service id           | spans, errors                        |
+| `roach.ci.run_id`           | `GITHUB_RUN_ID` of the run                       | spans, errors                        |
+| `roach.ci.job`              | `GITHUB_JOB` of the run                          | spans, errors                        |
+| `roach.ci.repo`             | `GITHUB_REPOSITORY` of the run                   | spans, errors                        |
+| `roach.ci.ref`              | `GITHUB_REF` of the run                          | spans, errors                        |
+| `roach.session`             | session (test) name of a request                 | `roach.request`                      |
+| `roach.key`                 | recording key of a request                       | `roach.key`, `roach.store.read`      |
+| `roach.write`               | the run has the write token (boolean)            | `roach.run.start`                    |
+| `roach.recordings`          | files that one write sends to the store          | `roach.store.write`                  |
+| `roach.written`             | files that were new or changed                   | `roach.store.write`, `roach.run.end` |
+| `http.request.method`       | method of the request                            | `roach.request`, `roach.upstream`    |
+| `http.response.status_code` | status to the client                             | `roach.request`, `roach.upstream`    |
+| `gen_ai.request.model`      | model that a model call asked for                | `roach.request`                      |
+| `gen_ai.response.model`     | model of the response, when the request has none | `roach.request`                      |
+| `miss.sample`               | `found`, `withheld`, or `none` for a miss        | `roach.request`                      |
+| `miss.changed_at`           | offset of the change of a miss                   | `roach.request`                      |
+| `miss.compared`             | recording key of a miss change                   | `roach.request`                      |
+| `miss.recorded`             | recorded text of a miss change                   | `roach.request`                      |
+| `miss.request`              | sent text of a miss change                       | `roach.request`                      |
 
 A metric for a `notAllowed` request has `roach.origin:other`, because the
 client picks that origin. Its span has the origin.
@@ -153,6 +158,15 @@ tests send the same live requests again on the next run.
 ```bash
 sentry explore sentry/roach --dataset metrics --metric roach.recording.write \
   --agg sum --period 24h -F roach.rule -F roach.result
+```
+
+Keys that change on each run. A key that only one run uses shows that a
+value changes on each run. Add `-F roach.run.id` to see the runs.
+
+```bash
+sentry explore sentry/roach --dataset spans --period 24h \
+  -q 'span.op:roach.key roach.tenant:getsentry/junior' -F roach.rule \
+  -F roach.key -F 'count()' -s 'count()'
 ```
 
 Runs with the most live requests. When the same tests stay live from run to
@@ -242,7 +256,7 @@ Spent and saved, by rule and model.
 ```bash
 sentry explore sentry/roach --dataset spans --period 24h \
   -q 'span.op:roach.request has:gen_ai.usage.input_tokens' \
-  -F roach.result -F roach.rule -F gen_ai.request.model \
+  -F roach.result -F roach.rule -F gen_ai.request.model -F gen_ai.response.model \
   -F 'sum(gen_ai.cost.total_tokens)' -F 'sum(gen_ai.usage.input_tokens)' \
   -F 'sum(gen_ai.usage.output_tokens)' -F 'count()'
 ```
@@ -275,8 +289,8 @@ and the next run makes it again. Compare `roach.recording.write` with
   metric does not count samples.
 - An error event has the message of the error. The message can have the
   body of a GCS response. Only Sentry gets it. The client gets only the id
-  of the event. The service log gets the id, the class, and the HTTP status
-  of the error.
+  of the event. The service log gets the id of the event, and the class,
+  the code, and the HTTP status of the error.
 - An error of the control API, such as a failed write at the end of a
   session, has no `roach.*` tags.
 - Cost is on spans only, not on metrics.

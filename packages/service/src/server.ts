@@ -70,11 +70,12 @@ const MAX_BODY_BYTES = 64 * 1024 * 1024;
 /** A tunnel that sends no byte this long after its `200` closes. */
 const TUNNEL_FIRST_BYTE_MS = 10_000;
 /**
- * A tunnel that sends and gets no byte this long closes. A live model
- * call can take minutes before its first byte, so this is long. Between
- * two requests, Node closes the tunnel sooner (`keepAliveTimeout`, 5 s).
+ * A connection or tunnel that sends and gets no byte this long closes. A
+ * live model call can take minutes before its first byte, so this is long.
+ * Between two requests, Node closes the connection sooner
+ * (`keepAliveTimeout`, 5 s, and 1 s that Node adds).
  */
-const TUNNEL_IDLE_MS = 10 * 60 * 1000;
+const IDLE_MS = 10 * 60 * 1000;
 /**
  * The HTTP servers of the proxy. Headers that do not come in 10 s get
  * HTTP 408 from Node. A whole request, with its body, has Node's default
@@ -520,6 +521,11 @@ export async function listenProxy(
     }
     serveProxied(tunnel, incoming, outgoing, tunnel.origin);
   });
+  // Between two requests, Node sets the time limit of a socket to its
+  // `keepAliveTimeout`, and at the next request back to `timeout`. With
+  // the default `timeout` of 0, a later request in a tunnel without TLS
+  // had no idle limit. A TLS tunnel also keeps the limit of its raw socket.
+  tunnelServer.timeout = IDLE_MS;
   const server = http.createServer(HTTP_OPTIONS, (incoming, outgoing) => {
     // A request to the proxy itself has a path. A proxied plain HTTP
     // request has an absolute URL.
@@ -550,6 +556,10 @@ export async function listenProxy(
   const listener = options.proxyProtocol
     ? net.createServer((socket) => acceptProxied(socket, server))
     : server;
+  // Node's `requestTimeout` stops when a request is read. Without this, a
+  // request that waits on a hung upstream, or a client that does not read
+  // its response, holds the connection with no limit.
+  server.timeout = IDLE_MS;
   listener.on("connection", (socket: Socket) => {
     sockets.add(socket);
     socket.on("close", () => sockets.delete(socket));
@@ -597,7 +607,7 @@ export async function listenProxy(
       }
       socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
       // A tunnel that a client leaves open must not stay open forever.
-      socket.setTimeout(TUNNEL_IDLE_MS, () => socket.destroy());
+      socket.setTimeout(IDLE_MS, () => socket.destroy());
       const open = async (first: Buffer) => {
         socket.unshift(first);
         // A TLS handshake starts with byte 0x16. Anything else is plain HTTP.

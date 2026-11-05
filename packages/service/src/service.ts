@@ -21,8 +21,9 @@
  *   service. Two checks keep that safe for the other tenants. The proxy
  *   sends requests only to public addresses (`addresses.ts`), so a run
  *   cannot reach the metadata server or the VPC. The key of a request has
- *   a time limit, and it is made in a worker thread (`key-worker.ts`), so
- *   a slow pattern fails only its own request.
+ *   a time limit, and the keys of runs without the token are made in a
+ *   worker process (`key-worker.ts`), so a slow pattern fails only its own
+ *   request.
  * - The recordings of a tenant are under `<tenant>/`, in a directory or a
  *   GCS bucket (`gcs.ts`). Tenants never share recordings, because a key
  *   does not include credentials.
