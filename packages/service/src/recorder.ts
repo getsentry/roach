@@ -42,7 +42,7 @@ import {
   type JobError,
   type JobOptions,
 } from "./key-worker.ts";
-import { keyTimeLimit, type KeyedRequest } from "./request-key.ts";
+import { keyRequest, keyTimeLimit, type KeyedRequest } from "./request-key.ts";
 import {
   createSecrets,
   redactUrl,
@@ -70,8 +70,10 @@ import type {
   RefusalReason,
 } from "@sentry/roach/types";
 import {
+  canBeKnown,
   fillValues,
   templateValues,
+  withTimeLimit,
   type RequestValues,
 } from "@sentry/roach/values";
 
@@ -345,11 +347,20 @@ export interface WorkLimit {
    * with HTTP 400. Its key does not change.
    */
   maxValues: number;
+  /**
+   * The most values in `known` of all sessions of the run, and their
+   * characters. A request that would add more fails with HTTP 400, and
+   * the run ends. The values stay, so no key changes.
+   */
+  maxKnown: { values: number; chars: number };
   /** The time of all jobs of the run, in ms. Past it, the run ends. */
   totalMs: number;
   /**
-   * Set for a run without a token. A key that goes past its time limit
-   * ends the run. The jobs of the run go after the jobs of other runs.
+   * Set for a run without a token. Its keys and the redaction of its
+   * misses run in the key worker, and a key that goes past its time limit
+   * ends the run. A run with the token does them on the main thread, as
+   * before the worker, so the memory limit of the worker fails none of
+   * its requests.
    */
   untrusted: boolean;
 }
@@ -371,11 +382,54 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
   const { workLimit } = config;
   let closed = false;
   let workMs = 0;
+  /** The values in `known` of all sessions, and their characters. */
+  const knownTotal = { values: 0, chars: 0 };
+  /** Clear `known` of a session. */
+  const forget = (session: Session) => {
+    knownTotal.values -= session.known.size;
+    for (const value of session.known.keys()) {
+      knownTotal.chars -= value.length;
+    }
+    session.known.clear();
+  };
+  /**
+   * Add the values of a request to `known` of its session. A value that
+   * `canBeKnown()` refuses stays out: before, it failed each later request
+   * of the session, so no key changes. Past `workLimit.maxKnown`, it adds
+   * nothing, ends the run, and throws an error with HTTP status 400.
+   */
+  const remember = (session: Session, values: RequestValues) => {
+    const added = new Map<string, string>();
+    let chars = 0;
+    for (const [name, list] of values) {
+      for (const value of list) {
+        if (session.known.has(value) || added.has(value)) continue;
+        if (!canBeKnown(value)) continue;
+        added.set(value, name);
+        chars += value.length;
+      }
+    }
+    const { maxKnown } = workLimit;
+    if (
+      knownTotal.values + added.size > maxKnown.values ||
+      knownTotal.chars + chars > maxKnown.chars
+    ) {
+      if (!closed) config.endRun("its sessions have too many changing values");
+      throw Object.assign(
+        new Error(
+          `the sessions of this run have over ${maxKnown.values} changing values or ${maxKnown.chars} characters of them. This run has ended.`,
+        ),
+        { status: 400 },
+      );
+    }
+    for (const [value, name] of added) session.known.set(value, name);
+    knownTotal.values += added.size;
+    knownTotal.chars += chars;
+  };
   /** The options of a job of `bytes` bytes in the key worker. */
   const jobOptions = (bytes: number): JobOptions => ({
     timeLimitMs: Math.min(workLimit.maxJobMs, keyTimeLimit(bytes)),
     maxValues: workLimit.maxValues,
-    first: !workLimit.untrusted,
     skip: () => closed,
   });
   /** Count the time of a job. Past `workLimit.totalMs`, end the run. */
@@ -549,7 +603,7 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
     ended.passed = passed;
     const recorded = [...ended.recorded];
     ended.recorded.clear();
-    ended.known.clear();
+    forget(ended);
     if (passed) await write(recorded);
     else drop(recorded.map(([key]) => key));
     return ended.missed;
@@ -637,33 +691,52 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
       const { keyed, key } = await telemetry.span(
         { op: "roach.key", attributes: { "roach.rule": rule.name } },
         async () => {
-          const result = await keyInWorker(
-            rule,
-            {
-              method: request.method,
-              url: request.url.href,
-              headers: request.headers,
-              body: request.body.toString("utf8"),
-            },
-            owner?.known,
-            jobOptions(request.body.length),
-          ).catch((error: JobError) => {
-            countWork(error.ms);
-            if (error.timedOut && workLimit.untrusted && !closed) {
-              config.endRun("a key went past its time limit");
-              error.message += " This run has ended.";
-            }
-            throw error;
-          });
-          countWork(result.ms);
-          const name = recordingKey(rule.name, result.value.key);
+          const toKey = {
+            method: request.method,
+            url: request.url.href,
+            headers: request.headers,
+            body: request.body.toString("utf8"),
+          };
+          const options = jobOptions(request.body.length);
+          const value = workLimit.untrusted
+            ? await keyInWorker(rule, toKey, owner?.known, options).then(
+                (result) => {
+                  countWork(result.ms);
+                  return result.value;
+                },
+                (error: JobError) => {
+                  countWork(error.ms);
+                  if (error.timedOut && !closed) {
+                    config.endRun("a key went past its time limit");
+                    error.message += " This run has ended.";
+                  }
+                  throw error;
+                },
+              )
+            : keyRequest(
+                rule,
+                toKey,
+                owner?.known,
+                options.timeLimitMs,
+                options.maxValues,
+              );
+          const name = recordingKey(rule.name, value.key);
           telemetry.annotate({ "roach.key": name });
-          return { keyed: result.value, key: name };
+          return { keyed: value, key: name };
         },
       );
       /** The redacted text of the key, or `undefined` past the time limit. */
-      const redactedText = () =>
-        redactInWorker(
+      const redactedText = async (): Promise<string | undefined> => {
+        if (!workLimit.untrusted) {
+          try {
+            return withTimeLimit(keyTimeLimit(keyed.text.length), () =>
+              secrets.redactRequest(keyed.text, request, rule),
+            );
+          } catch {
+            return undefined;
+          }
+        }
+        return redactInWorker(
           secrets.list(),
           keyed.text,
           toRedact(request, rule),
@@ -678,15 +751,10 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
             return undefined;
           },
         );
-      // A session remembers every value, also after it ends. A limit here
-      // would change the keys of later requests that repeat a value.
-      if (owner) {
-        for (const [name, list] of keyed.values) {
-          for (const value of list) {
-            if (!owner.known.has(value)) owner.known.set(value, name);
-          }
-        }
-      }
+      };
+      // A session remembers every value of its requests. A value that it
+      // dropped would change the keys of later requests that repeat it.
+      if (owner) remember(owner, keyed.values);
       const report = (result: ResponseSource, response?: ProxyResponse) => {
         const attributes = {
           "roach.rule": rule.name,
@@ -838,6 +906,7 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
       );
       const extra = ended.length - MAX_ENDED_SESSIONS + 1;
       for (const old of ended.slice(0, Math.max(0, extra))) {
+        forget(old);
         sessions.delete(old.id);
       }
       const id = randomBytes(8).toString("hex");

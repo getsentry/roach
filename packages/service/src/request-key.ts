@@ -8,9 +8,9 @@
  * `<<name>>` in the key (`@sentry/roach/values`).
  *
  * The patterns of `values` come from the client, and all runs share one
- * process. A slow pattern would block every run. So the service makes keys
- * in a worker thread (`key-worker.ts`), and a key has a time limit
- * (`keyTimeLimit()`).
+ * process. A slow pattern would block every run. So a key has a time
+ * limit (`keyTimeLimit()`), and the service makes the keys of runs without
+ * the token in a worker process (`key-worker.ts`).
  */
 import { createHash } from "node:crypto";
 import type { IncomingHttpHeaders } from "node:http";
@@ -65,19 +65,30 @@ export interface KeyedRequest {
   values: RequestValues;
 }
 
-/** JSON with sorted object keys, so equal bodies give equal keys. */
-function stableStringify(value: unknown): string {
+/**
+ * JSON with sorted object keys, so equal bodies give equal keys. A value
+ * in `replace` is written as its string instead.
+ */
+function stableStringify(
+  value: unknown,
+  replace?: ReadonlyMap<object, string>,
+): string {
   if (value === null || typeof value !== "object") {
     return JSON.stringify(value);
   }
+  const replaced = replace?.get(value);
+  if (replaced !== undefined) return JSON.stringify(replaced);
   if (Array.isArray(value)) {
-    return `[${value.map(stableStringify).join(",")}]`;
+    return `[${value.map((item) => stableStringify(item, replace)).join(",")}]`;
   }
   const entries = Object.entries(value as Record<string, unknown>)
     .filter(([, item]) => item !== undefined)
     .toSorted(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
   return `{${entries
-    .map(([key, item]) => `${JSON.stringify(key)}:${stableStringify(item)}`)
+    .map(
+      ([key, item]) =>
+        `${JSON.stringify(key)}:${stableStringify(item, replace)}`,
+    )
     .join(",")}}`;
 }
 
@@ -108,11 +119,18 @@ function normalizeJson(
   maxValues: number,
 ): { text: string; values: RequestValues } {
   const thinking: string[] = [];
+  // The mark of each thinking block, numbered in the order of the body.
+  // The text gets the mark in place of the block, without a copy of the
+  // body, because a copy of a large body needs hundreds of MiB.
+  const marks = new Map<object, string>();
   // The values of thinking blocks count toward `maxValues` too.
   let left = maxValues;
-  const mark = (value: unknown): unknown => {
-    if (Array.isArray(value)) return value.map(mark);
-    if (value === null || typeof value !== "object") return value;
+  const mark = (value: unknown): void => {
+    if (value === null || typeof value !== "object") return;
+    if (Array.isArray(value)) {
+      for (const item of value) mark(item);
+      return;
+    }
     const record = value as Record<string, unknown>;
     if (THINKING_BLOCK_TYPES.has(String(record.type))) {
       const block = extractValues(
@@ -123,14 +141,14 @@ function normalizeJson(
       );
       for (const list of block.values.values()) left -= list.length;
       thinking.push(block.text);
-      return `\uE000${thinking.length - 1}`;
+      marks.set(record, `\uE000${thinking.length - 1}`);
+      return;
     }
-    return Object.fromEntries(
-      Object.entries(record).map(([name, item]) => [name, mark(item)]),
-    );
+    for (const item of Object.values(record)) mark(item);
   };
+  mark(json);
   const { text, values } = extractValues(
-    stableStringify(mark(json)),
+    stableStringify(json, marks),
     patterns,
     known,
     left,
