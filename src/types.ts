@@ -29,8 +29,13 @@ export interface RecordingRule {
   match: {
     /** The method, such as `POST`. */
     method?: string;
-    /** The start of the URL, such as `https://ai-gateway.vercel.sh/`. */
-    url?: string;
+    /**
+     * The start of the URL, such as `https://ai-gateway.vercel.sh/`. A list
+     * matches a URL that starts with one of its prefixes, so one rule can
+     * record the same API on many hosts. The key does not use `match`, so a
+     * string and a list with that string give the same keys.
+     */
+    url?: string | string[];
     /** Header values. Names are lowercase. */
     headers?: Record<string, string>;
   };

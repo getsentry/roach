@@ -145,11 +145,17 @@ directory or the closest parent directory (`src/config.ts`):
 
 ```json
 {
-  "allow": ["https://api.anthropic.com"],
+  "allow": ["https://api.anthropic.com", "https://openrouter.ai"],
   "rules": [
     {
       "name": "model",
-      "match": { "method": "POST", "url": "https://api.anthropic.com/v1/" },
+      "match": {
+        "method": "POST",
+        "url": [
+          "https://api.anthropic.com/v1/",
+          "https://openrouter.ai/api/v1/"
+        ]
+      },
       "values": {
         "uuid": { "builtin": "uuid" },
         "build": "build-[0-9]+"
@@ -189,10 +195,15 @@ A run takes `RunConfig` (`src/types.ts`): `tenant`, `mode`, `rules`,
   requests only to public addresses, so an origin that resolves to a
   private, loopback, or link-local address also gets HTTP 403.
 - `rules`: the traffic to record. `name` uses letters, digits, `_`, `.`,
-  and `-`. `match` has `method`, `url` (a prefix),
-  and `headers`. `keyHeaders` adds request headers to the key. `values`
-  names the values that change from run to run. A run can have 64 rules,
-  and a rule can have 32 values.
+  and `-`. `match` has `method`, `url`, and `headers`. `url` is a prefix,
+  or a list of 1 to 32 prefixes. A URL that starts with one of them
+  matches. Use a list when the same API is on many hosts, such as one
+  rule with the same `values` for Anthropic, OpenRouter, and OpenAI. The
+  key does not use `match`, so a change to `url` keeps the keys. When you
+  merge rules into one rule, some keys get a new rule name, so their
+  requests record again one time. `keyHeaders` adds request headers to
+  the key. `values` names the values that change from run to run. A run
+  can have 64 rules, and a rule can have 32 values.
 - Credentials: the proxy never writes the `secrets` of the service config
   or of the run. Use `secrets` of the run for the credentials of a CI job
   that a response can show but no request header has, such as a token that
@@ -210,7 +221,7 @@ stream. Each response has an `x-roach` header: `replayed`, `live`,
 ## Recordings
 
 The key of a recording is `<rule>/<hash>.json`, under `<tenant>/` in the
-store. The hash is the hash of the rule, the method, the URL, the key
+store. The hash is the hash of the rule name, the method, the URL, the key
 headers, and the body. A JSON body has sorted keys. A recording keeps the
 response and the session that recorded it. It does not keep the request
 body.

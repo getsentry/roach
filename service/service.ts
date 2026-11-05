@@ -133,6 +133,7 @@ const MAX_RUN_NAME = 128;
 const MAX_RUN_ORIGINS = 32;
 const MAX_RULES = 64;
 const MAX_RULE_VALUES = 32;
+const MAX_RULE_URLS = 32;
 const MAX_PATTERN_LENGTH = 2048;
 /** Enough for the API keys and OIDC tokens of a CI job. */
 const MAX_RUN_SECRETS = 32;
@@ -220,6 +221,19 @@ function invalidRunConfig(config: Partial<RunConfig>): string | undefined {
     names.add(rule.name);
     if (typeof rule.match !== "object" || rule.match === null) {
       return `rule ${rule.name} must have match`;
+    }
+    const { url } = rule.match;
+    if (
+      url !== undefined &&
+      typeof url !== "string" &&
+      !(
+        Array.isArray(url) &&
+        url.length > 0 &&
+        url.length <= MAX_RULE_URLS &&
+        url.every((prefix) => typeof prefix === "string")
+      )
+    ) {
+      return `match.url of rule ${rule.name} must be a string or a list of 1 to ${MAX_RULE_URLS} strings`;
     }
     // A slow pattern fails only its own requests (`request-key.ts`), so
     // the service takes any pattern that compiles.
