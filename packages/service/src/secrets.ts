@@ -70,21 +70,39 @@ const redactQuery = (url: URL) => {
   return url.href.replace(url.search, () => `?${search}`);
 };
 
-/** Create the secret list of one proxy run, with the values of `initial`. */
-export function createSecrets(initial: string[] = []) {
+/**
+ * Add `value` and its parts to `into`, such as the token of
+ * `Bearer <token>` or each value of a cookie header.
+ */
+function add(value: string, into: Set<string>): void {
+  for (const part of [value, ...value.split(/[\s;,=]+/)]) {
+    if (part.length < MIN_LENGTH) continue;
+    into.add(part);
+    // The recorder redacts JSON text, which escapes `"`, `\`, and control
+    // characters.
+    into.add(JSON.stringify(part).slice(1, -1));
+  }
+}
+
+/**
+ * The most values that one run learns from its requests, and their total
+ * length in characters. The values of `initial` do not count.
+ */
+export interface LearnLimit {
+  values: number;
+  length: number;
+}
+
+/**
+ * Create the secret list of one proxy run, with the values of `initial`.
+ * A request that would make the run learn more than `limit` fails with
+ * HTTP 431 and learns nothing. So the proxy never forgets a credential
+ * that it saw, and it never sends or records such a request.
+ */
+export function createSecrets(initial: string[], limit: LearnLimit) {
   const values = new Set<string>();
-  // Keep the whole value and its parts, such as the token of
-  // `Bearer <token>` or each value of a cookie header.
-  const add = (value: string) => {
-    for (const part of [value, ...value.split(/[\s;,=]+/)]) {
-      if (part.length < MIN_LENGTH) continue;
-      values.add(part);
-      // The recorder redacts JSON text, which escapes `"`, `\`, and
-      // control characters.
-      values.add(JSON.stringify(part).slice(1, -1));
-    }
-  };
-  initial.forEach(add);
+  let learned = { values: 0, length: 0 };
+  initial.forEach((value) => add(value, values));
   // Redact longer values first, so no part of one stays visible.
   const longestFirst = () =>
     [...values].toSorted((a, b) => b.length - a.length);
@@ -102,18 +120,38 @@ export function createSecrets(initial: string[] = []) {
     /**
      * Learn the credentials in the headers of a request, and in the query
      * of its `url`. A query value is learned as it is sent and decoded.
+     * Past the limit, it throws an error with HTTP status 431.
      */
     learn(headers: IncomingHttpHeaders, url?: URL): void {
+      const seen = new Set<string>();
       for (const [name, value] of Object.entries(headers)) {
         if (!CREDENTIAL_HEADER.test(name) || value === undefined) continue;
         if (NOT_CREDENTIAL_HEADERS.has(name)) continue;
-        for (const item of Array.isArray(value) ? value : [value]) add(item);
+        for (const item of Array.isArray(value) ? value : [value]) {
+          add(item, seen);
+        }
       }
       for (const { value, credential } of url ? queryParts(url) : []) {
         if (!credential) continue;
-        add(value);
-        add(decode(value));
+        add(value, seen);
+        add(decode(value), seen);
       }
+      const next = { ...learned };
+      for (const part of seen) {
+        if (values.has(part)) continue;
+        next.values += 1;
+        next.length += part.length;
+      }
+      if (next.values > limit.values || next.length > limit.length) {
+        throw Object.assign(
+          new Error(
+            `this run cannot learn more credentials (${limit.values} values or ${limit.length} characters), so it refuses a request with a new one. Start a new run.`,
+          ),
+          { status: 431 },
+        );
+      }
+      learned = next;
+      for (const part of seen) values.add(part);
     },
 
     redact,

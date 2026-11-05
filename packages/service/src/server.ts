@@ -44,8 +44,20 @@ const HOP_HEADERS = new Set([
   "upgrade",
 ]);
 const AUTHORITY = /^(\[[0-9a-f:.]+\]|[a-z0-9.-]+):(\d{1,5})$/i;
-/** A request body over this size gets HTTP 413. */
+/** A proxied request body over this size gets HTTP 413. */
 const MAX_BODY_BYTES = 64 * 1024 * 1024;
+/**
+ * A control API body over this size gets HTTP 413. Anyone can call
+ * `POST /runs`, so the service reads no more before it checks the token.
+ */
+const MAX_CONTROL_BODY_BYTES = 1024 * 1024;
+/** A tunnel that sends no byte this long after its `200` closes. */
+const TUNNEL_FIRST_BYTE_MS = 10_000;
+/**
+ * A tunnel that sends and gets no byte this long closes. A live model
+ * call can take minutes before its first byte, so this is long.
+ */
+const TUNNEL_IDLE_MS = 10 * 60 * 1000;
 
 /** An error that answers a request with its own status. */
 const httpError = (status: number, message: string) =>
@@ -82,6 +94,12 @@ function readBody(
   stream: http.IncomingMessage,
   maxBytes = Infinity,
 ): Promise<Buffer> {
+  const declared = Number(stream.headers["content-length"]);
+  if (declared > maxBytes) {
+    // Drop the body without a look at it, so it costs no memory.
+    stream.resume();
+    return Promise.reject(httpError(413, `body is over ${maxBytes} bytes`));
+  }
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
@@ -100,9 +118,15 @@ function readBody(
   });
 }
 
-/** Read a JSON object request body. Any other body fails with HTTP 400. */
+/**
+ * Read a JSON object body of a control API call. A body over
+ * `MAX_CONTROL_BODY_BYTES` fails with HTTP 413 before it is parsed. Any
+ * other body that is not a JSON object fails with HTTP 400.
+ */
 export async function readJson<T>(incoming: http.IncomingMessage): Promise<T> {
-  const text = (await readBody(incoming, MAX_BODY_BYTES)).toString("utf8");
+  const text = (await readBody(incoming, MAX_CONTROL_BODY_BYTES)).toString(
+    "utf8",
+  );
   let value: unknown;
   try {
     value = JSON.parse(text || "{}");
@@ -214,9 +238,12 @@ async function proxyRequest(
     return;
   }
   if (!rule) {
+    // Learn its credentials before it goes out, so that a later recording
+    // that shows them has them redacted.
+    recorder.learn(request.headers);
     const upstream = await sendUpstream(origin, request, privateNetworks);
     // Count it only when it went out. A refused address counts as refused.
-    recorder.countPassthrough(origin.origin, request.headers);
+    recorder.countPassthrough(origin.origin);
     outgoing.writeHead(upstream.statusCode ?? 502, upstream.statusMessage, {
       ...upstream.headers,
       "x-roach": "passthrough",
@@ -327,6 +354,8 @@ export interface ProxyTarget {
   privateNetworks?: boolean;
   /** Set when the target stops. Its tunnels then refuse new requests. */
   closed?: boolean;
+  /** The time of the last proxied request, from `Date.now()`. */
+  lastUsed?: number;
   /** Gets a span for each proxied request. */
   telemetry: Telemetry;
 }
@@ -390,6 +419,7 @@ function serveProxied(
     outgoing.end("Roach: this run has ended\n");
     return;
   }
+  target.lastUsed = Date.now();
   // Only the origin: the path and query can hold a credential.
   const origin = tunnelOrigin ?? URL.parse(incoming.url ?? "")?.origin;
   const method = incoming.method ?? "GET";
@@ -508,6 +538,8 @@ export async function listenProxy(
         return;
       }
       socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      // A tunnel that a client leaves open must not stay open forever.
+      socket.setTimeout(TUNNEL_IDLE_MS, () => socket.destroy());
       const open = async (first: Buffer) => {
         socket.unshift(first);
         // A TLS handshake starts with byte 0x16. Anything else is plain HTTP.
@@ -533,9 +565,14 @@ export async function listenProxy(
         tunnelServer.emit("connection", secure);
       };
       const onFirst = (first: Buffer) => {
+        clearTimeout(firstByte);
         socket.pause();
         open(first).catch(() => socket.destroy());
       };
+      const firstByte = setTimeout(() => {
+        socket.off("data", onFirst);
+        socket.destroy();
+      }, TUNNEL_FIRST_BYTE_MS);
       if (head.length > 0) onFirst(head);
       else socket.once("data", onFirst);
     },

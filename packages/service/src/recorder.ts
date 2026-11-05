@@ -29,7 +29,7 @@ import { randomBytes } from "node:crypto";
 import type { IncomingHttpHeaders } from "node:http";
 import { firstChange, sampleKey, toSample } from "./misses.ts";
 import { keyRequest, type KeyedRequest } from "./request-key.ts";
-import { createSecrets } from "./secrets.ts";
+import { createSecrets, type LearnLimit } from "./secrets.ts";
 import {
   recordingKey,
   RULE_NAME,
@@ -129,6 +129,8 @@ interface Session extends Places {
    * (`@sentry/roach/values`).
    */
   known: Map<string, string>;
+  /** The total length of the values in `known`. */
+  knownLength: number;
   /** Set when the session ends. */
   passed?: boolean;
 }
@@ -147,6 +149,12 @@ const OTHER_ORIGINS = "other origins";
 const MAX_ENDED_SESSIONS = 1000;
 /** Open sessions of a run, such as one for each test worker. */
 const MAX_OPEN_SESSIONS = 64;
+/**
+ * The values that a session remembers (`known`), and their total length.
+ * A session does not remember later values, so a later request that
+ * repeats one has it in its key as it is.
+ */
+const MAX_KNOWN = { values: 1000, length: 32 * 1024 };
 /** Response headers that a recording keeps. Other headers change each run. */
 const RECORDED_HEADERS = ["content-type", "location"];
 const NULL_BODY_STATUSES = new Set([101, 204, 205, 304]);
@@ -220,6 +228,8 @@ export interface RecorderConfig {
   rules: RecordingRule[];
   /** Credentials to redact, in addition to the ones that it learns. */
   secrets?: string[];
+  /** The credentials that the recorder can learn from requests. */
+  learnLimit: LearnLimit;
   /**
    * Add the first change from a request sample to the first miss of each
    * session in the stats (`misses.ts`). Only a run with the write token may
@@ -243,7 +253,7 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
   const open = () =>
     [...sessions.values()].filter((s) => s.passed === undefined);
   const { telemetry } = config;
-  const secrets = createSecrets(config.secrets);
+  const secrets = createSecrets(config.secrets ?? [], config.learnLimit);
   const refused: NonNullable<RecordingStats["refused"]> = {};
   const stats: RecordingStats = {
     counts: Object.fromEntries(
@@ -391,9 +401,16 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
       return config.rules.find((rule) => matches(rule, request));
     },
 
-    /** Count a request that no rule records, and learn its credentials. */
-    countPassthrough(origin: string, headers: IncomingHttpHeaders): void {
+    /**
+     * Learn the credentials of a request that no rule records, before it
+     * goes out. It throws when the run cannot learn more.
+     */
+    learn(headers: IncomingHttpHeaders): void {
       secrets.learn(headers);
+    },
+
+    /** Count a request that no rule records. */
+    countPassthrough(origin: string): void {
       stats.passthrough[origin] = (stats.passthrough[origin] ?? 0) + 1;
       telemetry.annotate({ result: "passthrough" });
       telemetry.count("roach.request", 1, { origin, result: "passthrough" });
@@ -447,10 +464,15 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
         },
       );
       const redactedText = () => secrets.redactRequest(keyed.text, request.url);
-      if (owner) {
+      // An ended session has no use for more values.
+      if (owner && owner.passed === undefined) {
         for (const [name, list] of keyed.values) {
           for (const value of list) {
-            if (!owner.known.has(value)) owner.known.set(value, name);
+            if (owner.known.has(value)) continue;
+            if (owner.known.size >= MAX_KNOWN.values) continue;
+            if (owner.knownLength + value.length > MAX_KNOWN.length) continue;
+            owner.known.set(value, name);
+            owner.knownLength += value.length;
           }
         }
       }
@@ -560,6 +582,7 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
         recorded: new Map(),
         missed: 0,
         known: new Map(),
+        knownLength: 0,
         sent: new Map(),
         explained: false,
       });

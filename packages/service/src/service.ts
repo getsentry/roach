@@ -111,6 +111,7 @@ interface Run extends ProxyTarget {
   id: string;
   token: string;
   started: number;
+  lastUsed: number;
 }
 
 const MODES = new Set<RecordingMode>(["auto", "off", "record", "replay"]);
@@ -118,6 +119,12 @@ const MODES = new Set<RecordingMode>(["auto", "off", "record", "replay"]);
 const TRACES_SAMPLE_RATE = 1;
 /** A run that is open longer than this ends as failed, such as a dead job. */
 const RUN_TIMEOUT_MS = 6 * 60 * 60 * 1000;
+/**
+ * A run without a token that gets no proxied request and no control call
+ * for this long ends. Anyone can start such runs, so they must not keep
+ * the places of `MAX_PUBLIC_RUNS` for 6 hours.
+ */
+const PUBLIC_RUN_IDLE_MS = 15 * 60 * 1000;
 /**
  * The open runs without a token that the service can have, for all tenants.
  * Anyone can start them with any tenant name, so the cap is not per tenant.
@@ -138,6 +145,14 @@ const MAX_PATTERN_LENGTH = 2048;
 /** Enough for the API keys and OIDC tokens of a CI job. */
 const MAX_RUN_SECRETS = 32;
 const MAX_SECRET_LENGTH = 16 * 1024;
+/**
+ * The credentials that a run learns from its requests (`secrets.ts`). A
+ * run without a token gets a small limit, because anyone can start one.
+ * A run with the token gets more, for credentials that change on each
+ * request, such as AWS signatures.
+ */
+const PUBLIC_LEARN_LIMIT = { values: 1024, length: 1024 * 1024 };
+const WRITE_LEARN_LIMIT = { values: 16 * 1024, length: 16 * 1024 * 1024 };
 /**
  * A tenant name: `owner/repo`, with the characters of GitHub names. It is a
  * path in the store, so each part starts with a letter, digit, or `_`, and
@@ -415,6 +430,7 @@ export async function startRoachService(
       id,
       token,
       started: Date.now(),
+      lastUsed: Date.now(),
       origins: parseOrigins(
         runConfig.allow.map((origin) => origin.replace(/\/$/, "")),
       ),
@@ -430,6 +446,7 @@ export async function startRoachService(
           // A change shows a part of a recorded request, and reads are
           // public, so only a run with the write token gets it.
           explainMisses: canWrite,
+          learnLimit: canWrite ? WRITE_LEARN_LIMIT : PUBLIC_LEARN_LIMIT,
           telemetry,
         },
         store,
@@ -534,6 +551,7 @@ export async function startRoachService(
       outgoing.writeHead(404).end();
       return;
     }
+    run.lastUsed = Date.now();
     const rest = runRoute[2] ?? "";
     if (incoming.method === "DELETE" && rest === "") {
       sendJson(outgoing, 200, await endRun(run));
@@ -563,8 +581,11 @@ export async function startRoachService(
   const sweep = setInterval(() => {
     const now = Date.now();
     for (const run of runs.values()) {
-      if (now - run.started > RUN_TIMEOUT_MS) {
-        process.stderr.write(`[roach] Run ${run.id} timed out\n`);
+      const idle = run.replayOnly && now - run.lastUsed > PUBLIC_RUN_IDLE_MS;
+      if (idle || now - run.started > RUN_TIMEOUT_MS) {
+        process.stderr.write(
+          `[roach] Run ${run.id} timed out${idle ? " without traffic" : ""}\n`,
+        );
         // A failed close must not stop the service for other runs.
         endRun(run).catch((error: unknown) => {
           process.stderr.write(

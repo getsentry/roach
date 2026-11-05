@@ -193,7 +193,8 @@ A run takes `RunConfig` (`packages/roach/src/types.ts`): `tenant`, `mode`, `rule
   them. It refuses all other origins with HTTP 403. The upstream host
   always comes from this list, not from the request. The service sends
   requests only to public addresses, so an origin that resolves to a
-  private, loopback, or link-local address also gets HTTP 403. The stats
+  private, loopback, or link-local address also gets HTTP 403. So does an
+  IPv4-mapped IPv6 address, such as `[::ffff:808:808]`. The stats
   of the run count the refused requests by origin, in `refused.notAllowed`
   and `refused.notPublic`. The run report shows them after `Refused:`, so
   look there first when requests fail with HTTP 403. A tunnel to a port
@@ -220,6 +221,13 @@ A run takes `RunConfig` (`packages/roach/src/types.ts`): `tenant`, `mode`, `rule
   Recordings show `<<redacted>>` in place of each known value. A request
   sample and the text of a miss in Sentry also show `<<redacted>>` for the
   value of each such query parameter, at any length (see [Misses](#misses)).
+  A run without the token learns at most 1,024 values, with a total of
+  1 Mi characters. A run with the token learns at most 16,384 values, with
+  a total of 16 Mi characters, for credentials that change on each
+  request, such as AWS signatures. The whole value and each part of it
+  count. Past the limit, a request with a new credential gets HTTP 431,
+  and the proxy does not send or record it. A request with known
+  credentials goes on. Start a new run to learn more.
 
 Requests that match no rule go live without a change, and their responses
 stream. Each response has an `x-roach` header: `replayed`, `live`,
@@ -267,7 +275,10 @@ as part of a word and does not match.
   the same session, such a value is also a placeholder where no pattern
   finds it. For example, a pattern finds a short commit id only in the
   output of `git push`, but the model then quotes it alone in its reply. A
-  pattern wins at the same place.
+  pattern wins at the same place. A session remembers at most 1,000
+  values, with a total of 32 Ki characters. It does not remember later
+  values, so a later request that quotes one of them alone has it in its
+  key as it is.
 - Values in thinking blocks of the request do not count for `n`, and the
   proxy does not look for remembered values in them. A replay keeps the
   recorded text of a thinking block, so when a later request sends it back,
@@ -285,9 +296,16 @@ real way use the same recording.
 The service takes any pattern that compiles in 1 s, up to 2048
 characters. A run without the token must use the same patterns as the run
 that recorded, or its keys do not match. All runs share one process, so
-the key of each request has a time limit: 1 s, and 0.5 s for each MiB of
-the body. The built-in patterns take less than 0.1 s for each MiB. A
-request whose key takes longer fails with HTTP 400, and other runs go on.
+the value patterns of each request have limits:
+
+- They see only the first 4 Mi (4,194,304) characters of the body text. A
+  JSON body has sorted keys, and its thinking blocks come last. The key
+  keeps the text after the limit as it is. So a changing value there
+  gives a new key on each run, and its request does not replay.
+- They have 500 ms for each request. The built-in patterns take about
+  60 ms for each Mi characters. A request whose patterns take longer
+  fails with HTTP 400, and other runs go on.
+
 Avoid nested quantifiers, such as `(a+)+`.
 
 ## Misses
@@ -450,8 +468,9 @@ config is `RoachServiceConfig` in `packages/service/src/service.ts`. `deploy/gcp
     It checks the address of each connection after DNS, so a host name
     cannot point a run at the metadata server, at the VPC, or at the VM.
     Only tests and local development set `privateNetworks`.
-  - The key of a request has a time limit (`request-key.ts`), so a slow
-    pattern fails only its own request.
+  - The value patterns of a request see only the first 4 Mi characters
+    of its body, for at most 500 ms (`request-key.ts`). So a slow pattern
+    fails only its own request.
 - **Sentry.** With `sentryDsn`, each read and write of a recording sends
   a span to Sentry. Each proxied request sends a span and metrics. See
   [Sentry](#sentry).
@@ -527,10 +546,19 @@ To see how well the cache works:
 
 - Runs live in memory in one process. A restart ends the open runs, and
   their CI jobs fail. A run that is open for 6 hours ends as failed.
+- A run without the token that gets no proxied request and no control
+  call for 15 minutes ends. Its proxy URL then gets HTTP 407, and its
+  control API gets HTTP 404. A run with the token does not end for this.
 - The service can have 100 open runs without a token, for all tenants
   together. Another one gets HTTP 429 until one ends. Runs with the token
   have no cap.
-- A request body over 64 MiB gets HTTP 413.
+- A proxied request body over 64 MiB gets HTTP 413. A control API body
+  over 1 MiB gets HTTP 413 before the service parses it.
+- A `CONNECT` tunnel that sends no byte for 10 s after the `200` closes. A
+  tunnel that sends and gets no byte for 10 minutes closes.
+- The credentials that a run learns and the values that a session
+  remembers have limits. See [Config](#config) and
+  [Changing values](#changing-values).
 - GCS deletes each recording 30 days after it was written, also when runs
   still replay it. Then `auto` mode records it again, and `replay` mode
   fails the request with HTTP 412.
