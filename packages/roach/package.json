@@ -1,0 +1,47 @@
+{
+  "name": "@sentry/roach",
+  "version": "0.2.0",
+  "description": "A recording HTTPS proxy for tests, as a shared service.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/getsentry/roach.git",
+    "directory": "packages/roach"
+  },
+  "files": [
+    "src"
+  ],
+  "type": "module",
+  "exports": {
+    "./client": "./src/client.ts",
+    "./report": "./src/report.ts",
+    "./types": "./src/types.ts",
+    "./values": "./src/values.ts",
+    "./vitest": "./src/vitest.ts",
+    "./vitest/setup": "./src/vitest-setup.ts"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "prepack": "cp ../../README.md ../../LICENSE .",
+    "test": "vitest run",
+    "typecheck": "tsc -p ."
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  },
+  "peerDependencies": {
+    "vitest": ">=3"
+  },
+  "peerDependenciesMeta": {
+    "vitest": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

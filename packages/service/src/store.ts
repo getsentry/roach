@@ -24,7 +24,7 @@ export interface Recording {
     headers: Record<string, string>;
     /**
      * A text body keeps each changing value of its request as a
-     * placeholder (`values.ts`).
+     * placeholder (`@sentry/roach/values`).
      */
     body: string;
     /** `base64` for a body that is not text, such as an image. */

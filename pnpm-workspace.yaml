@@ -1,7 +1,13 @@
-# The root is the npm package `@sentry/roach`. `service/` is the private
-# package of the shared service: only it depends on `@sentry/node`.
+# The workspace has two packages. `packages/roach` is the npm package
+# `@sentry/roach`. `packages/service` is the private package of the shared
+# service: only it depends on `@sentry/node`. The root holds only the tools.
 packages:
-  - service
+  - packages/*
+# One version of each tool that more than one package uses.
+catalog:
+  "@types/node": ^24.19.1
+  typescript: ^7.0.2
+  vitest: ^5.0.3
 # Install only versions that are at least one day old, so a bad release
 # has time to be pulled before it reaches us.
 minimumReleaseAge: 1440

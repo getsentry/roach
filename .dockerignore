@@ -2,6 +2,6 @@
 !package.json
 !pnpm-lock.yaml
 !pnpm-workspace.yaml
-!src
-!service
-service/node_modules
+!packages/*/package.json
+!packages/roach/src
+!packages/service/src

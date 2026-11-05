@@ -38,7 +38,7 @@
   "ignorePatterns": ["coverage/**"],
   "overrides": [
     {
-      "files": ["tests/**"],
+      "files": ["packages/*/tests/**"],
       "rules": {
         "typescript/no-non-null-assertion": "off"
       }

@@ -1,27 +1,9 @@
 {
-  "name": "@sentry/roach",
-  "version": "0.2.0",
-  "description": "A recording HTTPS proxy for tests, as a shared service.",
+  "name": "roach",
+  "private": true,
+  "description": "The workspace of @sentry/roach and the Roach service.",
   "license": "Apache-2.0",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/getsentry/roach.git"
-  },
-  "files": [
-    "src"
-  ],
   "type": "module",
-  "exports": {
-    "./client": "./src/client.ts",
-    "./report": "./src/report.ts",
-    "./types": "./src/types.ts",
-    "./values": "./src/values.ts",
-    "./vitest": "./src/vitest.ts",
-    "./vitest/setup": "./src/vitest-setup.ts"
-  },
-  "publishConfig": {
-    "access": "public"
-  },
   "scripts": {
     "check": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm knip && pnpm test",
     "format": "oxfmt",
@@ -33,11 +15,11 @@
     "skills:install": "dotagents --project install",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
-    "typecheck": "tsc -p ."
+    "typecheck": "tsc -p . && pnpm -r typecheck"
   },
   "devDependencies": {
     "@sentry/dotagents": "^3.3.0",
-    "@types/node": "^24.19.1",
+    "@types/node": "catalog:",
     "@vitest/coverage-v8": "^5.0.3",
     "knip": "^6.40.0",
     "lint-staged": "^17.6.0",
@@ -45,17 +27,8 @@
     "oxlint": "^1.87.0",
     "oxlint-tsgolint": "^7.0.2003",
     "simple-git-hooks": "^2.14.0",
-    "typescript": "^7.0.2",
-    "undici": "^8.11.2",
-    "vitest": "^5.0.3"
-  },
-  "peerDependencies": {
-    "vitest": ">=3"
-  },
-  "peerDependenciesMeta": {
-    "vitest": {
-      "optional": true
-    }
+    "typescript": "catalog:",
+    "vitest": "catalog:"
   },
   "simple-git-hooks": {
     "pre-commit": "pnpm exec lint-staged",

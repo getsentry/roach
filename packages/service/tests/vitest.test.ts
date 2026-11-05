@@ -1,5 +1,6 @@
 /**
- * The vitest integration (`src/vitest.ts`, `src/vitest-setup.ts`). Each
+ * The vitest integration of `@sentry/roach` (`@sentry/roach/vitest` and
+ * `@sentry/roach/vitest/setup`). Each
  * test runs vitest in a child process on a small project with a
  * `roach.json`, against a service and an upstream in this process.
  */
@@ -17,7 +18,7 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { startRoachService, type RoachService } from "../service/service.ts";
+import { startRoachService, type RoachService } from "../src/service.ts";
 
 const TOKEN = "write-token";
 const TENANT = "acme/vitest";
@@ -90,13 +91,13 @@ function runVitest(
 
 /** Write the vitest config of the project, with more setup files after Roach's. */
 function writeVitestConfig(setupFiles: string[] = []): Promise<void> {
-  const setup = [path.join(ROOT, "src/vitest-setup.ts"), ...setupFiles];
+  const setup = ["@sentry/roach/vitest/setup", ...setupFiles];
   return writeFile(
     path.join(project, "vitest.config.ts"),
     `export default {
   test: {
     include: ["*.fixture.ts"],
-    globalSetup: [${JSON.stringify(path.join(ROOT, "src/vitest.ts"))}],
+    globalSetup: ["@sentry/roach/vitest"],
     setupFiles: ${JSON.stringify(setup)},
   },
 };

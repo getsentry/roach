@@ -12,7 +12,7 @@
  */
 import { createHash } from "node:crypto";
 import type { RequestSample } from "./store.ts";
-import type { RecordingChange } from "./types.ts";
+import type { RecordingChange } from "@sentry/roach/types";
 
 /**
  * A change with the redacted texts around it. Only Sentry gets the texts.

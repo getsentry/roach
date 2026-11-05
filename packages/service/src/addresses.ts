@@ -1,7 +1,7 @@
 /**
  * The addresses that the proxy can send requests to.
  *
- * A run names its own origins (`service/service.ts`). So without this
+ * A run names its own origins (`service.ts`). So without this
  * check, a run could make the service send requests into its own network:
  * to the GCP metadata server, which gives tokens of the VM service
  * account, or to other hosts in the VPC. The proxy sends requests only to

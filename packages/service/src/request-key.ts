@@ -5,7 +5,7 @@
  * headers, and the body. It does not use `match` of the rule, so a change
  * to its URL prefixes keeps the keys. A JSON body has sorted object keys,
  * so key order does not matter. Each changing value of the rule is
- * `<<name>>` in the key (`values.ts`).
+ * `<<name>>` in the key (`@sentry/roach/values`).
  *
  * The patterns of `values` come from the client, and all runs share one
  * process. A slow pattern would block every run, so a key has a time limit
@@ -14,14 +14,14 @@
 import { createHash } from "node:crypto";
 import type { IncomingHttpHeaders } from "node:http";
 import { THINKING_BLOCK_TYPES } from "./streams.ts";
-import type { RecordingRule } from "./types.ts";
+import type { RecordingRule } from "@sentry/roach/types";
 import {
   extractValues,
   type KnownValues,
   type RequestValues,
   type ValuePatterns,
   withTimeLimit,
-} from "./values.ts";
+} from "@sentry/roach/values";
 
 /** Change this to make every recording a miss. */
 const KEY_VERSION = "http-v1";
@@ -126,8 +126,8 @@ function normalizeJson(
 const sha256 = (text: string) =>
   createHash("sha256").update(text).digest("hex");
 /**
- * The key and the changing values of a request. `known` holds
- * the values of earlier requests in the same session (`values.ts`). It
+ * The key and the changing values of a request. `known` holds the values
+ * of earlier requests in the same session (`@sentry/roach/values`). It
  * throws an error with HTTP status 400 when it takes too long.
  */
 export function keyRequest(

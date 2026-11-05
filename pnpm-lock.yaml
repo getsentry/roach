@@ -4,6 +4,18 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+catalogs:
+  default:
+    '@types/node':
+      specifier: ^24.19.1
+      version: 24.19.1
+    typescript:
+      specifier: ^7.0.2
+      version: 7.0.2
+    vitest:
+      specifier: ^5.0.3
+      version: 5.0.3
+
 importers:
 
   .:
@@ -12,7 +24,7 @@ importers:
         specifier: ^3.3.0
         version: 3.3.0
       '@types/node':
-        specifier: ^24.19.1
+        specifier: 'catalog:'
         version: 24.19.1
       '@vitest/coverage-v8':
         specifier: ^5.0.3
@@ -36,20 +48,45 @@ importers:
         specifier: ^2.14.0
         version: 2.14.0
       typescript:
-        specifier: ^7.0.2
+        specifier: 'catalog:'
+        version: 7.0.2
+      vitest:
+        specifier: 'catalog:'
+        version: 5.0.3(@opentelemetry/api@1.9.1)(@types/node@24.19.1)(@vitest/coverage-v8@5.0.3)(vite@8.3.4(@types/node@24.19.1)(esbuild@0.28.2)(jiti@2.7.0)(yaml@2.9.1))
+
+  packages/roach:
+    devDependencies:
+      '@types/node':
+        specifier: 'catalog:'
+        version: 24.19.1
+      typescript:
+        specifier: 'catalog:'
+        version: 7.0.2
+      vitest:
+        specifier: 'catalog:'
+        version: 5.0.3(@opentelemetry/api@1.9.1)(@types/node@24.19.1)(@vitest/coverage-v8@5.0.3)(vite@8.3.4(@types/node@24.19.1)(esbuild@0.28.2)(jiti@2.7.0)(yaml@2.9.1))
+
+  packages/service:
+    dependencies:
+      '@sentry/node':
+        specifier: 11.6.0
+        version: 11.6.0
+      '@sentry/roach':
+        specifier: workspace:*
+        version: link:../roach
+    devDependencies:
+      '@types/node':
+        specifier: 'catalog:'
+        version: 24.19.1
+      typescript:
+        specifier: 'catalog:'
         version: 7.0.2
       undici:
         specifier: ^8.11.2
         version: 8.11.2
       vitest:
-        specifier: ^5.0.3
+        specifier: 'catalog:'
         version: 5.0.3(@opentelemetry/api@1.9.1)(@types/node@24.19.1)(@vitest/coverage-v8@5.0.3)(vite@8.3.4(@types/node@24.19.1)(esbuild@0.28.2)(jiti@2.7.0)(yaml@2.9.1))
-
-  service:
-    dependencies:
-      '@sentry/node':
-        specifier: 11.6.0
-        version: 11.6.0
 
 packages:
 

@@ -11,8 +11,8 @@ domain = "roach-proxy.getsentry.net"
 deploy_repository    = "getsentry/roach"
 deploy_repository_id = "1412275249"
 
-# Runs send their own origins and value patterns (RunConfig in src/types.ts),
-# so a tenant needs no change here.
+# Runs send their own origins and value patterns (RunConfig in
+# packages/roach/src/types.ts), so a tenant needs no change here.
 
 # The service sends metrics and spans to the sentry/roach project.
 # A DSN only lets a client send events, so it is not a secret.

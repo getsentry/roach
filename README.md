@@ -5,7 +5,7 @@ replays them, so a second run of a test suite makes no live calls. The
 proxy owns every read and write of the recordings. A test runner only gives
 it rules and tells it when each test starts and ends.
 
-Roach is a shared service (`service/service.ts`): one deployed proxy for many
+Roach is a shared service (`packages/service`): one deployed proxy for many
 projects and CI runs. A client points `HTTPS_PROXY` at it and trusts its
 certificate authority. It installs nothing else. The recordings are in a
 GCS bucket, which deletes each one 30 days after it was written. See
@@ -16,7 +16,7 @@ the evals of
 [`getsentry/junior`](https://github.com/getsentry/junior/tree/main/packages/junior-evals).
 It uses Node built-ins and the `openssl` command. The npm package has no
 dependencies. Only the service uses the Sentry SDK (`@sentry/node`), and the
-service is a private package in `service/` that is not published.
+service is a private package in `packages/service` that is not published.
 
 ## Use with vitest
 
@@ -32,9 +32,9 @@ export default defineConfig({
 });
 ```
 
-The global setup (`src/vitest.ts`) starts one run for the invocation and
+The global setup (`packages/roach/src/vitest.ts`) starts one run for the invocation and
 gives its proxy variables to the test workers. The setup file
-(`src/vitest-setup.ts`) opens one session for each test, so test files
+(`packages/roach/src/vitest-setup.ts`) opens one session for each test, so test files
 record in parallel workers at the same time. A passed test writes its new
 recordings. A failed test drops them. In `replay` mode, a test with a miss
 fails. At the end, the global setup writes the stats of the run to stdout
@@ -125,7 +125,7 @@ A repository adds one step and a `roach.json` file (see
     run: pnpm test
 ```
 
-The action (`src/action.ts`) starts a run with the token in `auto` mode, or
+The action (`packages/roach/src/action.ts`) starts a run with the token in `auto` mode, or
 without it in `replay` mode. It runs `run` in bash with the proxy variables
 of the run, then ends the run and writes its stats to the job summary.
 
@@ -141,7 +141,7 @@ of the run, then ends the run and writes its stats to the job summary.
 ## Config file
 
 The action and the vitest integration read `roach.json` in the working
-directory or the closest parent directory (`src/config.ts`):
+directory or the closest parent directory (`packages/roach/src/config.ts`):
 
 ```json
 {
@@ -182,7 +182,7 @@ Actions.
 
 ## Config
 
-A run takes `RunConfig` (`src/types.ts`): `tenant`, `mode`, `rules`,
+A run takes `RunConfig` (`packages/roach/src/types.ts`): `tenant`, `mode`, `rules`,
 `allow`, `name`, and `secrets`.
 
 - `mode`: `auto` replays recordings and records misses. `replay` replays
@@ -416,8 +416,8 @@ Values that changed in real projects:
 
 ## Service
 
-`service/cli.ts service <config.json>` starts the service. The config is
-`RoachServiceConfig` in `service/service.ts`. `deploy/gcp/` writes it for you.
+`packages/service/src/cli.ts service <config.json>` starts the service. The
+config is `RoachServiceConfig` in `packages/service/src/service.ts`. `deploy/gcp/` writes it for you.
 
 - **Tenants.** A tenant is a GitHub repository, as `owner/repo`, such as
   `getsentry/junior`. In GitHub Actions, use `GITHUB_REPOSITORY`. The
@@ -627,7 +627,7 @@ set the secret again, and restart the VM.
 ## Command line
 
 ```sh
-node service/cli.ts service <config.json>
+node packages/service/src/cli.ts service <config.json>
 ```
 
 It starts the service and prints its URL as one JSON line.
@@ -667,12 +667,15 @@ manager accepts it, Craft:
 - makes the GitHub release `v<version>`, with the changelog, and moves the
   `v<major>` tag. Repositories use the action as `getsentry/roach@v<major>`.
 - publishes `@sentry/roach` to npm: the tarball that the `package` job of
-  `CI` uploads for the release commit. On the release branch, Craft runs
-  `.github/scripts/bump-version.sh`, which writes the version to the root
-  `package.json`. The `service/` package is private and has no version.
+  `CI` uploads for the release commit. Craft publishes only
+  `sentry-roach-<version>.tgz`, and CI makes sure that it has `LICENSE` and
+  `README.md` (`.github/scripts/check-tarball.sh`). On the release branch, Craft runs
+  `.github/scripts/bump-version.sh`, which writes the version to
+  `packages/roach/package.json`. The workspace root and `packages/service`
+  are private and have no version.
 
-The action runs `src/action.ts` from the tag, and the package has the
-sources, so a release has no build step.
+The action runs `packages/roach/src/action.ts` from the tag, and the
+package has the sources, so a release has no build step.
 
 Craft takes the last version from the newest `v<version>` tag in the
 history of `main`. Do not rewrite `main`, or the tag leaves its history and
@@ -693,12 +696,12 @@ pnpm check   # format, lint, types, unused code, and tests, as CI runs them
 
 `AGENTS.md` has the conventions and the commands for one file.
 
-- `tests/recording.test.ts` tests modes, sessions, changing values, and
+- `packages/service/tests/recording.test.ts` tests modes, sessions, changing values, and
   misses.
-- `tests/service.test.ts` tests the service in the test process.
-- `tests/vitest.test.ts` runs vitest with the integration on a small
+- `packages/service/tests/service.test.ts` tests the service in the test process.
+- `packages/service/tests/vitest.test.ts` runs vitest with the integration on a small
   project, against a service in the test process.
-- `tests/deployed.test.ts` runs the service as it runs in production: from
+- `packages/service/tests/deployed.test.ts` runs the service as it runs in production: from
   the command line, behind a TLS server that does what the load balancer
   does, with a local GCS server, metadata server, and Sentry server. Each
   CI job runs the GitHub Action, and its command has only the proxy
@@ -706,13 +709,36 @@ pnpm check   # format, lint, types, unused code, and tests, as CI runs them
 
 ## Files
 
-The npm package `@sentry/roach` is the root of the repository. Its sources
-are in `src/`. The service is the private package in `service/`. It imports
-the proxy code from `src/` and is the only package that depends on
-`@sentry/node`. Tests are in `tests/`. The production setup is in
-`deploy/gcp/` and `Dockerfile`.
+The repository is a pnpm workspace with two packages. The root package is
+private and has only the tools: oxlint, oxfmt, TypeScript, vitest, and knip.
+`pnpm-workspace.yaml` has the catalog of the versions that the packages
+share. The production setup is in `deploy/gcp/` and `Dockerfile`.
+
+- `packages/roach` is the npm package `@sentry/roach`: the client, the
+  vitest integration, and the action. It has no runtime dependencies, and it
+  ships only `src/`. `tests/package.test.ts` fails when an export or the
+  action loads a package that is not a Node built-in or vitest.
+- `packages/service` is the private package `@sentry/roach-service`: the
+  shared service and the proxy. It imports `@sentry/roach` as a workspace
+  package (`workspace:*`). It is the only package that depends on
+  `@sentry/node`. Its tests run the client, the vitest integration, and the
+  action against a real service.
+
+In `packages/roach/src/`:
 
 - `types.ts`: rules, modes, runs, sessions, and the results of a run.
+- `values.ts`: changing values and their placeholders.
+- `client.ts`: starts a run and calls the control API.
+- `config.ts`: `roach.json`, for the action and vitest.
+- `vitest.ts`: the vitest global setup: one run for each invocation.
+- `vitest-setup.ts`: the vitest setup file: one session for each test.
+- `report.ts`: text reports of a run.
+- `action.ts`: the GitHub Action (`action.yml` at the root).
+
+In `packages/service/src/`:
+
+- `service.ts`: the shared service: tenants, runs, access, and metrics.
+- `cli.ts`: the command line, which the image runs.
 - `server.ts`: sockets, HTTPS interception, the allow list, and the control
   API.
 - `addresses.ts`: the public addresses that the proxy can send requests to.
@@ -723,19 +749,7 @@ the proxy code from `src/` and is the only package that depends on
   store contract.
 - `recordings.ts`: the file store, for tests and development.
 - `gcs.ts`: the GCS store.
-- `values.ts`: changing values and their placeholders.
 - `streams.ts`: merges the deltas of a recorded model stream.
 - `usage.ts`: the token usage of a model response, for Sentry.
 - `secrets.ts`: redaction of credentials.
 - `certificates.ts`: the certificate authority for HTTPS.
-- `client.ts`: starts a run and calls the control API.
-- `config.ts`: `roach.json`, for the action and vitest.
-- `vitest.ts`: the vitest global setup: one run for each invocation.
-- `vitest-setup.ts`: the vitest setup file: one session for each test.
-- `report.ts`: text reports of a run.
-- `action.ts`: the GitHub Action (`action.yml` at the root).
-
-In `service/`:
-
-- `service.ts`: the shared service: tenants, runs, access, and metrics.
-- `cli.ts`: the command line, which the image runs.
