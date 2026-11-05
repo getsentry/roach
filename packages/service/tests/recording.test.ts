@@ -713,6 +713,30 @@ describe("recording", () => {
     expect(keyOf(large)).toBe(
       "0158550d2794ddc225cb9d383c62a599f06592d4626ecf13276ff6ab53d44118",
     );
+    // A session that knows 1,200 commit ids (`pushRequests()`). Its last
+    // request quotes the 1,200th id.
+    const known = new Map<string, string>();
+    const pushed = pushRequests(0xa000000).map((body) => {
+      const keyed = keyRequest(
+        rule,
+        {
+          method: "POST",
+          url: "https://api.anthropic.com/v1/messages",
+          headers: {},
+          body: JSON.stringify(body),
+        },
+        known,
+      );
+      for (const [name, list] of keyed.values) {
+        for (const value of list) if (!known.has(value)) known.set(value, name);
+      }
+      return keyed.key;
+    });
+    expect(pushed).toEqual([
+      "b7f24e7956bea1227001b1b734b4cfcfd389f07681a89de35245487afc62228b",
+      "aa0d220dd551e1135fa6c275ac0ae0ed03db065b5d106da52e30be5dbcc5bf63",
+      "aa0d220dd551e1135fa6c275ac0ae0ed03db065b5d106da52e30be5dbcc5bf63",
+    ]);
     // A model request of 6 M characters (`screenshotRequest()`).
     for (const time of ["2026-10-07T10:00:00Z", "2026-10-08T11:30:00Z"]) {
       expect(keyOf(JSON.stringify(screenshotRequest(time)))).toBe(
@@ -732,18 +756,60 @@ describe("recording", () => {
     expect(replay.map(({ source }) => source)).toEqual(["replayed"]);
   });
 
-  it("remembers at most 1,000 values in a session", async () => {
+  it("remembers every value of a session", async () => {
     const running = await start("auto");
     await session(running, pushRequests(0xa000000));
 
     const replay = await session(running, pushRequests(0xb000000));
 
-    // The 1,200th id is past the limit, so its request has a new key.
+    // The 1,200th id is known too, so its request has the same key.
     expect(replay.map(({ source }) => source)).toEqual([
       "replayed",
       "replayed",
-      "live",
+      "replayed",
     ]);
+  });
+
+  it("gives the keys that the values of the session give", async () => {
+    // The recorder must give each request the key of `keyRequest()` with
+    // every value of the earlier requests of its session. The keys of
+    // `keyRequest()` are pinned in "keeps the keys of earlier versions".
+    const running = await start("auto");
+    const bodies = pushRequests(0xa000000);
+    await session(running, bodies);
+
+    const rule: RecordingRule = {
+      name: "model",
+      match: {},
+      values: {
+        uuid: VALUE_PATTERNS.uuid,
+        time: VALUE_PATTERNS.isoTime,
+        commit: VALUE_PATTERNS.gitCommit,
+      },
+    };
+    const known = new Map<string, string>();
+    const expected = new Set<string>();
+    for (const body of bodies) {
+      const keyed = keyRequest(
+        rule,
+        {
+          method: "POST",
+          url: `${origin}/v1/messages`,
+          headers: {},
+          body: JSON.stringify(body),
+        },
+        known,
+      );
+      expected.add(`${keyed.key}.json`);
+      for (const [name, list] of keyed.values) {
+        for (const value of list) if (!known.has(value)) known.set(value, name);
+      }
+    }
+    // The last two requests quote one known id each, so they have one key.
+    expect(expected.size).toBe(2);
+    await expect(files().then((names) => names.toSorted())).resolves.toEqual(
+      [...expected].toSorted(),
+    );
   });
 
   it("records again in record mode", async () => {

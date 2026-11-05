@@ -105,14 +105,24 @@ function normalizeJson(
   json: unknown,
   patterns: ValuePatterns | undefined,
   known: KnownValues | undefined,
+  maxValues: number,
 ): { text: string; values: RequestValues } {
   const thinking: string[] = [];
+  // The values of thinking blocks count toward `maxValues` too.
+  let left = maxValues;
   const mark = (value: unknown): unknown => {
     if (Array.isArray(value)) return value.map(mark);
     if (value === null || typeof value !== "object") return value;
     const record = value as Record<string, unknown>;
     if (THINKING_BLOCK_TYPES.has(String(record.type))) {
-      thinking.push(extractValues(stableStringify(record), patterns).text);
+      const block = extractValues(
+        stableStringify(record),
+        patterns,
+        undefined,
+        left,
+      );
+      for (const list of block.values.values()) left -= list.length;
+      thinking.push(block.text);
       return `\uE000${thinking.length - 1}`;
     }
     return Object.fromEntries(
@@ -123,6 +133,7 @@ function normalizeJson(
     stableStringify(mark(json)),
     patterns,
     known,
+    left,
   );
   return {
     text: text.replace(THINKING_MARK, (_, index) => thinking[Number(index)]!),
@@ -136,21 +147,27 @@ const sha256 = (text: string) =>
  * The key and the changing values of a request. `known` holds the values
  * of earlier requests in the same session (`@sentry/roach/values`). It
  * throws an error with HTTP status 400 when it takes longer than
- * `timeLimitMs`, by default `keyTimeLimit()` of the body.
+ * `timeLimitMs`, by default `keyTimeLimit()` of the body, or when the
+ * request has more than `maxValues` changing values. The limits never
+ * change a key: a request gets its key, or it fails.
  */
 export function keyRequest(
   rule: RecordingRule,
   request: RequestToKey,
   known?: KnownValues,
   timeLimitMs = keyTimeLimit(Buffer.byteLength(request.body)),
+  maxValues = Infinity,
 ): KeyedRequest {
-  return withTimeLimit(timeLimitMs, () => keyRequestNow(rule, request, known));
+  return withTimeLimit(timeLimitMs, () =>
+    keyRequestNow(rule, request, known, maxValues),
+  );
 }
 
 function keyRequestNow(
   rule: RecordingRule,
   request: RequestToKey,
-  known?: KnownValues,
+  known: KnownValues | undefined,
+  maxValues: number,
 ): KeyedRequest {
   const headers = Object.fromEntries(
     (rule.keyHeaders ?? []).map((name) => [
@@ -161,8 +178,8 @@ function keyRequestNow(
   const json = parseJson(request.body);
   const { text, values } =
     json === undefined
-      ? extractValues(request.body, rule.values, known)
-      : normalizeJson(json, rule.values, known);
+      ? extractValues(request.body, rule.values, known, maxValues)
+      : normalizeJson(json, rule.values, known, maxValues);
   const keyText = [
     KEY_VERSION,
     rule.name,

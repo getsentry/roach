@@ -23,8 +23,8 @@
  * `missed` (`replay` mode had no recording), or `passthrough` (no rule
  * matched).
  *
- * Behind a load balancer, each connection can start with a PROXY protocol
- * v1 header (`proxyProtocol`). It gives the address of the client
+ * Behind a load balancer, a connection can start with a PROXY protocol v1
+ * header (`proxyProtocol`). It gives the address of the client
  * (`clientAddress()`).
  */
 import { timingSafeEqual } from "node:crypto";
@@ -74,9 +74,10 @@ const TUNNEL_FIRST_BYTE_MS = 10_000;
 const TUNNEL_IDLE_MS = 10 * 60 * 1000;
 /**
  * A PROXY protocol v1 header, such as
- * `PROXY TCP4 203.0.113.7 10.0.0.2 51234 443`. It is at most 107 bytes,
- * and it must come in this time.
+ * `PROXY TCP4 203.0.113.7 10.0.0.2 51234 443`. It is at most 107 bytes.
+ * The first bytes of a connection must come in `PROXY_HEADER_MS`.
  */
+const PROXY_PREFIX = Buffer.from("PROXY ");
 const PROXY_HEADER =
   /^PROXY (?:TCP[46] ([0-9A-Fa-f:.]+) [0-9A-Fa-f:.]+ \d{1,5} \d{1,5}|UNKNOWN[^\r\n]*)\r\n/;
 const MAX_PROXY_HEADER_BYTES = 107;
@@ -87,13 +88,44 @@ const proxiedClients = new WeakMap<Socket, string>();
 
 /**
  * The address of the client of a request. With `proxyProtocol`, it comes
- * from the PROXY header of the connection, which only the load balancer
- * writes. Else it is the address of the socket.
+ * from the PROXY header of the connection, when the connection has one.
+ * Else it is the address of the socket.
  */
 export function clientAddress(incoming: http.IncomingMessage): string {
   return (
     proxiedClients.get(incoming.socket) ?? incoming.socket.remoteAddress ?? ""
   );
+}
+
+/**
+ * The group of a client address for the limit of runs for each client. An
+ * IPv6 client often has a whole /64, so the group of an IPv6 address is
+ * its /64, such as `2001:db8:0:1::/64`. An IPv4 address, also in IPv6
+ * form (`::ffff:192.0.2.1`), is its own group.
+ */
+export function clientGroup(address: string): string {
+  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(address);
+  if (mapped) return mapped[1]!;
+  if (isIP(address) !== 6) return address;
+  // Write `::` as its zero groups. An address that ends in IPv4 form has
+  // two groups in it, but only the first four groups count.
+  const [head = "", tail] = address.toLowerCase().split("::");
+  const front = head ? head.split(":") : [];
+  const back = tail ? tail.split(":") : [];
+  const groups =
+    tail === undefined
+      ? front
+      : [
+          ...front,
+          ...Array<string>(Math.max(0, 8 - front.length - back.length)).fill(
+            "0",
+          ),
+          ...back,
+        ];
+  const prefix = groups
+    .slice(0, 4)
+    .map((group) => Number.parseInt(group, 16).toString(16));
+  return `${prefix.join(":")}::/64`;
 }
 
 /** An error that answers a request with its own status. */
@@ -426,8 +458,8 @@ export interface ListenOptions {
    */
   capture(error: unknown): string | undefined;
   /**
-   * Each connection starts with a PROXY protocol v1 header. A connection
-   * without a valid header closes.
+   * Read a PROXY protocol v1 header at the start of a connection, when it
+   * has one. A header that is not valid closes the connection.
    */
   proxyProtocol?: boolean;
 }
@@ -455,22 +487,39 @@ function refuse(status: 403 | 407, outgoing: http.ServerResponse): void {
 }
 
 /**
- * Read the PROXY protocol v1 header of a new connection, and keep the
- * address of its client. Then give the connection to `server`. A
- * connection without a valid header in time closes.
+ * Read the PROXY protocol v1 header of a new connection, when it has one,
+ * and keep the address of its client. Then give the connection to
+ * `server`. A connection without the header keeps the address of its
+ * socket. A header that is not valid closes the connection.
+ *
+ * The load balancer writes its header first, so a client cannot put a
+ * header before it. Without a load balancer, a client can send its own
+ * header. That changes only the address for the limit of runs for each
+ * client.
  */
 function acceptProxied(socket: Socket, server: http.Server): void {
   let read = Buffer.alloc(0);
   const timer = setTimeout(() => socket.destroy(), PROXY_HEADER_MS);
+  const accept = (rest: Buffer) => {
+    socket.off("data", onData);
+    clearTimeout(timer);
+    socket.pause();
+    if (rest.length > 0) socket.unshift(rest);
+    server.emit("connection", socket);
+    socket.resume();
+  };
   const onData = (chunk: Buffer) => {
     read = Buffer.concat([read, chunk]);
+    const prefix = Math.min(read.length, PROXY_PREFIX.length);
+    if (!read.subarray(0, prefix).equals(PROXY_PREFIX.subarray(0, prefix))) {
+      accept(read);
+      return;
+    }
     const end = read.indexOf("\r\n");
     if (end < 0 || end + 2 > MAX_PROXY_HEADER_BYTES) {
       if (end >= 0 || read.length >= MAX_PROXY_HEADER_BYTES) socket.destroy();
       return;
     }
-    socket.off("data", onData);
-    clearTimeout(timer);
     const match = PROXY_HEADER.exec(read.subarray(0, end + 2).toString());
     if (!match) {
       socket.destroy();
@@ -478,11 +527,7 @@ function acceptProxied(socket: Socket, server: http.Server): void {
     }
     // `UNKNOWN`, such as from a health check, gives no address.
     if (match[1] && isIP(match[1])) proxiedClients.set(socket, match[1]);
-    socket.pause();
-    const rest = read.subarray(end + 2);
-    if (rest.length > 0) socket.unshift(rest);
-    server.emit("connection", socket);
-    socket.resume();
+    accept(read.subarray(end + 2));
   };
   socket.on("error", () => socket.destroy());
   socket.on("close", () => clearTimeout(timer));
@@ -600,8 +645,8 @@ export async function listenProxy(
       sendJson(outgoing, status ?? 500, { error: message });
     });
   });
-  // With `proxyProtocol`, a plain TCP server reads the PROXY header of each
-  // connection, and then gives it to `server`.
+  // With `proxyProtocol`, a plain TCP server reads the PROXY header of a
+  // connection, when it has one, and then gives it to `server`.
   const listener = options.proxyProtocol
     ? net.createServer((socket) => acceptProxied(socket, server))
     : server;

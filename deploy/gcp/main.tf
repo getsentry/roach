@@ -213,7 +213,7 @@ resource "google_compute_health_check" "roach" {
   name = "roach"
   tcp_health_check {
     port = local.port
-    # The service closes a connection without the header.
+    # Connect as the load balancer does for clients.
     proxy_header = "PROXY_V1"
   }
 }

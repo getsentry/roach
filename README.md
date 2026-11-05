@@ -360,10 +360,9 @@ as part of a word and does not match.
   the same session, such a value is also a placeholder where no pattern
   finds it. For example, a pattern finds a short commit id only in the
   output of `git push`, but the model then quotes it alone in its reply. A
-  pattern wins at the same place. A session remembers at most 1,000
-  values, with a total of 32 Ki characters. It does not remember later
-  values, so a later request that quotes one of them alone has it in its
-  key as it is.
+  pattern wins at the same place. A session remembers all values of its
+  requests, also after it ends. A limit there would change the keys of
+  later requests.
 - Values in thinking blocks of the request do not count for `n`, and the
   proxy does not look for remembered values in them. A replay keeps the
   recorded text of a thinking block, so when a later request sends it back,
@@ -381,18 +380,28 @@ real way use the same recording.
 The service takes any pattern that compiles in 1 s, up to 2048
 characters. A run without the token must use the same patterns as the run
 that recorded, or its keys do not match. All runs share one process, so
-the service makes each key in a worker thread, one key at a time. So a
+the service makes each key in a worker process, one key at a time. So a
 slow key does not stop the other work of the service. Each key has a time
 limit: 1 s, and 0.5 s for each MiB of the body. The built-in patterns take
 about 60 to 110 ms for each MiB. A request whose key takes longer fails
-with HTTP 400. The keys of runs with the token come before the keys of runs
-without it. A run without the token has smaller limits:
+with HTTP 400. Some work, such as `JSON.parse()` of a large body, cannot
+stop at the time limit. When a key goes 1 s past its time limit, the
+service stops the worker and starts a new one. The worker has 384 MiB of
+heap. A key that needs more stops the worker, and its request fails with
+HTTP 400. The key of a 64 MiB body needs about 320 MiB.
+
+The limits never change a key: a request gets the key that it always
+had, or it fails. The keys of runs with the token come before the keys of
+runs without it. A run without the token has smaller limits:
 
 - A key has at most 5 s.
+- A request can have at most 100,000 changing values. A request with more
+  fails with HTTP 400, and the run goes on.
 - The keys of the run and the redaction of its misses (see
-  [Misses](#misses)) have 30 s in total.
-- When a key goes past its time limit, or the run goes past 30 s, the run
-  ends. Its other requests then fail with HTTP 410 or 407.
+  [Misses](#misses)) have 30 s in total. In the 14 days to 2026-11-05, the
+  keys of the largest run took 9.5 s (p99 9.1 s, about 1,000 keys).
+- When a key goes past its time limit, its worker stops, or the run goes
+  past 30 s, the run ends. Its other requests then fail with HTTP 410 or 407.
 
 Avoid nested quantifiers, such as `(a+)+`.
 
@@ -445,7 +454,7 @@ shows it.
   from an older version, or when the texts are the same in the part that
   the sample keeps.
 - The proxy redacts the text of the miss before it compares it. This runs
-  in the worker thread of the keys, with the time limit of a key (see
+  in the worker process of the keys, with the time limit of a key (see
   [Changing values](#changing-values)). Past it, the miss has no change.
 - When the requests of a test run in parallel, their order can change.
   Then a sample can come from another request of the test.
@@ -560,9 +569,10 @@ config is `RoachServiceConfig` in `packages/service/src/service.ts`. `deploy/gcp
     It checks the address of each connection after DNS, so a host name
     cannot point a run at the metadata server, at the VPC, or at the VM.
     Only tests and local development set `privateNetworks`.
-  - The service makes keys in a worker thread, and a key has a time limit
-    (`key-worker.ts`, `request-key.ts`). So a slow pattern fails only its
-    own request, and it does not stop the service.
+  - The service makes keys in a worker process, and a key has a time
+    limit and a memory limit (`key-worker.ts`, `request-key.ts`). So a
+    slow pattern or a large body fails only its own request, and it does
+    not stop the service.
 - **Sentry.** With `sentryDsn`, each read and write of a recording sends
   a span to Sentry. Each proxied request sends a span and metrics. Each
   unexpected error sends an error event. See [Sentry](#sentry).
@@ -666,10 +676,11 @@ To see how well the cache works:
   before the command of the job, so a step that takes longer than
   60 minutes without a request to the service fails.
 - The service can have 100 open runs without a token, for all tenants
-  together, and 10 for each client address. Another one gets HTTP 429
-  until one ends. Runs with the token have no cap. With `proxyProtocol`,
-  the address of the client comes from the PROXY protocol v1 header of
-  the load balancer. Else it is the address of the connection.
+  together, and 10 for each client address. All addresses of one IPv6
+  /64 count as one client. Another one gets HTTP 429 until one ends. Runs
+  with the token have no cap. With `proxyProtocol`, the address of the
+  client comes from the PROXY protocol v1 header of the load balancer.
+  A connection without the header uses the address of the connection.
 - A proxied request body over 64 MiB gets HTTP 413, and over 16 MiB for a
   run without the token. A control API body over 1 MiB gets HTTP 413
   before the service parses it.
@@ -700,8 +711,7 @@ To see how well the cache works:
   connection starts with a PROXY protocol v1 header with the address of
   the client (`proxy_header`). The config sets `proxyProtocol`, so the
   service limits runs without a token by that address. The health check
-  sends the header too, because the service closes a connection without
-  it,
+  sends the header too,
 - a service account for the `Deploy` workflow, which GitHub Actions uses
   through workload identity federation (`deploy.tf`). It can only reset
   the VM.
@@ -769,10 +779,27 @@ To deploy by hand, restart the VM:
 `gcloud compute instances reset roach --zone <zone>`. It pulls `:main`,
 the last green commit.
 
-The service reads its config only when it starts. A service with
-`proxyProtocol` closes each connection without a PROXY header, and a
-service without it cannot read the header. So after a change to
-`proxy_header` or `proxyProtocol`, restart the VM at once.
+The service reads its config only when it starts. With `proxyProtocol`,
+it reads a PROXY header when a connection has one, and it uses the
+address of the connection when it does not. A service without
+`proxyProtocol` cannot read the header. To turn on the PROXY header:
+
+1. Merge the change, and let the `Deploy` workflow deploy the image.
+2. Apply Terraform: `terraform apply -var-file=roach.tfvars`. The load
+   balancer then sends the header, but the service still has its old
+   config, so proxied requests fail with HTTP 400 until step 3.
+3. Restart the VM at once, so that it reads the new config:
+   `gcloud compute instances reset roach --project roach-511216 --zone us-east1-b`.
+   The apply does not restart the VM.
+
+The load balancer writes its header before the first byte of the client,
+so a client cannot put its own header first. A client can send its own
+header only when the service has `proxyProtocol` and the load balancer
+does not send the header, such as when the config has `proxyProtocol`
+but the load balancer has no `proxy_header`. With the steps above, this
+does not occur: until step 3 the service does not read headers. A false
+header changes only the address for the limit of runs for each client,
+and the firewall lets only the Google ranges connect to the VM.
 
 To add a project, add its repository to the repositories of the
 `ROACH_TOKEN` organization secret, in the GitHub settings of the
@@ -905,8 +932,8 @@ In `packages/service/src/`:
 - `addresses.ts`: the public addresses that the proxy can send requests to.
 - `recorder.ts`: modes, sessions, replay, and misses.
 - `request-key.ts`: the key of a request.
-- `key-worker.ts`: the worker thread that makes keys and redacts the text
-  of misses, with a time limit.
+- `key-worker.ts`: the worker process that makes keys and redacts the text
+  of misses, with a time limit and a memory limit.
 - `misses.ts`: request samples and the first change of a miss.
 - `store.ts`: the formats of recordings and request samples, and the
   store contract.
