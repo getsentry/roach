@@ -25,7 +25,10 @@ import {
 } from "vitest";
 import { startRemoteRun, type RemoteRoach } from "../src/client.ts";
 import { startRoachService, type RoachService } from "../service/service.ts";
-import { describeRecordingMisses } from "../src/report.ts";
+import {
+  describeRecordingMisses,
+  describeRecordingStats,
+} from "../src/report.ts";
 import { keyRequest } from "../src/request-key.ts";
 import type { RecordingMode, RecordingRule } from "../src/types.ts";
 import { VALUE_PATTERNS } from "../src/values.ts";
@@ -200,6 +203,7 @@ describe("recording", () => {
       written: 2,
       discarded: 0,
       passthrough: {},
+      refused: {},
     });
   });
 
@@ -445,6 +449,33 @@ describe("recording", () => {
     await response.body.dump();
     expect(response.statusCode).toBe(403);
     expect(liveRequests).toBe(0);
+
+    // The stats and the report name the refused origins, so a missing
+    // entry in `allow` shows. A tunnel has no scheme, so it shows as
+    // `host:port`, or as an `https` origin on port 443. The names are
+    // bounded, because the client picks them.
+    const port = new URL(origin).port;
+    await expect(
+      send([{}], "https://openrouter.ai/api/v1/chat/completions"),
+    ).rejects.toThrow("403");
+    for (let host = 0; host < 33; host += 1) {
+      await expect(
+        send([{}], `http://host${host}.test:${port}/v1/messages`),
+      ).rejects.toThrow("403");
+    }
+    const stats = await runs[0]!.stats();
+    const notAllowed = stats.refused?.notAllowed ?? {};
+    // 32 origins by name, and one entry for the rest.
+    expect(Object.keys(notAllowed)).toHaveLength(33);
+    expect(notAllowed).toMatchObject({
+      [`localhost:${port}`]: 1,
+      [`http://localhost:${port}`]: 1,
+      "https://openrouter.ai": 1,
+      "other origins": 4,
+    });
+    expect(describeRecordingStats(stats)).toContain(
+      `Refused: localhost:${port} 1 (not in allow), http://localhost:${port} 1 (not in allow), https://openrouter.ai 1 (not in allow), host0.test:${port} 1 (not in allow)`,
+    );
   });
 
   it("writes a request that ends after its passed session", async () => {

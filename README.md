@@ -193,7 +193,12 @@ A run takes `RunConfig` (`src/types.ts`): `tenant`, `mode`, `rules`,
   them. It refuses all other origins with HTTP 403. The upstream host
   always comes from this list, not from the request. The service sends
   requests only to public addresses, so an origin that resolves to a
-  private, loopback, or link-local address also gets HTTP 403.
+  private, loopback, or link-local address also gets HTTP 403. The stats
+  of the run count the refused requests by origin, in `refused.notAllowed`
+  and `refused.notPublic`. The run report shows them after `Refused:`, so
+  look there first when requests fail with HTTP 403. A tunnel to a port
+  other than 443 shows as `host:port`. The stats name 32 origins for each
+  reason, and count the others as `other origins`.
 - `rules`: the traffic to record. `name` uses letters, digits, `_`, `.`,
   and `-`. `match` has `method`, `url`, and `headers`. `url` is a prefix,
   or a list of 1 to 32 prefixes. A URL that starts with one of them
@@ -426,12 +431,13 @@ Values that changed in real projects:
   you trust, and never to a workflow that runs code from a fork.
 - **Reads are public.** Anyone can start a `replay` run of a tenant, so CI
   jobs of forks replay without a secret. Such a run never writes, and it
-  refuses a request that no rule records, so nothing goes live. Every
-  other mode needs the write token. So treat each recording as readable by
-  anyone who can make its request. Do not record responses that must stay
-  private. Only runs with the write token get the change of a miss, which
-  shows a part of a recorded request (see [Misses](#misses)). So CI of a
-  fork does not show it. Sentry shows it.
+  refuses a request that no rule records, so nothing goes live. The stats
+  count these requests in `refused.replayOnly`. Every other mode needs
+  the write token. So treat each recording as readable by anyone who can
+  make its request. Do not record responses that must stay private. Only
+  runs with the write token get the change of a miss in their stats, and
+  only its offset (see [Misses](#misses)). So CI of a fork does not show
+  it. Sentry shows it.
 - **Runs.** Each run has its own id, token, mode, rules, sessions, and
   stats. A proxied request names its run in `Proxy-Authorization`, as
   `Basic base64(<id>:<token>)`. The proxy URL of the run has them, so

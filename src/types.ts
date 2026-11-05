@@ -97,7 +97,20 @@ export interface RecordingStats {
    * recorded. Use this to find traffic that a rule misses.
    */
   passthrough: Record<string, number>;
+  /**
+   * Requests that the proxy refused with HTTP 403 and sent nowhere, by
+   * reason and origin. An older service does not send it.
+   */
+  refused?: Partial<Record<RefusalReason, Record<string, number>>>;
 }
+
+/**
+ * Why the proxy refused a request:
+ * - `notAllowed`: its origin is not in `allow`.
+ * - `notPublic`: its origin is in `allow`, but its address is not public.
+ * - `replayOnly`: the run can only replay, and no rule records the request.
+ */
+export type RefusalReason = "notAllowed" | "notPublic" | "replayOnly";
 
 /** The configuration of one run. The client sends it. */
 export interface RunConfig {

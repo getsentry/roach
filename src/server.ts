@@ -10,7 +10,8 @@
  * other origins with HTTP 403 and sends nothing. The upstream host always
  * comes from `allow`, never from the request. Only the path comes from the
  * request. It also refuses an origin whose address is not public
- * (`addresses.ts`), unless the service config has `privateNetworks`.
+ * (`addresses.ts`), unless the service config has `privateNetworks`. The
+ * stats of the run count each refused request (`refused`).
  *
  * Each response has an `x-roach` header: `replayed`, `live`,
  * `missed` (`replay` mode had no recording), or `passthrough` (no rule
@@ -21,7 +22,12 @@ import http from "node:http";
 import https from "node:https";
 import { isIP, type Socket } from "node:net";
 import tls from "node:tls";
-import { isPublicAddress, notPublicError, publicLookup } from "./addresses.ts";
+import {
+  isPublicAddress,
+  NOT_PUBLIC_CODE,
+  notPublicError,
+  publicLookup,
+} from "./addresses.ts";
 import type { CertificateAuthority } from "./certificates.ts";
 import type { ProxyRequest, Recorder, Telemetry } from "./recorder.ts";
 import type { OpenedSession } from "./types.ts";
@@ -185,6 +191,7 @@ async function proxyRequest(
   const origin = origins.get(url.origin);
   if (!origin) {
     process.stderr.write(`[roach] Refused ${url.origin}\n`);
+    recorder.countRefused("notAllowed", url.origin);
     outgoing.writeHead(403, { "content-type": "text/plain" });
     outgoing.end(`Roach: ${url.origin} is not an allowed origin\n`);
     return;
@@ -199,6 +206,7 @@ async function proxyRequest(
 
   if (!rule && replayOnly) {
     // Without this, anyone could send live traffic through a public run.
+    recorder.countRefused("replayOnly", origin.origin);
     outgoing.writeHead(403, { "content-type": "text/plain" });
     outgoing.end(
       "Roach: this run can only replay, and no rule records this request\n",
@@ -206,8 +214,9 @@ async function proxyRequest(
     return;
   }
   if (!rule) {
-    recorder.countPassthrough(origin.origin, request.headers);
     const upstream = await sendUpstream(origin, request, privateNetworks);
+    // Count it only when it went out. A refused address counts as refused.
+    recorder.countPassthrough(origin.origin, request.headers);
     outgoing.writeHead(upstream.statusCode ?? 502, upstream.statusMessage, {
       ...upstream.headers,
       "x-roach": "passthrough",
@@ -399,6 +408,9 @@ function serveProxied(
       },
     )
     .catch((error: unknown) => {
+      if ((error as { code?: string }).code === NOT_PUBLIC_CODE) {
+        target.recorder.countRefused("notPublic", String(origin));
+      }
       if (!outgoing.headersSent) {
         const status = (error as { status?: number }).status ?? 502;
         outgoing.writeHead(status, { "content-type": "text/plain" });
@@ -486,6 +498,12 @@ export async function listenProxy(
       );
       if (!allowed) {
         process.stderr.write(`[roach] Refused ${host}:${port}\n`);
+        // The scheme is not known before the tunnel opens. Most tunnels
+        // are HTTPS on 443, so name them as their origin.
+        target.target.recorder.countRefused(
+          "notAllowed",
+          port === "443" ? `https://${host}` : `${host}:${port}`,
+        );
         socket.end("HTTP/1.1 403 Forbidden\r\n\r\n");
         return;
       }
