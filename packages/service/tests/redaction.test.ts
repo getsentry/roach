@@ -4,26 +4,23 @@
  * and request samples. The keys of recordings must not change. Each test
  * starts runs on a service with a local upstream.
  */
-import { createHash } from "node:crypto";
-import { createServer, type Server } from "node:http";
 import {
   brotliCompressSync,
   constants,
   gzipSync,
   zstdCompressSync,
 } from "node:zlib";
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { ProxyAgent, request } from "undici";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { startRemoteRun, type RemoteRoach } from "@sentry/roach/client";
-import { startRoachService, type RoachService } from "../src/service.ts";
+import type { RoachService } from "../src/service.ts";
+import { budget, startTestService, startUpstream, TOKEN } from "./harness.ts";
 import { keyRequest } from "../src/request-key.ts";
 import type { Recording, RequestSample } from "../src/store.ts";
 import type { RecordingMode, RecordingRule } from "@sentry/roach/types";
 
-const TOKEN = "write-token";
 const TENANT = "acme/alpha";
 const API_KEY = "sk-live-request-key-456";
 const MINTED = "minted-access-token-0123456789";
@@ -62,7 +59,6 @@ const BOMB = brotliCompressSync(Buffer.alloc(65 * 1024 * 1024), {
 const BINARY_HEAD = Buffer.from([0x00, 0xff, 0xfe, 0x80]);
 const BINARY_TAIL = Buffer.from([0xc3, 0x28, 0x00, 0x01]);
 
-let upstream: Server;
 let origin: string;
 let directory: string;
 let service: RoachService;
@@ -163,6 +159,27 @@ async function follow(run: RemoteRoach) {
   return [first.source, second.source];
 }
 
+/**
+ * Run `work`, and return the longest time in ms that a timer of 5 ms waited
+ * while it ran. The service runs in this process, so a long wait shows that
+ * the service blocked the event loop.
+ */
+async function longestStall(work: () => Promise<unknown>): Promise<number> {
+  let last = performance.now();
+  let longest = 0;
+  const timer = setInterval(() => {
+    const now = performance.now();
+    longest = Math.max(longest, now - last);
+    last = now;
+  }, 5);
+  try {
+    await work();
+  } finally {
+    clearInterval(timer);
+  }
+  return longest;
+}
+
 /** The one recording of the rule. */
 async function onlyRecording(): Promise<{ text: string; file: Recording }> {
   const files = [...(await stored("api")).values()];
@@ -171,7 +188,7 @@ async function onlyRecording(): Promise<{ text: string; file: Recording }> {
 }
 
 beforeEach(async () => {
-  upstream = createServer((incoming, outgoing) => {
+  ({ origin } = await startUpstream((incoming, outgoing) => {
     const chunks: Buffer[] = [];
     incoming.on("data", (chunk: Buffer) => chunks.push(chunk));
     incoming.on("end", () => {
@@ -330,27 +347,13 @@ beforeEach(async () => {
         outgoing.end(JSON.stringify({ ok: true }));
       }
     });
-  });
-  await new Promise<void>((resolve) =>
-    upstream.listen(0, "127.0.0.1", resolve),
-  );
-  const address = upstream.address();
-  if (!address || typeof address === "string") throw new Error("No port");
-  origin = `http://127.0.0.1:${address.port}`;
-  directory = await mkdtemp(path.join(tmpdir(), "roach-redaction-"));
-  service = await startRoachService({
-    directory,
-    privateNetworks: true,
-    writeTokenHash: createHash("sha256").update(TOKEN).digest("hex"),
-  });
+  }));
+  ({ service, directory } = await startTestService());
 });
 
 afterEach(async () => {
   await Promise.all(agents.splice(0).map((agent) => agent.close()));
   await Promise.all(runs.splice(0).map((run) => run.close().catch(() => {})));
-  await service.close();
-  await new Promise<void>((resolve) => upstream.close(() => resolve()));
-  await rm(directory, { recursive: true, force: true });
 });
 
 describe("redaction", () => {
@@ -734,42 +737,6 @@ describe("redaction", () => {
     );
   });
 
-  it("redacts many credential fields of a request without blocking the event loop", async () => {
-    // 64 different passwords in about 8 MiB, the most that the proxy
-    // checks. Each is a field to redact in the request sample.
-    const fields = Object.fromEntries(
-      Array.from({ length: 64 }, (_, index) => [
-        `f${index}`,
-        { password: `${index}-${"p".repeat(128 * 1024)}` },
-      ]),
-    );
-    const body = JSON.stringify(fields);
-    const run = await start("auto");
-    let last = performance.now();
-    let longest = 0;
-    const timer = setInterval(() => {
-      const now = performance.now();
-      longest = Math.max(longest, now - last);
-      last = now;
-    }, 5);
-    const started = performance.now();
-    try {
-      const live = await send(run, "/v1/fields", body);
-      expect(live.source).toBe("live");
-    } finally {
-      clearInterval(timer);
-    }
-    // About 115 ms, and 700 ms with coverage. A pass for each field took
-    // 16 s.
-    expect(longest).toBeLessThan(2000);
-    expect(performance.now() - started).toBeLessThan(5000);
-    const [sample] = [...(await stored("_requests/api")).values()];
-    const { text, withheld } = JSON.parse(sample!) as RequestSample;
-    expect(withheld).toBeUndefined();
-    // `includes`, so a failure does not print 8 MiB.
-    expect(text.includes("p".repeat(4096))).toBe(false);
-  }, 120_000);
-
   it("redacts a request sample with many different credential values", async () => {
     // The check reads the text once, for all values, so it has no limit
     // of values.
@@ -789,14 +756,31 @@ describe("redaction", () => {
     expect(text).not.toMatch(/password-\d/);
   });
 
+  // Each body is about 8 MiB, the most that the proxy checks. The longest
+  // stall is about 150 ms, and up to 1.8 s with coverage. `leaked` is in
+  // the text only when a password is.
   it.each([
-    // A long value makes a search for it in the text slow.
+    // 64 different passwords. Each is a field to redact in the request
+    // sample. A pass for each field took 16 s.
+    [
+      "many credential fields",
+      Object.fromEntries(
+        Array.from({ length: 64 }, (_, index) => [
+          `f${index}`,
+          { password: `${index}-${"p".repeat(128 * 1024)}` },
+        ]),
+      ),
+      "p".repeat(4096),
+    ],
+    // A long value makes a search for it in the text slow. A search for
+    // each value in the text took 11 s for one value, and minutes for 64.
     [
       "a long value",
       {
         filler: "a".repeat(8 * 1024 * 1024),
         password: `${"a".repeat(1024)} b ${"a".repeat(1024)}`,
       },
+      ` ${"a".repeat(1024)}`,
     ],
     [
       "many long values",
@@ -809,33 +793,26 @@ describe("redaction", () => {
           ]),
         ),
       },
+      ` ${"a".repeat(1024)}`,
     ],
   ])(
     "checks a request sample with %s without blocking the event loop",
-    async (_, fields) => {
+    async (_, fields, leaked) => {
       const run = await start("auto");
-      let last = performance.now();
-      let longest = 0;
-      const timer = setInterval(() => {
-        const now = performance.now();
-        longest = Math.max(longest, now - last);
-        last = now;
-      }, 5);
-      try {
+      const started = performance.now();
+      const longest = await longestStall(async () => {
         const live = await send(run, "/v1/fields", JSON.stringify(fields));
         expect(live.source).toBe("live");
-      } finally {
-        clearInterval(timer);
-      }
-      // About 60 ms, and 300 ms with coverage. A search for each value in
-      // the text took 11 s for one value, and minutes for 64.
-      expect(longest).toBeLessThan(2000);
+      });
+      expect(longest).toBeLessThan(budget(2000));
+      expect(performance.now() - started).toBeLessThan(budget(5000));
       const [sample] = [...(await stored("_requests/api")).values()];
       const { text, withheld } = JSON.parse(sample!) as RequestSample;
       expect(withheld).toBeUndefined();
-      expect(text.includes(` ${"a".repeat(1024)}`)).toBe(false);
+      // `includes`, so a failure does not print 8 MiB.
+      expect(text.includes(leaked)).toBe(false);
     },
-    60_000,
+    120_000,
   );
 
   const JSON_TYPE = "application/json";
@@ -955,24 +932,15 @@ describe("redaction", () => {
       parts.push(`password=p${String(i).padStart(9, "0")}`);
     }
     const run = await start("auto");
-    let last = performance.now();
-    let longest = 0;
-    const timer = setInterval(() => {
-      const now = performance.now();
-      longest = Math.max(longest, now - last);
-      last = now;
-    }, 5);
-    try {
+    const longest = await longestStall(async () => {
       const live = await send(run, "/v1/fields", parts.join("&"), {
         "content-type": FORM_TYPE,
       });
       expect(live.source).toBe("live");
-    } finally {
-      clearInterval(timer);
-    }
-    // About 300 ms, and 900 ms with coverage. Three decodes of each part
+    });
+    // About 550 ms, and 1.7 s with coverage. Three decodes of each part
     // took 1.9 s.
-    expect(longest).toBeLessThan(1500);
+    expect(longest).toBeLessThan(budget(1500));
     const [sample] = [...(await stored("_requests/api")).values()];
     const { text, withheld } = JSON.parse(sample!) as RequestSample;
     expect(withheld).toBeUndefined();
@@ -1084,22 +1052,13 @@ describe("redaction", () => {
     const run = await start("auto", [{ ...rule(), values }]);
     const strings = Array.from({ length: 900_000 }, () => '"\\u0001"');
     const body = `{"a":[${strings.join(",")}],"password":"x"}`;
-    let last = performance.now();
-    let longest = 0;
-    const timer = setInterval(() => {
-      const now = performance.now();
-      longest = Math.max(longest, now - last);
-      last = now;
-    }, 5);
-    try {
+    const longest = await longestStall(async () => {
       const live = await send(run, "/v1/fields", body);
       expect(live.source).toBe("live");
-    } finally {
-      clearInterval(timer);
-    }
-    // About 300 ms, and 1.2 s with coverage. A throw for each string took
+    });
+    // About 1.2 s, and 2 s with coverage. A throw for each string took
     // 5.9 s.
-    expect(longest).toBeLessThan(3000);
+    expect(longest).toBeLessThan(budget(3000));
     const [sample] = [...(await stored("_requests/api")).values()];
     // The escapes that are not valid make the body of the text not JSON,
     // so the proxy cannot check it, and the sample has no text.
@@ -1112,22 +1071,13 @@ describe("redaction", () => {
     const run = await start("auto");
     const strings = Array.from({ length: 1_650_000 }, () => '"\\n"');
     const body = `{"a":[${strings.join(",")}],"password":"pw"}`;
-    let last = performance.now();
-    let longest = 0;
-    const timer = setInterval(() => {
-      const now = performance.now();
-      longest = Math.max(longest, now - last);
-      last = now;
-    }, 5);
-    try {
+    const longest = await longestStall(async () => {
       const live = await send(run, "/v1/fields", body);
       expect(live.source).toBe("live");
-    } finally {
-      clearInterval(timer);
-    }
-    // About 200 ms, and 1.4 s with coverage. Most of it is the parse of the
+    });
+    // About 1 s, and 2.9 s with coverage. Most of it is the parse of the
     // body. A `JSON.parse` of each string made it about two times longer.
-    expect(longest).toBeLessThan(3000);
+    expect(longest).toBeLessThan(budget(3000));
     const [sample] = [...(await stored("_requests/api")).values()];
     expect(JSON.parse(sample!)).not.toHaveProperty("withheld");
   }, 60_000);

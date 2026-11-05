@@ -2,17 +2,7 @@
  * Recording and replay: modes, sessions, changing values, and misses. Each
  * test starts runs on a service with a local upstream.
  */
-import { createHash } from "node:crypto";
-import { createServer, type Server } from "node:http";
-import {
-  mkdir,
-  mkdtemp,
-  readdir,
-  readFile,
-  rm,
-  writeFile,
-} from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { ProxyAgent, request } from "undici";
 import {
@@ -28,15 +18,14 @@ import {
   describeRecordingMisses,
   describeRecordingStats,
 } from "@sentry/roach/report";
-import { startRoachService, type RoachService } from "../src/service.ts";
+import type { RoachService } from "../src/service.ts";
+import { startTestService, startUpstream, TOKEN } from "./harness.ts";
 import { keyRequest } from "../src/request-key.ts";
 import type { RecordingMode, RecordingRule } from "@sentry/roach/types";
 import { extractValues, VALUE_PATTERNS } from "@sentry/roach/values";
 
-const TOKEN = "write-token";
 const TENANT = "acme/alpha";
 
-let upstream: Server;
 let origin: string;
 let liveRequests: number;
 /** The event stream that the upstream sends for a request body. */
@@ -184,7 +173,7 @@ beforeEach(async () => {
   liveRequests = 0;
   respond = () => `data: ${liveRequests}\n\n`;
   upstreamGate = Promise.resolve();
-  upstream = createServer((incoming, outgoing) => {
+  ({ origin } = await startUpstream((incoming, outgoing) => {
     liveRequests += 1;
     const chunks: Buffer[] = [];
     incoming.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -193,28 +182,14 @@ beforeEach(async () => {
       outgoing.writeHead(200, { "content-type": "text/event-stream" });
       outgoing.end(respond(Buffer.concat(chunks).toString("utf8")));
     });
-  });
-  await new Promise<void>((resolve) =>
-    upstream.listen(0, "127.0.0.1", resolve),
-  );
-  const address = upstream.address();
-  if (!address || typeof address === "string") throw new Error("No port");
-  origin = `http://127.0.0.1:${address.port}`;
-  directory = await mkdtemp(path.join(tmpdir(), "roach-"));
-  service = await startRoachService({
-    directory,
-    privateNetworks: true,
-    writeTokenHash: createHash("sha256").update(TOKEN).digest("hex"),
-  });
+  }));
+  ({ service, directory } = await startTestService());
 });
 
 afterEach(async () => {
   await agent?.close();
   agent = undefined;
   await Promise.all(runs.splice(0).map((run) => run.close().catch(() => {})));
-  await service.close();
-  await new Promise<void>((resolve) => upstream.close(() => resolve()));
-  await rm(directory, { recursive: true, force: true });
 });
 
 describe("recording", () => {
