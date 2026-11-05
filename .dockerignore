@@ -3,3 +3,5 @@
 !pnpm-lock.yaml
 !pnpm-workspace.yaml
 !src
+!service
+service/node_modules

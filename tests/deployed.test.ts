@@ -22,7 +22,7 @@ import path from "node:path";
 import tls from "node:tls";
 import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import type { RoachServiceConfig } from "../src/service.ts";
+import type { RoachServiceConfig } from "../service/service.ts";
 
 const execFileAsync = promisify(execFile);
 const ROOT = path.join(import.meta.dirname, "..");
@@ -368,7 +368,7 @@ beforeAll(async () => {
     [
       "--experimental-strip-types",
       "--disable-warning=ExperimentalWarning",
-      path.join(ROOT, "src/cli.ts"),
+      path.join(ROOT, "service/cli.ts"),
       "service",
       configFile,
     ],

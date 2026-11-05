@@ -1,3 +1,7 @@
+# The root is the npm package `@sentry/roach`. `service/` is the private
+# package of the shared service: only it depends on `@sentry/node`.
+packages:
+  - service
 # Install only versions that are at least one day old, so a bad release
 # has time to be pulled before it reaches us.
 minimumReleaseAge: 1440

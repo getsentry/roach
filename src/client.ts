@@ -1,10 +1,10 @@
 /**
  * The client of Roach. See `README.md`.
  *
- * `startRemoteRun()` starts a run on a Roach service (`service.ts`). It
- * returns `env`, the variables that send the traffic of a process through
- * the run. `connectRoach()` controls a run from another process, such as a
- * test worker.
+ * `startRemoteRun()` starts a run on a Roach service
+ * (`service/service.ts`). It returns `env`, the variables that send the
+ * traffic of a process through the run. `connectRoach()` controls a run
+ * from another process, such as a test worker.
  */
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
@@ -133,7 +133,7 @@ export function connectRoach({
   };
 }
 
-/** A run on a Roach service (`service.ts`). */
+/** A run on a Roach service (`service/service.ts`). */
 export interface RemoteRoach extends RemoteRun, RoachControl {
   /**
    * The variables that send the HTTP traffic of a process through the run:

@@ -5,9 +5,15 @@ FROM node:24-alpine
 RUN apk add --no-cache openssl && corepack enable
 WORKDIR /app
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
-RUN pnpm install --prod --frozen-lockfile --ignore-scripts
+COPY service/package.json ./service/
+# Only the dependencies of the service package (`@sentry/node`). The root
+# package, `@sentry/roach`, has none.
+RUN pnpm install --prod --frozen-lockfile --ignore-scripts \
+      --filter @sentry/roach-service
+# The service imports the proxy code in src/ by relative path.
 COPY src ./src
+COPY service/*.ts ./service/
 USER node
 EXPOSE 8080
-ENTRYPOINT ["node", "src/cli.ts"]
+ENTRYPOINT ["node", "service/cli.ts"]
 CMD ["service", "/config/roach.json"]

@@ -73,7 +73,7 @@ resource "random_password" "write_token" {
   special = false
 }
 
-# The service config (`RoachServiceConfig` in src/service.ts). The VM reads
+# The service config (`RoachServiceConfig` in service/service.ts). The VM reads
 # it at each start.
 resource "google_secret_manager_secret" "config" {
   secret_id = "roach-config"

@@ -9,15 +9,15 @@
  *
  * A session groups the requests of one test. Many sessions can be open at
  * once, such as one for each test worker. A request names its session in
- * its proxy URL (`service.ts`). A request that names no session belongs to
- * the open session when only one is open. The recorder keeps the new
- * recordings of a session in memory until the session ends. A passed
+ * its proxy URL (`service/service.ts`). A request that names no session
+ * belongs to the open session when only one is open. The recorder keeps
+ * the new recordings of a session in memory until the session ends. A passed
  * session writes them, and a failed session drops them, so a bad sample is
  * never replayed. A request that ends after its session ended follows the
  * result of that session. A request outside a session is written at once.
  *
  * The recorder never writes a known credential (`secrets.ts`). It reports
- * spans and metrics through the `Telemetry` hooks of `service.ts`.
+ * spans and metrics through the `Telemetry` hooks of `service/service.ts`.
  */
 import { randomBytes } from "node:crypto";
 import type { IncomingHttpHeaders } from "node:http";
@@ -65,10 +65,10 @@ export type ResponseSource = "live" | "missed" | "replayed";
 type Attributes = Record<string, string | number | boolean>;
 
 /**
- * Hooks that report spans and metrics. `service.ts` gives hooks that send
- * them to Sentry, so this file and `server.ts` do not load the SDK. An
- * attribute must never hold a credential, a body, or the path or query of
- * a URL.
+ * Hooks that report spans and metrics. `service/service.ts` gives hooks
+ * that send them to Sentry, so this file and `server.ts` do not load the
+ * SDK. An attribute must never hold a credential, a body, or the path or
+ * query of a URL.
  */
 export interface Telemetry {
   /** Run `fn` in a span. The span ends when `fn` returns or settles. */
