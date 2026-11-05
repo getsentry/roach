@@ -107,7 +107,7 @@ function compile(patterns: ValuePatterns): CompiledValues {
  * Run `fn` with a time limit. A slow pattern cannot stop itself, but the
  * `timeout` of `vm` stops any code that runs too long, also code outside
  * the context that the script calls. A timeout throws an error with HTTP
- * status 400.
+ * status 400 and `timedOut`.
  */
 export function withTimeLimit<T>(ms: number, fn: () => T): T {
   try {
@@ -118,7 +118,7 @@ export function withTimeLimit<T>(ms: number, fn: () => T): T {
     if ((error as { code?: string }).code === "ERR_SCRIPT_EXECUTION_TIMEOUT") {
       throw Object.assign(
         new Error(`the value patterns took over ${ms} ms. Make them simpler.`),
-        { status: 400 },
+        { status: 400, timedOut: true },
       );
     }
     throw error;
@@ -153,11 +153,15 @@ export type KnownValues = ReadonlyMap<string, string>;
  * model repeats the short commit id of a `git push` range in its reply,
  * and a later request sends that reply back. A pattern wins over a known
  * value at the same place.
+ *
+ * Past `maxValues` values, it stops and throws an error with HTTP status
+ * 400. So a text with millions of values cannot fill the memory.
  */
 export function extractValues(
   text: string,
   patterns: ValuePatterns | undefined,
   known?: KnownValues,
+  maxValues = Infinity,
 ): { text: string; values: RequestValues } {
   const values: RequestValues = new Map();
   if (!patterns || Object.keys(patterns).length === 0) {
@@ -170,7 +174,15 @@ export function extractValues(
   const search = hasKnown
     ? new RegExp(`${pattern.source}|(${literals([...known.keys()])})`, "g")
     : pattern;
+  let count = 0;
   const result = text.replace(search, (...match: unknown[]) => {
+    count += 1;
+    if (count > maxValues) {
+      throw Object.assign(
+        new Error("the request has too many changing values"),
+        { status: 400 },
+      );
+    }
     const value = match[0] as string;
     const name =
       hasKnown && match[knownGroup] !== undefined

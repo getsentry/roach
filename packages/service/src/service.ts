@@ -50,6 +50,7 @@ import {
 import { createFileStore } from "./recordings.ts";
 import {
   clientAddress,
+  clientGroup,
   controlRecorder,
   listenProxy,
   parseOrigins,
@@ -107,10 +108,12 @@ export interface RoachServiceConfig {
   /** Without a DSN, the service sends nothing to Sentry. */
   sentryDsn?: string;
   /**
-   * Each connection starts with a PROXY protocol v1 header, such as from a
-   * GCP proxy load balancer with `proxy_header = "PROXY_V1"`. The service
-   * takes the address of the client from it, for the limit of runs for
-   * each client. A connection without the header closes. Default: `false`.
+   * Read a PROXY protocol v1 header at the start of each connection, such
+   * as from a GCP proxy load balancer with `proxy_header = "PROXY_V1"`. The
+   * service takes the address of the client from it, for the limit of runs
+   * for each client. A connection without the header uses the address of
+   * its socket, so the service works before and after the load balancer
+   * sends the header. Default: `false`.
    */
   proxyProtocol?: boolean;
 }
@@ -128,7 +131,10 @@ interface Run extends ProxyTarget {
   token: string;
   started: number;
   lastUsed: number;
-  /** The address of the client that started a run without a token. */
+  /**
+   * The address group (`clientGroup()`) of the client that started a run
+   * without a token.
+   */
   client?: string;
 }
 
@@ -152,8 +158,8 @@ const PUBLIC_RUN_IDLE_MS = 60 * 60 * 1000;
  */
 const MAX_PUBLIC_RUNS = 100;
 /**
- * The open runs without a token of one client address, so one client
- * cannot take all places of `MAX_PUBLIC_RUNS`.
+ * The open runs without a token of one client address, or of one IPv6 /64,
+ * so one client cannot take all places of `MAX_PUBLIC_RUNS`.
  */
 const MAX_PUBLIC_RUNS_PER_CLIENT = 10;
 /** A proxied request body of a run without a token over this gets 413. */
@@ -162,15 +168,19 @@ const PUBLIC_MAX_BODY_BYTES = 16 * 1024 * 1024;
  * The time that a run can use in the key worker (`key-worker.ts`). A key
  * has 1 s and 0.5 s for each MiB of its body. For a run without a token,
  * one job has at most 5 s and all jobs 30 s. Past that, or when a key goes
- * past its time limit, the run ends.
+ * past its time limit, the run ends. In the 14 days to 2026-11-05, the key
+ * time of a run was at most 9.5 s (p99 9.1 s, about 1,000 keys). A request
+ * of a run without a token can have at most 100,000 changing values.
  */
 const PUBLIC_WORK_LIMIT: WorkLimit = {
   maxJobMs: 5000,
+  maxValues: 100_000,
   totalMs: 30_000,
   untrusted: true,
 };
 const WRITE_WORK_LIMIT: WorkLimit = {
   maxJobMs: Infinity,
+  maxValues: Infinity,
   totalMs: Infinity,
   untrusted: false,
 };
@@ -636,7 +646,7 @@ export async function startRoachService(
         });
         return;
       }
-      const client = clientAddress(incoming);
+      const client = clientGroup(clientAddress(incoming));
       if (!canWrite) {
         let open = 0;
         let ofClient = 0;

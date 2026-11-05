@@ -141,8 +141,6 @@ interface Session extends Places {
    * (`@sentry/roach/values`).
    */
   known: Map<string, string>;
-  /** The total length of the values in `known`. */
-  knownLength: number;
   /** Set when the session ends. */
   passed?: boolean;
 }
@@ -163,12 +161,6 @@ const METRIC_OTHER_ORIGIN = "other";
 const MAX_ENDED_SESSIONS = 1000;
 /** Open sessions of a run, such as one for each test worker. */
 const MAX_OPEN_SESSIONS = 64;
-/**
- * The values that a session remembers (`known`), and their total length.
- * A session does not remember later values, so a later request that
- * repeats one has it in its key as it is.
- */
-const MAX_KNOWN = { values: 1000, length: 32 * 1024 };
 /** Response headers that a recording keeps. Other headers change each run. */
 const RECORDED_HEADERS = ["content-type", "location"];
 const NULL_BODY_STATUSES = new Set([101, 204, 205, 304]);
@@ -274,6 +266,11 @@ export interface WorkLimit {
    * body (`keyTimeLimit()`).
    */
   maxJobMs: number;
+  /**
+   * The most changing values in one request. A request with more fails
+   * with HTTP 400. Its key does not change.
+   */
+  maxValues: number;
   /** The time of all jobs of the run, in ms. Past it, the run ends. */
   totalMs: number;
   /**
@@ -303,6 +300,7 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
   /** The options of a job of `bytes` bytes in the key worker. */
   const jobOptions = (bytes: number): JobOptions => ({
     timeLimitMs: Math.min(workLimit.maxJobMs, keyTimeLimit(bytes)),
+    maxValues: workLimit.maxValues,
     first: !workLimit.untrusted,
     skip: () => closed,
   });
@@ -569,15 +567,12 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
             return undefined;
           },
         );
-      // An ended session has no use for more values.
-      if (owner && owner.passed === undefined) {
+      // A session remembers every value, also after it ends. A limit here
+      // would change the keys of later requests that repeat a value.
+      if (owner) {
         for (const [name, list] of keyed.values) {
           for (const value of list) {
-            if (owner.known.has(value)) continue;
-            if (owner.known.size >= MAX_KNOWN.values) continue;
-            if (owner.knownLength + value.length > MAX_KNOWN.length) continue;
-            owner.known.set(value, name);
-            owner.knownLength += value.length;
+            if (!owner.known.has(value)) owner.known.set(value, name);
           }
         }
       }
@@ -702,7 +697,6 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
         recorded: new Map(),
         missed: 0,
         known: new Map(),
-        knownLength: 0,
         sent: new Map(),
         explained: false,
       });

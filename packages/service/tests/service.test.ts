@@ -28,6 +28,7 @@ import {
   type RemoteRoach,
 } from "@sentry/roach/client";
 import { describeRecordingMisses } from "@sentry/roach/report";
+import { keyInWorker } from "../src/key-worker.ts";
 import { startRoachService, type RoachService } from "../src/service.ts";
 import type { RemoteRun, RunConfig } from "@sentry/roach/types";
 import { VALUE_PATTERNS } from "@sentry/roach/values";
@@ -655,7 +656,9 @@ async function rawRequest(
     ...Object.entries(headers).map(([name, value]) => `${name}: ${value}`),
   ];
   const proxyHeader = client
-    ? `PROXY TCP4 ${client} 10.0.0.2 51234 443\r\n`
+    ? client.includes(":")
+      ? `PROXY TCP6 ${client} 2001:db8::2 51234 443\r\n`
+      : `PROXY TCP4 ${client} 10.0.0.2 51234 443\r\n`
     : "";
   const chunks: Buffer[] = [];
   socket.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -716,6 +719,80 @@ describe("limits of the service", () => {
       results.filter((result) => result.status === "fulfilled").length,
     );
     await expect(run.stats()).rejects.toThrow(/404/);
+  });
+
+  it("fails a request with too many values from a run without a token", async () => {
+    const rules = [
+      {
+        name: "model",
+        match: { method: "POST", url: `${origin}/v1/` },
+        values: { v: "x" },
+      },
+    ];
+    const prompt = "x ".repeat(150_000);
+    const reader = await startRun(undefined, "replay", { rules });
+    const tooMany = await send(reader.url, { prompt });
+    expect(tooMany.status).toBe(400);
+    expect(tooMany.body).toMatch(/too many changing values/);
+    // The request fails, but the run goes on.
+    await expect(reader.stats()).resolves.toBeDefined();
+    expect((await send(reader.url, { prompt: "x x" })).status).toBe(412);
+    // A run with the token has no limit.
+    const writer = await startRun("write-token", "auto", { rules });
+    expect((await send(writer.url, { prompt })).status).toBe(200);
+  });
+
+  it("ends a run without a token whose key fills the memory of the worker", async () => {
+    // Each `{}` is an object for `JSON.parse()`, so the body needs more
+    // memory than the worker has.
+    const reader = await startRun(undefined, "replay");
+    const body = Array.from({ length: 5_500_000 }, () => ({}));
+    const sent = send(reader.url, body);
+    const waits = await caWaitsUntil(sent);
+    const failed = await sent;
+    expect(failed.status).toBe(400);
+    expect(failed.body).toMatch(/key worker stopped.*This run has ended/s);
+    expect(Math.max(...waits)).toBeLessThan(500);
+    await expect(reader.stats()).rejects.toThrow(/404/);
+    // The next key gets a new worker.
+    const writer = await startRun("write-token", "auto");
+    expect((await send(writer.url, { prompt: "hi" })).status).toBe(200);
+  });
+
+  it("stops a key that the time limit of vm cannot stop", async () => {
+    // `JSON.parse()` does not stop for the `vm` timeout. The worker stops
+    // after the time limit and a margin of 1 s.
+    const rule = { name: "model", match: {}, values: { v: "x" } };
+    const options = {
+      timeLimitMs: 1,
+      maxValues: Infinity,
+      first: true,
+      skip: () => false,
+    };
+    const body = `[${"{},".repeat(16 * 1024 * 1024)}{}]`;
+    const started = performance.now();
+    const error = await keyInWorker(
+      rule,
+      { method: "POST", url: "https://example.test/", headers: {}, body },
+      undefined,
+      options,
+    ).catch((caught: unknown) => caught);
+    const elapsed = performance.now() - started;
+    expect(error).toMatchObject({
+      message: expect.stringMatching(/the request took over 1 ms/),
+      status: 400,
+      timedOut: true,
+    });
+    // The run gets the time that the job used.
+    expect((error as { ms: number }).ms).toBeGreaterThan(900);
+    expect(elapsed).toBeLessThan(2500);
+    const next = await keyInWorker(
+      rule,
+      { method: "POST", url: "https://example.test/", headers: {}, body: "x" },
+      undefined,
+      { ...options, timeLimitMs: 1000 },
+    );
+    expect(next.value.values).toEqual(new Map([["v", ["x"]]]));
   });
 
   it("refuses a large body from a run without a token", async () => {
@@ -922,6 +999,23 @@ describe("limits of the service", () => {
     const startFrom = (client: string) =>
       rawRequest(local.url, client, "POST", "/__roach/runs", config);
 
+    // A connection without the header, such as before the load balancer
+    // sends it, has the address of its socket.
+    const bare = await rawRequest(
+      local.url,
+      undefined,
+      "POST",
+      "/__roach/runs",
+      config,
+    );
+    expect(bare.status).toBe(201);
+    // A header that is not valid closes the connection.
+    const { hostname, port } = new URL(local.url);
+    const socket = connect(Number(port), hostname);
+    socket.write("PROXY TCP4 not-an-address\r\nGET / HTTP/1.1\r\n\r\n");
+    socket.resume();
+    await once(socket, "close");
+
     const first = await startFrom("203.0.113.1");
     expect(first.status).toBe(201);
     for (let n = 1; n < 10; n += 1) {
@@ -930,9 +1024,14 @@ describe("limits of the service", () => {
     const eleventh = await startFrom("203.0.113.1");
     expect(eleventh).toMatchObject({ status: 429 });
     expect(eleventh.body).toMatch(/Your address has 10 open runs/);
+    // The addresses of one IPv6 /64 share a limit.
+    for (let n = 1; n <= 10; n += 1) {
+      expect((await startFrom(`2001:db8:0:1::${n}`)).status).toBe(201);
+    }
+    expect((await startFrom("2001:db8:0:1:ffff::1")).status).toBe(429);
     // Other clients have their own limit, and the service has 100 places.
-    for (let client = 2; client <= 10; client += 1) {
-      for (let n = 0; n < 10; n += 1) {
+    for (let client = 2; client <= 9; client += 1) {
+      for (let n = 0; n < (client === 9 ? 9 : 10); n += 1) {
         expect((await startFrom(`203.0.113.${client}`)).status).toBe(201);
       }
     }
@@ -951,15 +1050,5 @@ describe("limits of the service", () => {
     );
     expect(ended.status).toBe(200);
     expect((await startFrom("203.0.113.1")).status).toBe(201);
-
-    // A connection without the header gets no answer.
-    const bare = await rawRequest(
-      local.url,
-      undefined,
-      "POST",
-      "/__roach/runs",
-      config,
-    );
-    expect(bare.status).toBe(0);
   });
 });
