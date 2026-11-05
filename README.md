@@ -236,8 +236,8 @@ A run takes `RunConfig` (`packages/roach/src/types.ts`): `tenant`, `mode`, `rule
   new credential gets HTTP 431, and the proxy does not send or record it.
   A request with known credentials goes on. Start a new run to learn more.
 - Compressed bodies: the proxy asks the upstream for a body without a
-  content encoding. When the upstream sends `gzip`, `deflate`, or `br`
-  all the same, the proxy decodes the body before it redacts and records
+  content encoding. When the upstream sends `gzip`, `deflate`, `br`, or
+  `zstd` all the same, the proxy decodes the body before it redacts and records
   it. It decodes 64 MiB at most. When the body does not decode, or when
   it decodes to more than 64 MiB, the proxy does not record it. It
   writes a log line, and the client gets the body as it came.
@@ -267,9 +267,21 @@ A run takes `RunConfig` (`packages/roach/src/types.ts`): `tenant`, `mode`, `rule
     not redact a field such as `password` in a response, or a field at a
     lower depth, or text in a string, such as `?access_token=` in a
     command.
-  - A recording shows `<<redacted>>` in place of the value. A JSON body
-    stays valid JSON. The proxy also does this for a body that is valid
+  - A recording shows `<<redacted>>` in place of the value. The proxy
+    replaces only the value after the name of its field. All other text
+    of the body keeps its bytes, also the same text at other places, and
+    the spaces and the order of the fields. So a JSON body stays valid
+    JSON. A byte order mark at the start and unicode escapes in the value
+    do not stop it. The proxy also does this for a body that is valid
     UTF-8 JSON when its content type is not JSON, or when it has none.
+    When a minted value stays in the body after this, the proxy does not
+    record the response. It writes a log line, and the client gets the
+    body as it came.
+  - The proxy does not find these fields in text that is not one JSON
+    value, such as the `data:` lines of a stream (`text/event-stream`), or
+    JSON that is not valid. It keeps them there. It still redacts each
+    known value in such a body. When a field name of the top object comes
+    two times, it reads only the last value, as `JSON.parse` does.
     A recording keeps an `application/x-www-form-urlencoded` body as
     text. The `location` header of a recording shows `<<redacted>>` for
     each known value, and for each of these fields in its query and its
@@ -285,8 +297,8 @@ A run takes `RunConfig` (`packages/roach/src/types.ts`): `tenant`, `mode`, `rule
     only sends the credential back in a header, such as `Authorization`,
     replays without a change, because the key does not use that header.
     A client that reads the credential, such as one that decodes a JWT
-    `id_token`, or that sends it in a body or a key header, does not work
-    on replay. Do not record such requests with a rule.
+    `id_token`, or that sends it in a body, in the URL query, or in a key
+    header, does not work on replay. Do not record such requests with a rule.
 - Credentials in a request body: a request sample and the text of a miss
   in Sentry show `<<redacted>>` for the fields above, and also for
   `bearer_token`, `client_assertion`, `password`, `api_key`,

@@ -6,7 +6,12 @@
  */
 import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
-import { brotliCompressSync, constants, gzipSync } from "node:zlib";
+import {
+  brotliCompressSync,
+  constants,
+  gzipSync,
+  zstdCompressSync,
+} from "node:zlib";
 import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -34,6 +39,15 @@ const TOOL_INPUTS: Record<string, Record<string, unknown>> = {
   fragment: { url: "https://app.test/cb#access_token=abc123def&expires_in=60" },
   nested: { grant: { refresh_token: "tool-refresh-token-123" } },
 };
+/**
+ * A minted token with the same text as a message, in JSON with its own
+ * spaces and order of fields.
+ */
+const SAME_TEXT = `{
+  "choices": [{ "message": { "content": "yes" } }],
+  "access_token":   "yes",
+  "token_type": "Bearer"
+}`;
 /** A string value larger than 8 MiB, with no character to escape. */
 const LARGE = "QUJD".repeat(2.25 * 1024 * 1024);
 /** Brotli of 1 MiB more than the proxy decodes. It is a few hundred bytes. */
@@ -57,10 +71,13 @@ const rule = (): RecordingRule => ({
 });
 
 /** Start a run with the write token. */
-async function start(mode: RecordingMode): Promise<RemoteRoach> {
+async function start(
+  mode: RecordingMode,
+  rules: RecordingRule[] = [rule()],
+): Promise<RemoteRoach> {
   const run = await startRemoteRun(
     { url: service.url, token: TOKEN },
-    { tenant: TENANT, mode, allow: [origin], rules: [rule()] },
+    { tenant: TENANT, mode, allow: [origin], rules },
   );
   runs.push(run);
   return run;
@@ -268,6 +285,25 @@ beforeEach(async () => {
           "content-encoding": "gzip",
         });
         outgoing.end(`{"access_token":"${MINTED}"}`);
+      } else if (pathname === "/v1/zstd") {
+        outgoing.writeHead(200, {
+          "content-type": "application/json",
+          "content-encoding": "zstd",
+        });
+        outgoing.end(
+          zstdCompressSync(JSON.stringify({ access_token: MINTED })),
+        );
+      } else if (pathname === "/v1/bom") {
+        // JSON after a byte order mark.
+        outgoing.writeHead(200, { "content-type": "application/json" });
+        outgoing.end(`\uFEFF${JSON.stringify({ access_token: MINTED })}`);
+      } else if (pathname === "/v1/escaped") {
+        // The same token, with each `-` as a unicode escape.
+        outgoing.writeHead(200, { "content-type": "application/json" });
+        outgoing.end(`{"access_token":"${MINTED.replaceAll("-", "\\u002d")}"}`);
+      } else if (pathname === "/v1/same-text") {
+        outgoing.writeHead(200, { "content-type": "application/json" });
+        outgoing.end(SAME_TEXT);
       } else if (pathname === "/v1/note") {
         // A later response that shows the minted token in plain text.
         outgoing.writeHead(200, { "content-type": "text/plain" });
@@ -556,6 +592,123 @@ describe("redaction", () => {
       source: "live",
     });
     expect((await stored("api")).size).toBe(1);
+  });
+
+  it("decodes a zstd response before it redacts and records it", async () => {
+    const run = await start("auto");
+    const live = await send(run, "/v1/zstd", "{}");
+    expect(JSON.parse(live.body.toString())).toEqual({ access_token: MINTED });
+    const { text, file } = await onlyRecording();
+    expect(text).not.toContain(MINTED);
+    expect(file.response.body).toBe('{"access_token":"<<redacted>>"}');
+  });
+
+  it("redacts a minted credential in JSON after a byte order mark", async () => {
+    const run = await start("auto");
+    await send(run, "/v1/bom", "{}");
+    const { text } = await onlyRecording();
+    expect(text).not.toContain(MINTED);
+    const replayed = await send(await start("replay"), "/v1/bom", "{}");
+    expect(replayed.body.toString()).toBe(
+      '\uFEFF{"access_token":"<<redacted>>"}',
+    );
+  });
+
+  it("redacts a minted credential with unicode escapes", async () => {
+    const run = await start("auto");
+    await send(run, "/v1/escaped", "{}");
+    const { text, file } = await onlyRecording();
+    expect(text).not.toContain(MINTED.replaceAll("-", "\\u002d"));
+    expect(text).not.toContain(MINTED);
+    expect(JSON.parse(file.response.body)).toEqual({
+      access_token: "<<redacted>>",
+    });
+  });
+
+  it("replaces only the value of a minted field, and keeps all other text", async () => {
+    // `content` has the same text as the token. The live client gets it,
+    // so a replay must give it too.
+    const run = await start("auto");
+    const live = await send(run, "/v1/same-text", "{}");
+    expect(live.body.toString()).toBe(SAME_TEXT);
+    const replayed = await send(await start("replay"), "/v1/same-text", "{}");
+    expect(replayed.body.toString()).toBe(
+      SAME_TEXT.replace(
+        '"access_token":   "yes"',
+        '"access_token":   "<<redacted>>"',
+      ),
+    );
+  });
+
+  it("redacts many credential fields of a request without blocking the event loop", async () => {
+    // 2,000 different passwords in about 8 MiB. Each is a field to redact
+    // in the request sample.
+    const fields = Object.fromEntries(
+      Array.from({ length: 2000 }, (_, index) => [
+        `f${index}`,
+        { password: `${index}-${"p".repeat(4096)}` },
+      ]),
+    );
+    const body = JSON.stringify(fields);
+    const run = await start("auto");
+    let last = performance.now();
+    let longest = 0;
+    const timer = setInterval(() => {
+      const now = performance.now();
+      longest = Math.max(longest, now - last);
+      last = now;
+    }, 5);
+    const started = performance.now();
+    try {
+      const live = await send(run, "/v1/fields", body);
+      expect(live.source).toBe("live");
+    } finally {
+      clearInterval(timer);
+    }
+    // About 115 ms, and 700 ms with coverage. A pass for each field took
+    // 16 s.
+    expect(longest).toBeLessThan(2000);
+    expect(performance.now() - started).toBeLessThan(5000);
+    const [sample] = [...(await stored("_requests/api")).values()];
+    const { text } = JSON.parse(sample!) as RequestSample;
+    // `includes`, so a failure does not print 8 MiB.
+    expect(text.includes("p".repeat(4096))).toBe(false);
+  }, 120_000);
+
+  it("redacts a credential field of a request with escapes in its value", async () => {
+    // `\/` and `\u` are other ways to write the same value. The key writes
+    // a body that parses again, but keeps the text of one that does not,
+    // such as one after a byte order mark.
+    const escaped = String.raw`{"password":"pass\/word\u002dsecret"}`;
+    const run = await start("auto");
+    await send(run, "/v1/escaped-field", escaped);
+    await send(run, "/v1/escaped-field-bom", `\uFEFF${escaped}`);
+    const samples = [...(await stored("_requests/api")).values()].map(
+      (sample) => (JSON.parse(sample) as RequestSample).text,
+    );
+    expect(samples).toHaveLength(2);
+    for (const text of samples) {
+      expect(text).not.toContain("secret");
+      expect(text).toContain(`"password":"<<redacted>>"`);
+    }
+  });
+
+  it("reads a string that does not close only once", async () => {
+    // The pattern takes the quotes from around a long value of escaped
+    // quotes, so in the text of the key that string does not close.
+    const values = { v: String.raw`:"(?=\\)|(?<!\\)"(?=\}$)` };
+    const run = await start("auto", [{ ...rule(), values }]);
+    const body = JSON.stringify({
+      password: "secret-pass-1",
+      v: '"'.repeat(40 * 1024),
+    });
+    const started = performance.now();
+    const live = await send(run, "/v1/fields", body);
+    // About 5.7 s when it reads the rest of the line again at each quote.
+    expect(performance.now() - started).toBeLessThan(1000);
+    expect(live.source).toBe("live");
+    const [sample] = [...(await stored("_requests/api")).values()];
+    expect(sample).not.toContain("secret-pass-1");
   });
 
   it("does not record a compressed body that decodes to more than 64 MiB", async () => {
