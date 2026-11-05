@@ -100,32 +100,41 @@ export function clientAddress(incoming: http.IncomingMessage): string {
 /**
  * The group of a client address for the limit of runs for each client. An
  * IPv6 client often has a whole /64, so the group of an IPv6 address is
- * its /64, such as `2001:db8:0:1::/64`. An IPv4 address, also in IPv6
- * form (`::ffff:192.0.2.1`), is its own group.
+ * its /64, such as `2001:db8:0:1::/64`. An IPv4 address is its own group,
+ * also in each IPv6 form, such as `::ffff:192.0.2.1`, `::ffff:c000:201`,
+ * and `0:0:0:0:0:ffff:192.0.2.1`.
  */
 export function clientGroup(address: string): string {
-  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(address);
-  if (mapped) return mapped[1]!;
   if (isIP(address) !== 6) return address;
-  // Write `::` as its zero groups. An address that ends in IPv4 form has
-  // two groups in it, but only the first four groups count.
-  const [head = "", tail] = address.toLowerCase().split("::");
+  const groups = ipv6Groups(address);
+  if (
+    groups.slice(0, 5).every((group) => group === 0) &&
+    groups[5] === 0xffff
+  ) {
+    const [high = 0, low = 0] = groups.slice(6);
+    return [high >> 8, high & 0xff, low >> 8, low & 0xff].join(".");
+  }
+  return `${groups
+    .slice(0, 4)
+    .map((group) => group.toString(16))
+    .join(":")}::/64`;
+}
+
+/** The eight 16-bit groups of an IPv6 address. */
+function ipv6Groups(address: string): number[] {
+  // The URL parser writes each IPv6 form with hex groups only, such as
+  // `::ffff:c000:201`. A zone, such as `%eth0`, is not part of it.
+  const [head = "", tail] = new URL(
+    `http://[${address.split("%")[0]}]`,
+  ).hostname
+    .slice(1, -1)
+    .split("::");
   const front = head ? head.split(":") : [];
   const back = tail ? tail.split(":") : [];
-  const groups =
-    tail === undefined
-      ? front
-      : [
-          ...front,
-          ...Array<string>(Math.max(0, 8 - front.length - back.length)).fill(
-            "0",
-          ),
-          ...back,
-        ];
-  const prefix = groups
-    .slice(0, 4)
-    .map((group) => Number.parseInt(group, 16).toString(16));
-  return `${prefix.join(":")}::/64`;
+  const zeros = Array<string>(8 - front.length - back.length).fill("0");
+  return [...front, ...zeros, ...back].map((group) =>
+    Number.parseInt(group, 16),
+  );
 }
 
 /** An error that answers a request with its own status. */
@@ -155,13 +164,70 @@ function authorityOf(origin: URL): string {
 }
 
 /**
- * Read a whole body. A body over `maxBytes` fails with HTTP 413. Only
- * request bodies have a limit: the client sends them, and a large upstream
- * response is not the fault of the client.
+ * The bytes of request bodies that the requests of many targets can hold
+ * at one time (`ProxyTarget.bodyBudget`). `used` counts the bodies of the
+ * requests that did not finish, and `clients` counts them for each client
+ * (`ProxyTarget.client`). One client can hold at most `perClient` bytes,
+ * so it cannot take all of `max`. A body that takes longer than `readMs`
+ * to come fails with HTTP 408 and gives its bytes back.
+ */
+export interface BodyBudget {
+  max: number;
+  perClient: number;
+  readMs: number;
+  used: number;
+  clients: Map<string, number>;
+}
+
+/** The bytes that one request holds of its `BodyBudget`. */
+interface Held {
+  budget: BodyBudget | undefined;
+  client: string;
+  bytes: number;
+}
+
+/** Hold `bytes` more of the budget. Returns `false` when they do not fit. */
+function hold(held: Held, bytes: number): boolean {
+  const { budget, client } = held;
+  if (!budget) return true;
+  const ofClient = budget.clients.get(client) ?? 0;
+  if (budget.used + bytes > budget.max || ofClient + bytes > budget.perClient) {
+    return false;
+  }
+  budget.used += bytes;
+  budget.clients.set(client, ofClient + bytes);
+  held.bytes += bytes;
+  return true;
+}
+
+/** Give back all bytes that a request holds. */
+function release(held: Held): void {
+  const { budget, client, bytes } = held;
+  held.bytes = 0;
+  if (!budget || bytes === 0) return;
+  budget.used -= bytes;
+  const left = (budget.clients.get(client) ?? 0) - bytes;
+  if (left > 0) budget.clients.set(client, left);
+  else budget.clients.delete(client);
+}
+
+const busyError = () =>
+  httpError(
+    503,
+    "the service has too many large requests at this time. Send the request again later.",
+  );
+
+/**
+ * Read a whole body. A body over `maxBytes` fails with HTTP 413. A body
+ * that does not fit in the budget of `held` fails with HTTP 503, and one
+ * that does not come in the `readMs` of the budget fails with HTTP 408.
+ * Only request bodies have a limit: the client sends them, and a large
+ * upstream response is not the fault of the client.
  */
 function readBody(
   stream: http.IncomingMessage,
   maxBytes = Infinity,
+  held: Held = { budget: undefined, client: "", bytes: 0 },
 ): Promise<Buffer> {
   const declared = Number(stream.headers["content-length"]);
   if (declared > maxBytes) {
@@ -169,21 +235,52 @@ function readBody(
     stream.resume();
     return Promise.reject(httpError(413, `body is over ${maxBytes} bytes`));
   }
+  // Hold the bytes when they come, not the declared length. So a client
+  // that declares a large body and then sends nothing holds nothing.
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
+    let failed = false;
+    const fail = (error: Error) => {
+      // Read the rest without keeping it, so the client gets the error.
+      failed = true;
+      chunks.length = 0;
+      clearTimeout(deadline);
+      reject(error);
+    };
+    // Node does not time out a request in a tunnel (`listenProxy()`), so
+    // a client that sends a byte now and then could hold its bytes for
+    // as long as the tunnel stays open.
+    const readMs = held.budget?.readMs;
+    const deadline =
+      readMs === undefined
+        ? undefined
+        : setTimeout(
+            () =>
+              fail(
+                httpError(408, `the body did not come in ${readMs / 1000} s`),
+              ),
+            readMs,
+          );
     stream.on("data", (chunk: Buffer) => {
+      if (failed) return;
       size += chunk.length;
       if (size > maxBytes) {
-        // Read the rest without keeping it, so the client gets the 413.
-        chunks.length = 0;
-        reject(httpError(413, `body is over ${maxBytes} bytes`));
-        return;
+        fail(httpError(413, `body is over ${maxBytes} bytes`));
+      } else if (!hold(held, chunk.length)) {
+        fail(busyError());
+      } else {
+        chunks.push(chunk);
       }
-      chunks.push(chunk);
     });
-    stream.on("end", () => resolve(Buffer.concat(chunks)));
-    stream.on("error", reject);
+    stream.on("end", () => {
+      clearTimeout(deadline);
+      resolve(Buffer.concat(chunks));
+    });
+    stream.on("error", (error) => {
+      clearTimeout(deadline);
+      reject(error);
+    });
   });
 }
 
@@ -283,6 +380,7 @@ async function proxyRequest(
   incoming: http.IncomingMessage,
   outgoing: http.ServerResponse,
   tunnelOrigin: string | undefined,
+  held: Held,
 ): Promise<void> {
   const url = new URL(
     tunnelOrigin ? `${tunnelOrigin}${incoming.url}` : (incoming.url ?? ""),
@@ -299,7 +397,7 @@ async function proxyRequest(
     method: incoming.method ?? "GET",
     url,
     headers: incoming.headers,
-    body: await readBody(incoming, maxBodyBytes),
+    body: await readBody(incoming, maxBodyBytes, held),
   };
   const rule = recorder.ruleFor(request);
 
@@ -423,6 +521,18 @@ export interface ProxyTarget {
   closed?: boolean;
   /** A request body over this size gets HTTP 413. Default: 64 MiB. */
   maxBodyBytes?: number;
+  /**
+   * The budget that the request bodies of this target take from, until
+   * each request finishes. A body that does not fit gets HTTP 503, and the
+   * run goes on. Targets can share one budget.
+   */
+  bodyBudget?: BodyBudget;
+  /**
+   * The client whose part of `bodyBudget` the requests take. The service
+   * sets it for a run without the token: the address group
+   * (`clientGroup()`) of the client that started the run.
+   */
+  client?: string;
   /** The time of the last proxied request, from `Date.now()`. */
   lastUsed?: number;
   /** Gets a span for each proxied request. */
@@ -559,11 +669,25 @@ function serveProxied(
         attributes: { "roach.origin": origin, "http.request.method": method },
       },
       async () => {
+        const held: Held = {
+          budget: target.bodyBudget,
+          client: target.client ?? "",
+          bytes: 0,
+        };
         try {
-          await proxyRequest(target, session, incoming, outgoing, tunnelOrigin);
+          await proxyRequest(
+            target,
+            session,
+            incoming,
+            outgoing,
+            tunnelOrigin,
+            held,
+          );
         } catch (error) {
           // In the span, so that the Sentry event is in the trace.
           answerError(target, origin, error, outgoing);
+        } finally {
+          release(held);
         }
         telemetry.annotate({
           "http.response.status_code": outgoing.statusCode,
@@ -588,8 +712,26 @@ function answerError(
     status === undefined
       ? reportInternal("Request", error, target.telemetry.capture(error))
       : (error as Error).message;
+  // A body that did not fit in the budget, or that did not come in time,
+  // is not a miss and not an error. Count it, so that Sentry shows it.
+  const result =
+    status === 503 ? "busy" : status === 408 ? "timeout" : undefined;
+  if (result) {
+    target.telemetry.annotate({ "roach.result": result });
+    target.telemetry.count("roach.request", 1, {
+      "roach.origin": origin,
+      "roach.result": result,
+    });
+  }
   if (!outgoing.headersSent) {
-    outgoing.writeHead(status ?? 502, { "content-type": "text/plain" });
+    outgoing.writeHead(status ?? 502, {
+      "content-type": "text/plain",
+      // Clients of model APIs send a 503 again, after this time in s.
+      ...(status === 503 ? { "retry-after": "1" } : {}),
+      // The rest of a slow body does not come in time, so close the
+      // connection and do not wait for it.
+      ...(status === 408 ? { connection: "close" } : {}),
+    });
   }
   outgoing.end(`Roach error: ${text}\n`);
 }

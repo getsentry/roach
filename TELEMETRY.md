@@ -50,6 +50,11 @@ For metrics, use `-f dataset=tracemetrics`,
   `roach.reason` tells why: `notAllowed` (the origin is not in `allow`),
   `notPublic` (the address is not public), or `replayOnly` (a run without
   the token, and no rule records the request).
+- **Busy**: the body of a run without the token did not fit in the
+  budget of bodies, and the proxy answered HTTP 503 with `Retry-After`.
+  The run goes on, and the client can send the request again.
+- **Timeout**: the body of a run without the token did not come in 30 s,
+  and the proxy answered HTTP 408.
 - **Dropped**: a live response was recorded, but its session failed, so the
   recording was not written. The next run sends the request live again.
 
@@ -96,8 +101,8 @@ The examples use the `sentry` CLI. The same fields work in Explore. The
 counts are estimates (see [Sampling](#sampling)).
 
 Cached and uncached requests by rule. The hit rate of a rule is
-`replayed / (replayed + live + missed)`. Do not count `passthrough` or
-`refused`.
+`replayed / (replayed + live + missed)`. Do not count `passthrough`,
+`refused`, `busy`, or `timeout`.
 
 ```bash
 sentry explore sentry/roach --dataset metrics --metric roach.request --agg sum \
@@ -119,6 +124,16 @@ Refused requests, by reason and origin.
 sentry explore sentry/roach --dataset metrics --metric roach.request --agg sum \
   --period 24h -q 'roach.result:refused' -F roach.tenant -F roach.reason \
   -F roach.origin
+```
+
+Requests of runs without the token that the budget of bodies stopped
+(`busy`, HTTP 503) or that were too slow (`timeout`, HTTP 408), by tenant.
+A steady count of `busy` from many tenants shows that the budget is too
+small. A count from one tenant shows one client that fills its part.
+
+```bash
+sentry explore sentry/roach --dataset metrics --metric roach.request --agg sum \
+  --period 24h -q 'roach.result:[busy,timeout]' -F roach.tenant -F roach.result
 ```
 
 Time saved by a replay. Compare `live` and `replayed` for each rule. Use
