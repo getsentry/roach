@@ -396,6 +396,19 @@ describe("redaction", () => {
     },
   );
 
+  it.each([
+    ["a number", 8675309],
+    ["a number in an array", [8675309]],
+  ])(
+    "redacts a parameter of the URL of a recording that holds a credential field of the body, as %s",
+    async (_, password) => {
+      const run = await start("auto");
+      await send(run, "/v1/login?pin=8675309", JSON.stringify({ password }));
+      const { file } = await onlyRecording();
+      expect(file.request.url).toBe(`${origin}/v1/login?pin=<<redacted>>`);
+    },
+  );
+
   it("redacts a known credential in a binary body before it encodes it", async () => {
     const run = await start("auto");
     const live = await send(run, "/v1/binary", "{}", { "x-api-key": API_KEY });
@@ -1262,6 +1275,25 @@ describe("redaction", () => {
       [`api_key=abc123&data=%7B%22password%22%3A%22${HIDDEN}%22%7D`, form],
       [`payload=%7B%22pass%77ord%22%3A%22${HIDDEN}%22%7D&pct=100%`, form],
       [`see ${dashJwt}`, "text/plain"],
+      [`see x_${JWT}`, "text/plain"],
+      [`see 9${JWT}`, "text/plain"],
+      [`see -${dashJwt}`, "text/plain"],
+      // A bare `token` without a credential prefix is not a credential
+      // field, so its value is checked like any other.
+      ...[
+        "token=%7B%22password%22%3A%22S%22%7D",
+        "Token=%7B%22password%22%3A%22S%22%7D",
+        "user[token]=%7B%22password%22%3A%22S%22%7D",
+        "token=user.password%3DS",
+      ].map((part): [string, string] => [
+        `api_key=abc123&${part.replace("S", HIDDEN)}`,
+        form,
+      ]),
+      // A credential value or a JWT in a part of a form name that
+      // `formName` does not keep.
+      [`${HIDDEN}[password]=x&api_key=${HIDDEN}`, form],
+      [`a[${HIDDEN}][b]=x&api_key=${HIDDEN}`, form],
+      [`a[${JWT}][b]=x&api_key=abc123`, form],
     ];
     // A body without a name keeps its text.
     const kept = `{"note":"tokens and keys",}`;

@@ -100,15 +100,30 @@ const CREDENTIAL_WORD = new RegExp(`^(?:${CREDENTIAL_NAME_SOURCE})$`, "i");
  */
 const TOKEN_VALUE =
   /^(?:gh[pousr]_|github_pat_|xox[abprs]-|eyJ[^.\s"]*\.[^.\s"]*\.)/;
+/** A credential prefix of `TOKEN_VALUE` that is not a JWT. */
+const TOKEN_PREFIX = /gh[pousr]_|github_pat_|xox[abprs]-/;
 /**
- * A credential prefix of `TOKEN_VALUE` at any place of a text: a JWT, with
- * a header and a payload that both start with `eyJ`. A header with `-`
- * in its base64url counts from the start of a run of base64url
- * characters, and a header without `-` counts from a word start, so each
- * character is read a few times at most.
+ * A run of base64url characters that a `.` and `eyJ` follow: the header of
+ * a JWT, with its payload after it. It starts only where no such
+ * character comes before, so each run is read a few times at most.
  */
-const TOKEN_TEXT =
-  /gh[pousr]_|github_pat_|xox[abprs]-|(?<![\w-])eyJ[\w-]*\.eyJ|\beyJ\w*\.eyJ/;
+const JWT_HEADER = /(?<![\w-])[\w-]+(?=\.eyJ)/g;
+
+/**
+ * Tells whether `text` has a credential prefix of `TOKEN_VALUE` at any
+ * place: a prefix of `TOKEN_PREFIX`, or a JWT, a header that has `eyJ` at
+ * any place of it and a payload that starts with `eyJ`. It reads the text
+ * a few times at most.
+ */
+function showsToken(text: string): boolean {
+  if (TOKEN_PREFIX.test(text)) return true;
+  // Most texts have no payload, so they make no list of matches.
+  if (!text.includes(".eyJ")) return false;
+  for (const [header] of text.matchAll(JWT_HEADER)) {
+    if (header.includes("eyJ")) return true;
+  }
+  return false;
+}
 
 /**
  * Tells whether a field or a parameter holds a credential, from its
@@ -593,10 +608,10 @@ function valueTest(values: string[]): (text: string) => boolean {
  * The credential fields of a parsed JSON body at any depth, as
  * `formFields` gives them for a form: their number, and the values that
  * are strings. A field whose value is a number, an object, or an array
- * counts too, and each string in an object or an array is a value, so
- * its copies at other places are found. `keepsFields` checks each place.
- * It walks with a list, not with recursion, so a deep value cannot
- * overflow the stack.
+ * counts too, and each string and number in its value is a value, so
+ * its copies at other places are found (`addValues`). `keepsFields`
+ * checks each place. It walks with a list, not with recursion, so a deep
+ * value cannot overflow the stack.
  */
 function jsonFields(json: unknown): { count: number; values: string[] } {
   const values: string[] = [];
@@ -628,7 +643,7 @@ function jsonFields(json: unknown): { count: number; values: string[] } {
       ) {
         if (fieldKind(name) === "credential") {
           count += 1;
-          if (typeof item === "object") addStrings(item, values);
+          addValues(item, values);
         }
       }
       if (item !== null && typeof item === "object") pending.push(item);
@@ -639,15 +654,18 @@ function jsonFields(json: unknown): { count: number; values: string[] } {
 
 /**
  * Add each string in a parsed JSON value that is not empty or
- * `<<redacted>>` to `strings`, at any depth, without the names of its
- * fields. It walks with a list.
+ * `<<redacted>>`, and each number as decimal text, to `values`, at any
+ * depth, without the names of its fields. A number gives no text of a
+ * request sample, but a copy of it in the URL of a recording is
+ * redacted. It walks with a list.
  */
-function addStrings(json: object, strings: string[]): void {
+function addValues(json: unknown, values: string[]): void {
   const pending: unknown[] = [json];
   while (pending.length > 0) {
     const value = pending.pop();
-    if (typeof value === "string") {
-      if (value !== "" && value !== REDACTED) strings.push(value);
+    if (typeof value === "number") values.push(String(value));
+    else if (typeof value === "string") {
+      if (value !== "" && value !== REDACTED) values.push(value);
     } else if (value !== null && typeof value === "object") {
       for (const item of Object.values(value)) pending.push(item);
     }
@@ -657,10 +675,11 @@ function addStrings(json: object, strings: string[]): void {
 /**
  * The text of a form body, after a value pattern changed it, with the
  * value of each credential field replaced, in one pass. It is `undefined`
- * when the result can still show a value: when a name or a value of
- * another field is a credential value (`isValue`), when another field can
- * show a credential (`mayShowCredential`), such as `user.password` or
- * JSON with URL escapes, or when fewer than `expected` fields hold
+ * when the result can still show a value: when a name of a field shows a
+ * credential (`nameShows`), when a value of another field is a credential
+ * value (`isValue`), when another field can show a credential
+ * (`partMayShow`), such as `user.password` or JSON with URL escapes, or
+ * when fewer than `expected` fields hold
  * `<<redacted>>` (`formFields`). Then a value pattern took a field away,
  * such as with its name. A field that held `<<redacted>>` before counts
  * in `expected`, so it cannot take the place of that field.
@@ -676,17 +695,19 @@ function redactFormBody(
   let shows = false;
   eachPart(body, (start, equals, end) => {
     const { name, value } = formField(body, start, equals, end);
-    if (isCredentialField(name, value)) {
+    if (nameShows(body.slice(start, equals < 0 ? end : equals), isValue)) {
+      shows = true;
+    } else if (isCredentialField(name, value)) {
       parts.push(body.slice(from, equals + 1), REDACTED);
       from = end;
       count += 1;
     } else if (value === REDACTED && credentialName(name)) count += 1;
     else if (
-      isValue(name) ||
       isValue(value) ||
-      // The name of a credential field with an empty value, or a bare
-      // `token` without a credential prefix, shows no credential.
-      (!credentialName(name) && partMayShow(body, start, equals, end, value))
+      // The name of a credential field with an empty value shows no
+      // credential. A bare `token` without a credential prefix can.
+      (fieldKind(name) !== "credential" &&
+        partMayShow(body, start, equals, end, value))
     ) {
       shows = true;
     }
@@ -695,6 +716,19 @@ function redactFormBody(
   if (shows || count < expected) return undefined;
   parts.push(body.slice(from));
   return parts.join("");
+}
+
+/**
+ * Tells whether the name of a form field, as it is sent, shows a
+ * credential: a part of a nested name, such as `S` of `S[password]`, is a
+ * credential value (`isValue`), or the name has a credential prefix
+ * (`showsToken`). `formName` keeps only one part, so the other parts are
+ * checked here.
+ */
+function nameShows(raw: string, isValue: (text: string) => boolean): boolean {
+  const name = decode(raw);
+  if (showsToken(name)) return true;
+  return name.includes("[") ? name.split(/[[\]]/).some(isValue) : isValue(name);
 }
 
 /**
@@ -1054,12 +1088,12 @@ export function redactRequestUrl(
  * Tells whether the text of a body that `redactRequestWith` cannot read
  * field by field can show a credential: it has the name of a field of
  * `CREDENTIAL_FIELDS`, also with JSON unicode escapes or URL escapes in
- * it, or a credential prefix of a bare `token` (`TOKEN_TEXT`). It decodes
+ * it, or a credential prefix of a bare `token` (`showsToken`). It decodes
  * each escape by itself, so an escape that is not valid does not stop the
  * test of the others. Each test reads the body once.
  */
 function mayShowCredential(body: string): boolean {
-  if (CREDENTIAL_NAME.test(body) || TOKEN_TEXT.test(body)) return true;
+  if (CREDENTIAL_NAME.test(body) || showsToken(body)) return true;
   const unescape = (pattern: RegExp) =>
     body.replaceAll(pattern, (_, hex: string) =>
       String.fromCharCode(Number.parseInt(hex, 16)),

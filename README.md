@@ -314,7 +314,8 @@ A run takes `RunConfig` (`packages/roach/src/types.ts`): `tenant`, `mode`, `rule
   this text, so this list can be longer. When the value of such a JSON
   field is an object or an array, each string in it shows `<<redacted>>`,
   at any depth. When the value is a number, or has a number in it, the
-  request sample has no text. The proxy replaces the value at the place
+  request sample has no text, and the URL of the recording shows
+  `<<redacted>>` for a parameter with that number. The proxy replaces the value at the place
   of each field, and each other string that is the same value, also each
   string of an object or an array value. A value pattern can change
   the text of a key, so then the proxy checks the result. It parses the
@@ -333,13 +334,16 @@ A run takes `RunConfig` (`packages/roach/src/types.ts`): `tenant`, `mode`, `rule
   that has no credential field, such as JSON or XML with a form content
   type. So the request sample of such a body has no text when the body has
   the name of a field above anywhere, or the start of a bare `token` above.
-  A form field that the proxy cannot read, such as `user.password` or JSON
-  with URL escapes in a value, also gives no text, in a form with credential
-  fields too. A value that is only such a name, such as
-  `grant_type=password`, does not count.
   The name can be in any case, with `_`, `-`, or nothing between its words,
   such as `accessToken`, and with JSON unicode escapes or URL escapes in
   it. Each test is one search of the body, so a long body costs little.
+  In a form with credential fields, the request sample also has no text
+  when a field that is not a credential field can show one, such as
+  `user.password=`, or a bare `token` or another field with JSON with URL
+  escapes in its value. A value that is only such a name, such as
+  `grant_type=password`, does not count. It also has no text when a part
+  of a nested name, such as `S` of `S[password]`, is a credential value,
+  or when a name has the start of a bare `token`.
 - The proxy parses a JSON body to find the fields, so a long string value
   cannot stop it. It does not find a field in JSON text that is itself a
   string, such as the escaped arguments of a tool call, or a copy of a
