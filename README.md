@@ -606,11 +606,11 @@ attribute of Roach starts with `roach.`. Metrics have only attributes with
 few values: `roach.tenant`, `roach.mode`, `roach.rule`, `roach.origin`,
 `roach.result`, and `roach.reason`.
 
-| Metric                   | Type              | Value                                                                                                                                                                                                                                                |
-| ------------------------ | ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `roach.request`          | counter           | 1 for each proxied request. `roach.result` is `replayed`, `live`, `missed`, `passthrough`, or `refused`. A `passthrough` or `refused` request has no `roach.rule`. A `refused` request has `roach.reason`, and `other` for an origin not in `allow`. |
-| `roach.request.duration` | distribution (ms) | The time to answer a request that a rule records, by `roach.result`.                                                                                                                                                                                 |
-| `roach.recording.write`  | counter           | Recordings by `roach.rule`. `roach.result` is `written` (the proxy sent them to the store) or `dropped` (their session failed).                                                                                                                      |
+| Metric                   | Type              | Value                                                                                                                                                                                                                                                                                                                                                                                |
+| ------------------------ | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `roach.request`          | counter           | 1 for each proxied request. `roach.result` is `replayed`, `live`, `missed`, `passthrough`, `refused`, `busy` (HTTP 503: the body did not fit in the budget), or `timeout` (HTTP 408: the body did not come in time). A `passthrough`, `refused`, `busy`, or `timeout` request has no `roach.rule`. A `refused` request has `roach.reason`, and `other` for an origin not in `allow`. |
+| `roach.request.duration` | distribution (ms) | The time to answer a request that a rule records, by `roach.result`.                                                                                                                                                                                                                                                                                                                 |
+| `roach.recording.write`  | counter           | Recordings by `roach.rule`. `roach.result` is `written` (the proxy sent them to the store) or `dropped` (their session failed).                                                                                                                                                                                                                                                      |
 
 Each proxied request is one trace. Each span has `roach.tenant`,
 `roach.mode`, `roach.run.id` (the `name` of the run, else its id), and the
@@ -698,11 +698,20 @@ To see how well the cache works:
   run without the token. A control API body over 1 MiB gets HTTP 413
   before the service parses it.
 - The requests of all runs without the token can hold 128 MiB of bodies
-  at one time. A request holds its body until it finishes, also while its
-  key waits for the key worker. A request whose body does not fit gets
-  HTTP 503 with `Retry-After: 1`, and the run goes on. The clients of
-  model APIs send a 503 again. A client that does not gets the 503, and
-  its test fails. Runs with the token have no such limit.
+  at one time, and the runs of one client 32 MiB. The client of a run is
+  the client that started it, grouped as for the limit of runs. A request
+  holds its body until it finishes, also while its key waits for the key
+  worker. A request whose body does not fit gets HTTP 503 with
+  `Retry-After: 1`, and the run goes on. The clients of model APIs send a
+  503 again. A client that does not gets the 503, and its test fails.
+  Runs with the token have no such limit.
+- A body of a run without the token that does not come in 30 s gets
+  HTTP 408, and its connection closes. The run goes on.
+- With these limits, the service and the key worker use at most about
+  1.1 GB of the 2 GB of the VM. That is for request bodies of runs with
+  the token of a normal size. A body of 64 MiB from a run with the token,
+  at the same time as runs without the token fill the budget, took about
+  2.0 GB.
 - Keys and the redaction of misses have time limits. See
   [Changing values](#changing-values).
 - A `CONNECT` tunnel that sends no byte for 10 s after the `200` closes. A
@@ -712,7 +721,14 @@ To see how well the cache works:
   [Changing values](#changing-values).
 - A gap: a client with an IPv6 /48 has 65,536 /64s, so it can open runs
   until the service has 100 runs without a token. Then other clients get
-  HTTP 429 until its runs end.
+  HTTP 429 until its runs end. Its runs can also hold all of the budget of
+  bodies, for 30 s at a time.
+- A gap: Node times out the headers and the body of a request only on a
+  server that listens. The servers of tunnels, and the HTTP server with
+  `proxyProtocol`, get their connections from another server. So a
+  request of a run with the token, and a control API call with
+  `proxyProtocol`, have no time limit for their headers and body. A
+  tunnel closes only after 10 minutes without a byte.
 - GCS deletes each recording 30 days after it was written, also when runs
   still replay it. Then `auto` mode records it again, and `replay` mode
   fails the request with HTTP 412.

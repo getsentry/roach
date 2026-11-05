@@ -54,6 +54,75 @@ function stalledBody(): Readable {
   return body;
 }
 
+/** Wait `ms` of real time, also when `setTimeout` is fake. */
+async function realWait(ms: number) {
+  const end = performance.now() + ms;
+  while (performance.now() < end) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
+/** Wait until `check` is true, for at most 10 s of real time. */
+async function until(check: () => boolean) {
+  const end = performance.now() + 10_000;
+  while (!check()) {
+    if (performance.now() > end) throw new Error("the wait timed out");
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
+/**
+ * Open a `CONNECT` tunnel of `run` to the upstream on a raw socket, and
+ * start a request that declares a body of `declared` bytes. It sends
+ * `sent` bytes of it, and then nothing. `reply` is all that the tunnel
+ * gets until it closes, and `status()` is the status that it got so far.
+ */
+async function startBody(
+  proxy: string,
+  run: RemoteRun,
+  declared: number,
+  sent: number,
+) {
+  const { hostname, port } = new URL(proxy);
+  const { username, password } = new URL(run.url);
+  const authority = new URL(origin).host;
+  const socket = connect(Number(port), hostname);
+  onTestFinished(() => {
+    socket.destroy();
+  });
+  await once(socket, "connect");
+  const credentials = Buffer.from(
+    `${decodeURIComponent(username)}:${decodeURIComponent(password)}`,
+  ).toString("base64");
+  socket.write(
+    `CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\nProxy-Authorization: Basic ${credentials}\r\n\r\n`,
+  );
+  const [established] = (await once(socket, "data")) as [Buffer];
+  expect(established.toString()).toMatch(/^HTTP\/1.1 200/);
+  const chunks: Buffer[] = [];
+  socket.on("data", (chunk: Buffer) => chunks.push(chunk));
+  socket.on("error", () => socket.destroy());
+  const reply = once(socket, "close").then(() =>
+    Buffer.concat(chunks).toString(),
+  );
+  socket.write(
+    `POST /v1/messages HTTP/1.1\r\nhost: ${authority}\r\ncontent-length: ${declared}\r\n\r\n`,
+  );
+  socket.write(Buffer.alloc(sent, "a"));
+  const status = () =>
+    Number(
+      /^HTTP\/1.1 (\d{3})/.exec(Buffer.concat(chunks).toString())?.[1] ?? 0,
+    );
+  return { socket, reply, status };
+}
+
+/** The status of a whole body of `bytes` through a raw tunnel of `run`. */
+async function answer(proxy: string, run: RemoteRun, bytes: number) {
+  const { status } = await startBody(proxy, run, bytes, bytes);
+  await until(() => status() > 0);
+  return status();
+}
+
 /** The heap that this process uses, in bytes. */
 const heap = () => process.memoryUsage().heapUsed;
 
@@ -719,9 +788,11 @@ describe("limits of the service", () => {
         },
       ],
     });
+    // 7 bodies of 4 MiB fit in the 32 MiB that the runs of one client can
+    // hold.
     const prompt = "a".repeat(4 * 1024 * 1024);
     const sent = Promise.allSettled(
-      Array.from({ length: 20 }, () => send(run.url, { prompt })),
+      Array.from({ length: 7 }, () => send(run.url, { prompt })),
     );
     const waits = await caWaitsUntil(sent);
     // The keys are made in a worker, so the service answers at once.
@@ -772,8 +843,8 @@ describe("limits of the service", () => {
     const results = await Promise.all(
       Array.from({ length: 12 }, () => send(reader.url, { prompt })),
     );
-    // The budget holds 128 MiB, 8 of these bodies. The bytes count when
-    // they come, so parts of more bodies can fill it.
+    // The runs of one client can hold 32 MiB, 2 of these bodies. The bytes
+    // count when they come, so parts of more bodies can fill it.
     const busy = results.filter((result) => result.status === 503);
     expect(busy.length).toBeGreaterThanOrEqual(4);
     for (const result of results) expect([412, 503]).toContain(result.status);
@@ -784,9 +855,9 @@ describe("limits of the service", () => {
     // The run goes on, and the bodies gave their bytes back.
     await expect(reader.stats()).resolves.toBeDefined();
     const again = await Promise.all(
-      Array.from({ length: 4 }, () => send(reader.url, { prompt })),
+      Array.from({ length: 2 }, () => send(reader.url, { prompt })),
     );
-    expect(again.map((result) => result.status)).toEqual([412, 412, 412, 412]);
+    expect(again.map((result) => result.status)).toEqual([412, 412]);
 
     // A client that declares large bodies and then stops holds only the
     // bytes that it sent.
@@ -807,6 +878,68 @@ describe("limits of the service", () => {
     expect((await send(reader.url, { prompt })).status).toBe(412);
     stalled.abort();
     await Promise.all(stalls);
+  });
+
+  it("keeps the budget for other clients while one client stalls its bodies", async () => {
+    const local = await startRoachService({
+      directory,
+      privateNetworks: true,
+      writeTokenHash: hash("write-token"),
+      proxyProtocol: true,
+    });
+    onTestFinished(() => local.close());
+    const config = {
+      tenant: "acme/alpha",
+      mode: "replay",
+      allow: [origin],
+      rules: [
+        { name: "model", match: { method: "POST", url: `${origin}/v1/` } },
+      ],
+    };
+    const startFrom = async (client: string) =>
+      JSON.parse(
+        (await rawRequest(local.url, client, "POST", "/__roach/runs", config))
+          .body,
+      ) as RemoteRun;
+    const attacker = await startFrom("203.0.113.1");
+    const other = await startFrom("203.0.113.2");
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+
+    // Each body declares 16 MiB, sends all but 1 KiB, and then stops. Before
+    // the part for each client, 8 of them held the whole budget.
+    const size = 16 * 1024 * 1024;
+    const stalls = await Promise.all(
+      Array.from({ length: 8 }, () =>
+        startBody(local.url, attacker, size, size - 1024),
+      ),
+    );
+    await until(() =>
+      stalls.every(
+        ({ socket, status }) => socket.writableLength === 0 || status() > 0,
+      ),
+    );
+    await realWait(500);
+    const small = 700 * 1024;
+    expect(await answer(local.url, other, small)).toBe(412);
+    // The runs of the attacker can hold only 32 MiB, 2 of the bodies.
+    await until(
+      () => stalls.filter(({ status }) => status() === 503).length >= 6,
+    );
+    const holders = stalls.filter(({ status }) => status() === 0);
+    expect(holders.length).toBeLessThanOrEqual(2);
+
+    // A body that does not come in 30 s gets HTTP 408, and its tunnel
+    // closes. Then the attacker has its part again.
+    await vi.advanceTimersByTimeAsync(30_000);
+    for (const holder of holders) {
+      expect(await holder.reply).toMatch(
+        /^HTTP\/1.1 408 [^]*the body did not come in 30 s/,
+      );
+    }
+    expect(await answer(local.url, attacker, small)).toBe(412);
   });
 
   it("fails a request with millions of values before it fills the memory", async () => {

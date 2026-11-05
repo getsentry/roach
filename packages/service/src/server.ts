@@ -166,33 +166,49 @@ function authorityOf(origin: URL): string {
 /**
  * The bytes of request bodies that the requests of many targets can hold
  * at one time (`ProxyTarget.bodyBudget`). `used` counts the bodies of the
- * requests that did not finish.
+ * requests that did not finish, and `clients` counts them for each client
+ * (`ProxyTarget.client`). One client can hold at most `perClient` bytes,
+ * so it cannot take all of `max`. A body that takes longer than `readMs`
+ * to come fails with HTTP 408 and gives its bytes back.
  */
 export interface BodyBudget {
   max: number;
+  perClient: number;
+  readMs: number;
   used: number;
+  clients: Map<string, number>;
 }
 
 /** The bytes that one request holds of its `BodyBudget`. */
 interface Held {
   budget: BodyBudget | undefined;
+  client: string;
   bytes: number;
 }
 
 /** Hold `bytes` more of the budget. Returns `false` when they do not fit. */
 function hold(held: Held, bytes: number): boolean {
-  const { budget } = held;
+  const { budget, client } = held;
   if (!budget) return true;
-  if (budget.used + bytes > budget.max) return false;
+  const ofClient = budget.clients.get(client) ?? 0;
+  if (budget.used + bytes > budget.max || ofClient + bytes > budget.perClient) {
+    return false;
+  }
   budget.used += bytes;
+  budget.clients.set(client, ofClient + bytes);
   held.bytes += bytes;
   return true;
 }
 
 /** Give back all bytes that a request holds. */
 function release(held: Held): void {
-  if (held.budget) held.budget.used -= held.bytes;
+  const { budget, client, bytes } = held;
   held.bytes = 0;
+  if (!budget || bytes === 0) return;
+  budget.used -= bytes;
+  const left = (budget.clients.get(client) ?? 0) - bytes;
+  if (left > 0) budget.clients.set(client, left);
+  else budget.clients.delete(client);
 }
 
 const busyError = () =>
@@ -203,14 +219,15 @@ const busyError = () =>
 
 /**
  * Read a whole body. A body over `maxBytes` fails with HTTP 413. A body
- * that does not fit in the budget of `held` fails with HTTP 503. Only
- * request bodies have a limit: the client sends them, and a large upstream
- * response is not the fault of the client.
+ * that does not fit in the budget of `held` fails with HTTP 503, and one
+ * that does not come in the `readMs` of the budget fails with HTTP 408.
+ * Only request bodies have a limit: the client sends them, and a large
+ * upstream response is not the fault of the client.
  */
 function readBody(
   stream: http.IncomingMessage,
   maxBytes = Infinity,
-  held: Held = { budget: undefined, bytes: 0 },
+  held: Held = { budget: undefined, client: "", bytes: 0 },
 ): Promise<Buffer> {
   const declared = Number(stream.headers["content-length"]);
   if (declared > maxBytes) {
@@ -224,26 +241,46 @@ function readBody(
     const chunks: Buffer[] = [];
     let size = 0;
     let failed = false;
+    const fail = (error: Error) => {
+      // Read the rest without keeping it, so the client gets the error.
+      failed = true;
+      chunks.length = 0;
+      clearTimeout(deadline);
+      reject(error);
+    };
+    // Node does not time out a request in a tunnel (`listenProxy()`), so
+    // a client that sends a byte now and then could hold its bytes for
+    // as long as the tunnel stays open.
+    const readMs = held.budget?.readMs;
+    const deadline =
+      readMs === undefined
+        ? undefined
+        : setTimeout(
+            () =>
+              fail(
+                httpError(408, `the body did not come in ${readMs / 1000} s`),
+              ),
+            readMs,
+          );
     stream.on("data", (chunk: Buffer) => {
       if (failed) return;
       size += chunk.length;
-      const error =
-        size > maxBytes
-          ? httpError(413, `body is over ${maxBytes} bytes`)
-          : !hold(held, chunk.length)
-            ? busyError()
-            : undefined;
-      if (error) {
-        // Read the rest without keeping it, so the client gets the error.
-        failed = true;
-        chunks.length = 0;
-        reject(error);
-        return;
+      if (size > maxBytes) {
+        fail(httpError(413, `body is over ${maxBytes} bytes`));
+      } else if (!hold(held, chunk.length)) {
+        fail(busyError());
+      } else {
+        chunks.push(chunk);
       }
-      chunks.push(chunk);
     });
-    stream.on("end", () => resolve(Buffer.concat(chunks)));
-    stream.on("error", reject);
+    stream.on("end", () => {
+      clearTimeout(deadline);
+      resolve(Buffer.concat(chunks));
+    });
+    stream.on("error", (error) => {
+      clearTimeout(deadline);
+      reject(error);
+    });
   });
 }
 
@@ -490,6 +527,12 @@ export interface ProxyTarget {
    * run goes on. Targets can share one budget.
    */
   bodyBudget?: BodyBudget;
+  /**
+   * The client whose part of `bodyBudget` the requests take. The service
+   * sets it for a run without the token: the address group
+   * (`clientGroup()`) of the client that started the run.
+   */
+  client?: string;
   /** The time of the last proxied request, from `Date.now()`. */
   lastUsed?: number;
   /** Gets a span for each proxied request. */
@@ -626,7 +669,11 @@ function serveProxied(
         attributes: { "roach.origin": origin, "http.request.method": method },
       },
       async () => {
-        const held: Held = { budget: target.bodyBudget, bytes: 0 };
+        const held: Held = {
+          budget: target.bodyBudget,
+          client: target.client ?? "",
+          bytes: 0,
+        };
         try {
           await proxyRequest(
             target,
@@ -665,11 +712,25 @@ function answerError(
     status === undefined
       ? reportInternal("Request", error, target.telemetry.capture(error))
       : (error as Error).message;
+  // A body that did not fit in the budget, or that did not come in time,
+  // is not a miss and not an error. Count it, so that Sentry shows it.
+  const result =
+    status === 503 ? "busy" : status === 408 ? "timeout" : undefined;
+  if (result) {
+    target.telemetry.annotate({ "roach.result": result });
+    target.telemetry.count("roach.request", 1, {
+      "roach.origin": origin,
+      "roach.result": result,
+    });
+  }
   if (!outgoing.headersSent) {
     outgoing.writeHead(status ?? 502, {
       "content-type": "text/plain",
       // Clients of model APIs send a 503 again, after this time in s.
       ...(status === 503 ? { "retry-after": "1" } : {}),
+      // The rest of a slow body does not come in time, so close the
+      // connection and do not wait for it.
+      ...(status === 408 ? { connection: "close" } : {}),
     });
   }
   outgoing.end(`Roach error: ${text}\n`);

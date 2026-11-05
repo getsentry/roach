@@ -132,11 +132,6 @@ interface Run extends ProxyTarget {
   token: string;
   started: number;
   lastUsed: number;
-  /**
-   * The address group (`clientGroup()`) of the client that started a run
-   * without a token.
-   */
-  client?: string;
 }
 
 const MODES = new Set<RecordingMode>(["auto", "off", "record", "replay"]);
@@ -175,6 +170,20 @@ const PUBLIC_MAX_BODY_BYTES = 16 * 1024 * 1024;
  * to 2026-11-05 was about 0.65 MB.
  */
 const PUBLIC_BODY_BUDGET_BYTES = 128 * 1024 * 1024;
+/**
+ * The part of `PUBLIC_BODY_BUDGET_BYTES` that the runs of one client
+ * (`clientGroup()` of the client that started the run) can hold, so that
+ * one client cannot take all of it. It is 2 bodies of 16 MiB, or about 50
+ * of the largest model requests.
+ */
+const PUBLIC_BODY_CLIENT_BYTES = 32 * 1024 * 1024;
+/**
+ * A body of a run without a token that does not come in this time gets
+ * HTTP 408, and gives its bytes back. So a client that sends a byte now
+ * and then cannot hold its part of the budget. 16 MiB in 30 s is about
+ * 4.5 Mbit/s.
+ */
+const PUBLIC_BODY_READ_MS = 30_000;
 /**
  * The work of a run without a token (`WorkLimit`). A key has 1 s and 0.5 s
  * for each MiB of its body. One job in the key worker (`key-worker.ts`) has
@@ -540,7 +549,13 @@ export async function startRoachService(
   }
   const runs = new Map<string, Run>();
   /** The request bodies of all runs without a token. */
-  const publicBodies: BodyBudget = { max: PUBLIC_BODY_BUDGET_BYTES, used: 0 };
+  const publicBodies: BodyBudget = {
+    max: PUBLIC_BODY_BUDGET_BYTES,
+    perClient: PUBLIC_BODY_CLIENT_BYTES,
+    readMs: PUBLIC_BODY_READ_MS,
+    used: 0,
+    clients: new Map(),
+  };
   const authority = await createCertificateAuthority(config.ca);
   const storeOf = (tenant: string): RecordingStore =>
     config.bucket
