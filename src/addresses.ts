@@ -65,13 +65,16 @@ export function isPublicAddress(address: string): boolean {
   return !NOT_PUBLIC.check(address, family === 6 ? "ipv6" : "ipv4");
 }
 
+/** The `code` of `notPublicError()`. */
+export const NOT_PUBLIC_CODE = "ERR_ROACH_NOT_PUBLIC";
+
 /** The error of a request to an address that is not public. */
 export const notPublicError = (host: string, address: string) =>
   Object.assign(
     new Error(
       `Roach does not send requests to ${host}, because ${address} is not a public address`,
     ),
-    { status: 403, code: "ERR_ROACH_NOT_PUBLIC" },
+    { status: 403, code: NOT_PUBLIC_CODE },
   );
 
 /**

@@ -40,6 +40,7 @@ import type {
   RecordingMode,
   RecordingRule,
   RecordingStats,
+  RefusalReason,
 } from "./types.ts";
 import { fillValues, templateValues, type RequestValues } from "./values.ts";
 
@@ -102,6 +103,12 @@ interface Session {
 }
 
 const MAX_MISSES = 500;
+/**
+ * Origins of each refusal reason that the stats name. The client picks
+ * the origin of a refused request, so later ones count as `OTHER_ORIGINS`.
+ */
+const MAX_REFUSED_ORIGINS = 32;
+const OTHER_ORIGINS = "other origins";
 /**
  * Ended sessions that a run keeps, so that late requests follow their
  * result. The oldest ones go first, so memory stays bounded.
@@ -198,6 +205,7 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
     [...sessions.values()].filter((s) => s.passed === undefined);
   const { telemetry } = config;
   const secrets = createSecrets(config.secrets);
+  const refused: NonNullable<RecordingStats["refused"]> = {};
   const stats: RecordingStats = {
     counts: Object.fromEntries(
       config.rules.map((rule) => [
@@ -209,6 +217,7 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
     written: 0,
     discarded: 0,
     passthrough: {},
+    refused,
   };
   /** Count recordings by rule in `roach.recording.write`. */
   const countRecordings = (keys: string[], result: "dropped" | "written") => {
@@ -292,6 +301,16 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
       stats.passthrough[origin] = (stats.passthrough[origin] ?? 0) + 1;
       telemetry.annotate({ result: "passthrough" });
       telemetry.count("roach.request", 1, { origin, result: "passthrough" });
+    },
+
+    /** Count a request that the proxy refused and sent nowhere. */
+    countRefused(reason: RefusalReason, origin: string): void {
+      const origins = (refused[reason] ??= {});
+      const name =
+        origin in origins || Object.keys(origins).length < MAX_REFUSED_ORIGINS
+          ? origin
+          : OTHER_ORIGINS;
+      origins[name] = (origins[name] ?? 0) + 1;
     },
 
     /**
@@ -380,7 +399,6 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
         }
       }
 
-      counts.live += 1;
       const live = await telemetry.span(
         {
           op: "roach.upstream",
@@ -393,6 +411,9 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
           return response;
         },
       );
+      // Count it only when it went out. A refused address counts as
+      // refused (`server.ts`).
+      counts.live += 1;
       // The client gets the redacted response too, so a live run and a
       // replay give the same body.
       const recording = JSON.parse(
