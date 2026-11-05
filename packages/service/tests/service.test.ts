@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { createServer, type Server } from "node:http";
@@ -69,6 +70,22 @@ async function openTunnel(serviceUrl: string, runUrl: string) {
   const [reply] = (await once(socket, "data")) as [Buffer];
   expect(reply.toString()).toMatch(/^HTTP\/1.1 200/);
   return socket;
+}
+
+/** The pid of the key worker, a child of this process (`key-worker.ts`). */
+function keyWorkerPid(): number {
+  const pids = execFileSync("ps", ["-A", "-o", "pid=,ppid=,args="], {
+    encoding: "utf8",
+  })
+    .split("\n")
+    .map((line) => line.trim().split(/\s+/))
+    .filter(
+      ([, ppid, ...args]) =>
+        Number(ppid) === process.pid && args.includes("roach-key-worker"),
+    )
+    .map(([pid]) => Number(pid));
+  expect(pids).toHaveLength(1);
+  return pids[0]!;
 }
 
 /** All that a socket gets until it closes. */
@@ -1174,7 +1191,10 @@ describe("limits of the service", () => {
 
   it("stops a key that the time limit of vm cannot stop", async () => {
     // `JSON.parse()` does not stop for the `vm` timeout. The worker stops
-    // after the time limit and a margin of 1 s.
+    // after the time limit and a margin of 1 s. A fast machine can parse
+    // the body before the margin ends, and then `vm` stops the key after
+    // the parse. So either limit can fail the key, but it always ends near
+    // its time limit. The next test shows the margin on any machine.
     const rule = { name: "model", match: {}, values: { v: "x" } };
     const options = {
       timeLimitMs: 1,
@@ -1193,12 +1213,10 @@ describe("limits of the service", () => {
     ).catch((caught: unknown) => caught);
     const elapsed = performance.now() - started;
     expect(error).toMatchObject({
-      message: expect.stringMatching(/the request took over 1 ms/),
+      message: expect.stringMatching(/took over 1 ms/),
       status: 400,
       timedOut: true,
     });
-    // The run gets the time that the job used.
-    expect((error as { ms: number }).ms).toBeGreaterThan(900);
     expect(elapsed).toBeLessThan(2500);
     const next = await keyInWorker(
       rule,
@@ -1207,6 +1225,44 @@ describe("limits of the service", () => {
       { ...options, timeLimitMs: 1000 },
     );
     expect(next.value.values).toEqual(new Map([["v", ["x"]]]));
+  });
+
+  it("stops a worker that does not answer after the time limit and a margin", async () => {
+    // A stopped worker cannot answer, so only the margin of 1 s after the
+    // time limit can end its job, on any machine.
+    const rule = { name: "model", match: {}, values: { v: "x" } };
+    const small = {
+      method: "POST",
+      url: "https://example.test/",
+      headers: {},
+      body: "x",
+    };
+    const options = { timeLimitMs: 1, maxValues: Infinity, skip: () => false };
+    await keyInWorker(rule, small, undefined, {
+      ...options,
+      timeLimitMs: 1000,
+    });
+    const stopped = keyWorkerPid();
+    process.kill(stopped, "SIGSTOP");
+    const started = performance.now();
+    const error = await keyInWorker(rule, small, undefined, options).catch(
+      (caught: unknown) => caught,
+    );
+    const elapsed = performance.now() - started;
+    expect(error).toMatchObject({
+      message: expect.stringMatching(/the request took over 1 ms/),
+      status: 400,
+      timedOut: true,
+    });
+    // The run gets the time that the job used.
+    expect((error as { ms: number }).ms).toBeGreaterThan(900);
+    expect(elapsed).toBeLessThan(2500);
+    const next = await keyInWorker(rule, small, undefined, {
+      ...options,
+      timeLimitMs: 1000,
+    });
+    expect(next.value.values).toEqual(new Map([["v", ["x"]]]));
+    expect(keyWorkerPid()).not.toBe(stopped);
   });
 
   it("refuses a large body from a run without a token", async () => {
