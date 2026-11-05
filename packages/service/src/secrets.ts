@@ -9,12 +9,14 @@
  * JSON body, and the value of each credential parameter of a URL that a
  * recording keeps.
  *
- * It parses a JSON body and walks it to find the fields. It does not run a
- * regular expression on JSON text, because a long string value can
- * overflow the stack of the expression. So it finds a field whose name
- * has a unicode escape. It does not find a field whose value is not a
- * string, such as an array, or a field in JSON text that is itself a
- * string, such as the escaped arguments of a tool call.
+ * It parses a JSON body and walks it to find the fields. Then it replaces
+ * them in one pass over the JSON strings of the text (`scanStrings`). It
+ * does not run a regular expression on JSON text, because a long string
+ * value can overflow the stack of the expression, and it does not run a
+ * pass for each value, because a client can send many. So it finds a
+ * field whose name or value has a unicode escape. It does not find a field
+ * whose value is not a string, such as an array, or a field in JSON text
+ * that is itself a string, such as the escaped arguments of a tool call.
  */
 import type { IncomingHttpHeaders } from "node:http";
 
@@ -106,15 +108,21 @@ const fieldTest =
     return fields.has(key) || (key === "token" && TOKEN_VALUE.test(value));
   };
 const isMinted = fieldTest(MINTED_FIELDS);
+/** Tells whether a field of `name` can hold a minted credential. */
+const mintedName = (name: string) =>
+  MINTED_FIELDS.has(fieldName(name)) || fieldName(name) === "token";
 const isCredentialField = fieldTest(CREDENTIAL_FIELDS);
 /** A query parameter whose name can mean a credential, at any value. */
 const isCredentialParam: CredentialTest = (name) =>
   CREDENTIAL_HEADER.test(name);
 
-/** The parsed value of a JSON text, or `undefined` when it is not JSON. */
+/**
+ * The parsed value of a JSON text, or `undefined` when it is not JSON. A
+ * byte order mark at the start does not count.
+ */
 const parseJson = (text: string): unknown => {
   try {
-    return JSON.parse(text);
+    return JSON.parse(text.startsWith("\uFEFF") ? text.slice(1) : text);
   } catch {
     return undefined;
   }
@@ -145,22 +153,125 @@ function credentialValues(
   return found;
 }
 
+const REDACTED_JSON = `"${REDACTED}"`;
+const QUOTE = 0x22;
+const BACKSLASH = 0x5c;
+const LINE_BREAK = 0x0a;
+const COLON = 0x3a;
+/** `{` and `[`. */
+const OPEN = new Set([0x7b, 0x5b]);
+/** `}` and `]`. */
+const CLOSE = new Set([0x7d, 0x5d]);
+/** Space, tab, line feed, and carriage return. */
+const JSON_SPACE = new Set([0x20, 0x09, 0x0a, 0x0d]);
+
 /**
- * `text` with each JSON string of `values` replaced by `"<<redacted>>"`.
- * Only a whole string value matches, so a short value cannot change other
- * text. A value matches as `JSON.stringify` writes it, and with `\/` for
- * each `/`, as some servers write it.
+ * Call `visit` for each JSON string of `text`, in one pass: its start, its
+ * end after the closing quote, the depth of objects and arrays around it,
+ * and whether it is a field name (a `:` follows it). A string ends at a
+ * line break, because JSON does not allow one in a string. So a line that
+ * is not JSON, such as a header line in the text of a key, cannot make it
+ * read the next lines wrong.
+ */
+function scanStrings(
+  text: string,
+  visit: (start: number, end: number, depth: number, name: boolean) => void,
+): void {
+  let depth = 0;
+  let at = 0;
+  while (at < text.length) {
+    const code = text.charCodeAt(at);
+    if (OPEN.has(code)) depth += 1;
+    else if (CLOSE.has(code)) depth -= 1;
+    if (code !== QUOTE) {
+      at += 1;
+      continue;
+    }
+    let end = at + 1;
+    while (end < text.length) {
+      const next = text.charCodeAt(end);
+      if (next === QUOTE) break;
+      if (next === LINE_BREAK) break;
+      end +=
+        next === BACKSLASH && text.charCodeAt(end + 1) !== LINE_BREAK ? 2 : 1;
+    }
+    if (text.charCodeAt(end) !== QUOTE) {
+      // Not a string. Go on after the quote.
+      at += 1;
+      continue;
+    }
+    end += 1;
+    let after = end;
+    while (JSON_SPACE.has(text.charCodeAt(after))) after += 1;
+    visit(at, end, depth, text.charCodeAt(after) === COLON);
+    at = end;
+  }
+}
+
+/**
+ * `text` with each JSON string that is one of `values` replaced by
+ * `"<<redacted>>"`, in one pass. A value matches as `JSON.stringify`
+ * writes it, as in the text of a key. Only a whole string matches, so a
+ * short value cannot change other text.
  */
 function replaceStrings(text: string, values: string[]): string {
-  const quoted = values.flatMap((value) => {
-    const json = JSON.stringify(value);
-    return [json, json.replaceAll("/", "\\/")];
+  if (values.length === 0) return text;
+  const quoted = new Set(values.map((value) => JSON.stringify(value)));
+  const lengths = new Set([...quoted].map((value) => value.length));
+  const parts: string[] = [];
+  let from = 0;
+  scanStrings(text, (start, end) => {
+    if (!lengths.has(end - start)) return;
+    if (!quoted.has(text.slice(start, end))) return;
+    parts.push(text.slice(from, start), REDACTED_JSON);
+    from = end;
   });
-  let result = text;
-  for (const json of new Set(quoted.toSorted((a, b) => b.length - a.length))) {
-    result = result.replaceAll(json, `"${REDACTED}"`);
+  if (parts.length === 0) return text;
+  parts.push(text.slice(from));
+  return parts.join("");
+}
+
+/**
+ * The JSON text of a response body with the value of each minted field of
+ * the object at the top replaced (`isMinted`), and those values. It
+ * replaces only the value after the name of its field, so the same text
+ * at other places, and all other bytes, do not change. Text that is not a
+ * JSON object does not change. It throws when a minted value stays in the
+ * result, so the caller does not record the body.
+ */
+function replaceMinted(text: string): { text: string; minted: string[] } {
+  const json = parseJson(text);
+  const none = { text, minted: [] };
+  if (json === null || typeof json !== "object" || Array.isArray(json)) {
+    return none;
   }
-  return result;
+  if (credentialValues(json, isMinted, false).length === 0) return none;
+  const minted: string[] = [];
+  const parts: string[] = [];
+  let from = 0;
+  let field: string | undefined;
+  scanStrings(text, (start, end, depth, name) => {
+    if (depth !== 1) return;
+    if (name) {
+      field = JSON.parse(text.slice(start, end)) as string;
+      return;
+    }
+    const of = field;
+    field = undefined;
+    // Parse only the values of fields that can be minted.
+    if (of === undefined || !mintedName(of)) return;
+    const value = JSON.parse(text.slice(start, end)) as string;
+    if (!isMinted(of, value)) return;
+    minted.push(value);
+    parts.push(text.slice(from, start), REDACTED_JSON);
+    from = end;
+  });
+  parts.push(text.slice(from));
+  const result = parts.join("");
+  if (credentialValues(parseJson(result), isMinted, false).length > 0) {
+    throw new Error("a minted credential stayed in the body");
+  }
+  return { text: result, minted };
 }
 
 /** Decode a part of a query, or keep it when it is not valid. */
@@ -421,9 +532,9 @@ export function createSecrets(initial: string[], limit: LearnLimit) {
           return true;
         });
       }
-      const minted = credentialValues(parseJson(text), isMinted, false);
-      for (const value of minted) add(value, values);
-      return replaceStrings(text, minted);
+      const result = replaceMinted(text);
+      for (const value of result.minted) add(value, values);
+      return result.text;
     },
 
     /**

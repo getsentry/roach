@@ -33,7 +33,7 @@
 import { randomBytes } from "node:crypto";
 import type { IncomingHttpHeaders } from "node:http";
 import { promisify } from "node:util";
-import { brotliDecompress, gunzip, inflate } from "node:zlib";
+import { brotliDecompress, gunzip, inflate, zstdDecompress } from "node:zlib";
 import { reportInternal } from "./errors.ts";
 import { firstChange, sampleKey, toSample } from "./misses.ts";
 import {
@@ -199,6 +199,7 @@ const DECODERS: Record<
   "x-gzip": promisify(gunzip),
   deflate: promisify(inflate),
   br: promisify(brotliDecompress),
+  zstd: promisify(zstdDecompress),
 };
 
 /**
@@ -752,22 +753,28 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
       // Count it only when it went out. A refused address counts as
       // refused (`server.ts`).
       counts.live += 1;
-      let live: ProxyResponse;
-      try {
-        live = { ...upstream, body: await decodeBody(upstream) };
-      } catch (error) {
-        // The recorder cannot find credentials in a body that it cannot
-        // read, or that decodes to more than `MAX_DECODED_BYTES`, so it
-        // does not record it. The client gets it as it came.
+      /**
+       * Do not record the response, because the recorder cannot redact it:
+       * it cannot read the body, or the body decodes to more than
+       * `MAX_DECODED_BYTES`, or a minted credential stays in it. The client
+       * gets it as it came.
+       */
+      const notRecorded = (why: string, error: unknown) => {
         process.stderr.write(
-          `[roach] The ${rule.name} response was not recorded, because its body could not be decoded (${(error as Error).message}): ${key}\n`,
+          `[roach] The ${rule.name} response was not recorded, because ${why} (${(error as Error).message}): ${key}\n`,
         );
         report("live");
         const headers: IncomingHttpHeaders = {};
         for (const name of ["content-type", "content-encoding"]) {
           if (upstream.headers[name]) headers[name] = upstream.headers[name];
         }
-        return { ...upstream, headers, source: "live" };
+        return { ...upstream, headers, source: "live" as const };
+      };
+      let live: ProxyResponse;
+      try {
+        live = { ...upstream, body: await decodeBody(upstream) };
+      } catch (error) {
+        return notRecorded("its body could not be decoded", error);
       }
       // The client gets the known credentials redacted too, so a live run
       // and a replay give the same body.
@@ -779,8 +786,14 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
         ),
       ) as Recording;
       if (!isTemporaryStatus(recording.response.status)) {
+        let stored: Recording;
+        try {
+          stored = toStored(recording);
+        } catch (error) {
+          return notRecorded("it could not be redacted", error);
+        }
         await record(owner, key, {
-          recording: toStored(recording),
+          recording: stored,
           samples: [
             [sample, toSample(key, secrets.redactRequest(keyed.text, request))],
           ],
