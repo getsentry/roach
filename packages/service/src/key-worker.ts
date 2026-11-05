@@ -1,13 +1,15 @@
 /**
- * The worker process that makes keys and redacts the text of misses.
+ * The worker process that makes the keys of runs without the token, and
+ * redacts the text of their misses.
  *
- * The value patterns of a run come from its client, and redaction takes
- * time for each credential that a run knows. Both run in this worker, so a
- * slow request does not stop the event loop that answers all runs. The
- * service has one worker. It does one job at a time, and each job has a
- * time limit (the `timeout` of `vm`). The jobs of runs with the write token
- * go before the jobs of runs without it. A job of an ended run does not
- * start.
+ * Anyone can start a run without the token, and its value patterns and
+ * bodies come from its client. Redaction takes time for each credential
+ * that a run knows. Both run in this worker, so a slow request does not
+ * stop the event loop that answers all runs. The service has one worker.
+ * It does one job at a time, in order, and each job has a time limit (the
+ * `timeout` of `vm`). A job of an ended run does not start. A run with the
+ * token does this work on the main thread (`recorder.ts`), because the
+ * key of a 64 MiB body can need more memory than the worker has.
  *
  * The worker is a child process with a heap limit (`MAX_HEAP_MB`), so one
  * request cannot fill the memory of the service. It is not a worker
@@ -68,8 +70,6 @@ export interface JobOptions {
   timeLimitMs: number;
   /** The most changing values that a key can have. */
   maxValues: number;
-  /** Run the job before the jobs that do not have this. */
-  first: boolean;
   /** Called before the job starts. When it returns `true`, it does not. */
   skip(): boolean;
 }
@@ -90,11 +90,13 @@ interface JobResult<T> {
 
 const MARK = "roach-key-worker";
 /**
- * The old-generation heap of the worker, in MiB. The key of a 64 MiB body,
- * the largest body of a run with the token, needs about 320 MiB. At 256 MiB,
- * a 64 MiB body with a screenshot fails.
+ * The heap of the worker, in MiB: the old generation and each semi-space
+ * of the young generation. The worker makes the keys of runs without the
+ * token, with bodies of at most 16 MiB. The key of a 16 MiB body of small
+ * text blocks peaks at about 330 MiB of RSS. The worst body, such as 16 MiB
+ * of `{}`, stops the worker at about 500 MiB of RSS.
  */
-const MAX_HEAP_MB = 384;
+const MAX_HEAP_MB = { old: 256, semi: 4 };
 /** The time after the time limit of a job before the worker stops. */
 const WATCHDOG_MARGIN_MS = 1000;
 
@@ -163,7 +165,11 @@ function failWorker(stopped: ChildProcess, why: string): void {
 
 function startWorker(): ChildProcess {
   const started = fork(fileURLToPath(import.meta.url), [MARK], {
-    execArgv: [...process.execArgv, `--max-old-space-size=${MAX_HEAP_MB}`],
+    execArgv: [
+      ...process.execArgv,
+      `--max-old-space-size=${MAX_HEAP_MB.old}`,
+      `--max-semi-space-size=${MAX_HEAP_MB.semi}`,
+    ],
     // `Map` values, such as `known`, need the advanced serialization.
     serialization: "advanced",
     stdio: ["ignore", "inherit", "inherit", "ipc"],
@@ -205,11 +211,7 @@ function hold(child: ChildProcess | undefined, busy: boolean): void {
 /** Start the next job, when the worker has none. */
 function next(): void {
   while (!running && queue.length > 0) {
-    const index = Math.max(
-      0,
-      queue.findIndex((pending) => pending.first),
-    );
-    const [pending] = queue.splice(index, 1) as [Pending];
+    const pending = queue.shift()!;
     if (pending.skip()) {
       pending.reject(jobError("this run has ended", { status: 410 }));
       continue;

@@ -361,8 +361,11 @@ as part of a word and does not match.
   finds it. For example, a pattern finds a short commit id only in the
   output of `git push`, but the model then quotes it alone in its reply. A
   pattern wins at the same place. A session remembers all values of its
-  requests, also after it ends. A limit there would change the keys of
-  later requests.
+  requests until it ends. It does not drop a value, because that would
+  change the keys of later requests. Only a value of over 32,767
+  characters stays out: V8 cannot run a pattern with it, so it would fail
+  each later request of the session. A run without the token has a limit
+  (see below): past it, the request fails.
 - Values in thinking blocks of the request do not count for `n`, and the
   proxy does not look for remembered values in them. A replay keeps the
   recorded text of a thinking block, so when a later request sends it back,
@@ -379,24 +382,32 @@ real way use the same recording.
 
 The service takes any pattern that compiles in 1 s, up to 2048
 characters. A run without the token must use the same patterns as the run
-that recorded, or its keys do not match. All runs share one process, so
-the service makes each key in a worker process, one key at a time. So a
-slow key does not stop the other work of the service. Each key has a time
-limit: 1 s, and 0.5 s for each MiB of the body. The built-in patterns take
-about 60 to 110 ms for each MiB. A request whose key takes longer fails
-with HTTP 400. Some work, such as `JSON.parse()` of a large body, cannot
-stop at the time limit. When a key goes 1 s past its time limit, the
-service stops the worker and starts a new one. The worker has 384 MiB of
-heap. A key that needs more stops the worker, and its request fails with
-HTTP 400. The key of a 64 MiB body needs about 320 MiB.
+that recorded, or its keys do not match. Each key has a time limit: 1 s,
+and 0.5 s for each MiB of the body. The built-in patterns take about 60
+to 110 ms for each MiB. A request whose key takes longer fails with HTTP 400.
+
+All runs share one process. Anyone can start a run without the token, so
+the service makes the keys of these runs in a worker process, one key at
+a time. So a slow key does not stop the other work of the service. Some
+work, such as `JSON.parse()` of a large body, cannot stop at the time
+limit. When a key goes 1 s past its time limit, the service stops the
+worker and starts a new one. The worker has 256 MiB of heap. A key that
+needs more stops the worker, and its request fails with HTTP 400. The key
+of a 16 MiB body of small text blocks needs less. A run with the token
+makes its keys in the main process, so it has no memory limit of the
+worker. The key of a 64 MiB body can need about 1 GiB.
 
 The limits never change a key: a request gets the key that it always
-had, or it fails. The keys of runs with the token come before the keys of
-runs without it. A run without the token has smaller limits:
+had, or it fails. A run without the token has smaller limits:
 
 - A key has at most 5 s.
 - A request can have at most 100,000 changing values. A request with more
   fails with HTTP 400, and the run goes on.
+- The sessions of the run remember at most 10,000 values, with 256 Ki
+  characters, together. A request that would add more fails with HTTP
+  400, and the run ends. A session forgets its values when it ends. The
+  model requests of Junior have about 500 values with 10 K characters for
+  each session.
 - The keys of the run and the redaction of its misses (see
   [Misses](#misses)) have 30 s in total. In the 14 days to 2026-11-05, the
   keys of the largest run took 9.5 s (p99 9.1 s, about 1,000 keys).
@@ -453,9 +464,10 @@ shows it.
 - A miss has no change when there is no sample, such as for a recording
   from an older version, or when the texts are the same in the part that
   the sample keeps.
-- The proxy redacts the text of the miss before it compares it. This runs
-  in the worker process of the keys, with the time limit of a key (see
-  [Changing values](#changing-values)). Past it, the miss has no change.
+- The proxy redacts the text of the miss before it compares it. This has
+  the time limit of a key, and for a run without the token it runs in the
+  worker process of the keys (see [Changing values](#changing-values)).
+  Past the limit, the miss has no change.
 - When the requests of a test run in parallel, their order can change.
   Then a sample can come from another request of the test.
 
@@ -569,10 +581,10 @@ config is `RoachServiceConfig` in `packages/service/src/service.ts`. `deploy/gcp
     It checks the address of each connection after DNS, so a host name
     cannot point a run at the metadata server, at the VPC, or at the VM.
     Only tests and local development set `privateNetworks`.
-  - The service makes keys in a worker process, and a key has a time
-    limit and a memory limit (`key-worker.ts`, `request-key.ts`). So a
-    slow pattern or a large body fails only its own request, and it does
-    not stop the service.
+  - A key has a time limit. The service makes the keys of runs without
+    the token in a worker process with a memory limit (`key-worker.ts`,
+    `request-key.ts`). So a slow pattern or a large body fails only its
+    own request, and it does not stop the service.
 - **Sentry.** With `sentryDsn`, each read and write of a recording sends
   a span to Sentry. Each proxied request sends a span and metrics. Each
   unexpected error sends an error event. See [Sentry](#sentry).
@@ -594,11 +606,11 @@ attribute of Roach starts with `roach.`. Metrics have only attributes with
 few values: `roach.tenant`, `roach.mode`, `roach.rule`, `roach.origin`,
 `roach.result`, and `roach.reason`.
 
-| Metric                   | Type              | Value                                                                                                                                                                                                                                                                                                                            |
-| ------------------------ | ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `roach.request`          | counter           | 1 for each proxied request. `roach.result` is `replayed`, `live`, `missed`, `passthrough`, `refused`, or `aborted` (the client closed the request before its body came). A `passthrough`, `refused`, or `aborted` request has no `roach.rule`. A `refused` request has `roach.reason`, and `other` for an origin not in `allow`. |
-| `roach.request.duration` | distribution (ms) | The time to answer a request that a rule records, by `roach.result`.                                                                                                                                                                                                                                                             |
-| `roach.recording.write`  | counter           | Recordings by `roach.rule`. `roach.result` is `written` (the proxy sent them to the store) or `dropped` (their session failed).                                                                                                                                                                                                  |
+| Metric                   | Type              | Value                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| ------------------------ | ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `roach.request`          | counter           | 1 for each proxied request. `roach.result` is `replayed`, `live`, `missed`, `passthrough`, `refused`, `busy` (HTTP 503: the body did not fit in the budget), `timeout` (HTTP 408: the body did not come in time), or `aborted` (the client closed the request before its body came). A `passthrough`, `refused`, `busy`, `timeout`, or `aborted` request has no `roach.rule`. A `refused` request has `roach.reason`, and `other` for an origin not in `allow`. |
+| `roach.request.duration` | distribution (ms) | The time to answer a request that a rule records, by `roach.result`.                                                                                                                                                                                                                                                                                                                                                                                            |
+| `roach.recording.write`  | counter           | Recordings by `roach.rule`. `roach.result` is `written` (the proxy sent them to the store) or `dropped` (their session failed).                                                                                                                                                                                                                                                                                                                                 |
 
 Each proxied request is one trace. Each span has `roach.tenant`,
 `roach.mode`, `roach.run.id` (the `name` of the run, else its id), and the
@@ -677,13 +689,29 @@ To see how well the cache works:
   60 minutes without a request to the service fails.
 - The service can have 100 open runs without a token, for all tenants
   together, and 10 for each client address. All addresses of one IPv6
-  /64 count as one client. Another one gets HTTP 429 until one ends. Runs
-  with the token have no cap. With `proxyProtocol`, the address of the
+  /64 count as one client, and an IPv4 address in IPv6 form, such as
+  `::ffff:192.0.2.1`, counts as its IPv4 address. Another one gets HTTP
+  429 until one ends. Runs with the token have no cap. With `proxyProtocol`, the address of the
   client comes from the PROXY protocol v1 header of the load balancer.
   A connection without the header uses the address of the connection.
 - A proxied request body over 64 MiB gets HTTP 413, and over 16 MiB for a
   run without the token. A control API body over 1 MiB gets HTTP 413
   before the service parses it.
+- The requests of all runs without the token can hold 128 MiB of bodies
+  at one time, and the runs of one client 32 MiB. The client of a run is
+  the client that started it, grouped as for the limit of runs. A request
+  holds its body until it finishes, also while its key waits for the key
+  worker. A request whose body does not fit gets HTTP 503 with
+  `Retry-After: 1`, and the run goes on. The clients of model APIs send a
+  503 again. A client that does not gets the 503, and its test fails.
+  Runs with the token have no such limit.
+- A body of a run without the token that does not come in 30 s gets
+  HTTP 408, and its connection closes. The run goes on.
+- With these limits, the service and the key worker use at most about
+  1.1 GB of the 2 GB of the VM. That is for request bodies of runs with
+  the token of a normal size. A body of 64 MiB from a run with the token,
+  at the same time as runs without the token fill the budget, took about
+  2.0 GB.
 - Keys and the redaction of misses have time limits. See
   [Changing values](#changing-values).
 - Request headers that do not come in 10 s get HTTP 408, and a request
@@ -691,9 +719,13 @@ To see how well the cache works:
   and with `proxyProtocol`.
 - A `CONNECT` tunnel that sends no byte for 10 s after the `200` closes. A
   tunnel that sends and gets no byte for 10 minutes closes.
-- The credentials that a run learns and the values that a session
-  remembers have limits. See [Config](#config) and
+- The credentials that a run learns and the values that the sessions of
+  a run without the token remember have limits. See [Config](#config) and
   [Changing values](#changing-values).
+- A gap: a client with an IPv6 /48 has 65,536 /64s, so it can open runs
+  until the service has 100 runs without a token. Then other clients get
+  HTTP 429 until its runs end. Its runs can also hold all of the budget of
+  bodies, for 30 s at a time.
 - GCS deletes each recording 30 days after it was written, also when runs
   still replay it. Then `auto` mode records it again, and `replay` mode
   fails the request with HTTP 412.
@@ -785,24 +817,47 @@ the last green commit.
 The service reads its config only when it starts. With `proxyProtocol`,
 it reads a PROXY header when a connection has one, and it uses the
 address of the connection when it does not. A service without
-`proxyProtocol` cannot read the header. To turn on the PROXY header:
+`proxyProtocol` cannot read the header, so a load balancer that sends the
+header before the service reads it fails each request with HTTP 400. To
+turn on the PROXY header, apply in this order. Run the commands in
+`deploy/gcp`:
 
 1. Merge the change, and let the `Deploy` workflow deploy the image.
-2. Apply Terraform: `terraform apply -var-file=roach.tfvars`. The load
-   balancer then sends the header, but the service still has its old
-   config, so proxied requests fail with HTTP 400 until step 3.
-3. Restart the VM at once, so that it reads the new config:
-   `gcloud compute instances reset roach --project roach-511216 --zone us-east1-b`.
-   The apply does not restart the VM.
+2. Apply only the config secret:
+
+   ```sh
+   terraform apply -var-file=roach.tfvars \
+     -target=google_secret_manager_secret_version.config
+   ```
+
+3. Restart the VM, so that it reads the new config. It then reads a
+   header when a connection has one:
+
+   ```sh
+   gcloud compute instances reset roach --project roach-511216 --zone us-east1-b
+   ```
+
+4. When the service answers, apply the rest. The load balancer then
+   sends the header (`proxy_header` of `google_compute_target_ssl_proxy`
+   and of `google_compute_health_check`):
+
+   ```sh
+   terraform apply -var-file=roach.tfvars
+   ```
+
+No step fails requests with HTTP 400. But step 1 and step 3 each reset
+the VM, and a reset ends the open runs, so their CI jobs fail (see
+[Deploy](#deploy)). Do step 3 when few runs are open. From step 3 to
+step 4, the service sees the addresses of the load balancer, so all
+clients share the limit of runs for each client.
 
 The load balancer writes its header before the first byte of the client,
 so a client cannot put its own header first. A client can send its own
 header only when the service has `proxyProtocol` and the load balancer
-does not send the header, such as when the config has `proxyProtocol`
-but the load balancer has no `proxy_header`. With the steps above, this
-does not occur: until step 3 the service does not read headers. A false
-header changes only the address for the limit of runs for each client,
-and the firewall lets only the Google ranges connect to the VM.
+does not send the header: from step 3 to step 4 above. So do step 4 at
+once. A false header changes only the address for the limit of runs for
+each client, and the firewall lets only the Google ranges connect to the
+VM.
 
 To add a project, add its repository to the repositories of the
 `ROACH_TOKEN` organization secret, in the GitHub settings of the
@@ -935,8 +990,9 @@ In `packages/service/src/`:
 - `addresses.ts`: the public addresses that the proxy can send requests to.
 - `recorder.ts`: modes, sessions, replay, and misses.
 - `request-key.ts`: the key of a request.
-- `key-worker.ts`: the worker process that makes keys and redacts the text
-  of misses, with a time limit and a memory limit.
+- `key-worker.ts`: the worker process that makes the keys of runs without
+  the token and redacts the text of their misses, with a time limit and a
+  memory limit.
 - `misses.ts`: request samples and the first change of a miss.
 - `store.ts`: the formats of recordings and request samples, and the
   store contract.

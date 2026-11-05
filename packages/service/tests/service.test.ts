@@ -12,6 +12,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 import { ProxyAgent, request } from "undici";
 import {
   afterEach,
@@ -29,6 +30,8 @@ import {
 } from "@sentry/roach/client";
 import { describeRecordingMisses } from "@sentry/roach/report";
 import { keyInWorker } from "../src/key-worker.ts";
+import { keyRequest } from "../src/request-key.ts";
+import { clientGroup } from "../src/server.ts";
 import { startRoachService, type RoachService } from "../src/service.ts";
 import type { RemoteRun, RunConfig } from "@sentry/roach/types";
 import { VALUE_PATTERNS } from "@sentry/roach/values";
@@ -57,7 +60,9 @@ async function openTunnel(serviceUrl: string, runUrl: string) {
     socket.destroy();
   });
   await once(socket, "connect");
-  const credentials = Buffer.from(`${username}:${password}`).toString("base64");
+  const credentials = Buffer.from(
+    `${decodeURIComponent(username)}:${decodeURIComponent(password)}`,
+  ).toString("base64");
   socket.write(
     `CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\nProxy-Authorization: Basic ${credentials}\r\n\r\n`,
   );
@@ -73,6 +78,79 @@ async function readUntilClose(socket: ReturnType<typeof connect>) {
   await once(socket, "close");
   return Buffer.concat(chunks).toString();
 }
+
+/** A body that sends one byte and then nothing. */
+function stalledBody(): Readable {
+  const body = new Readable({ read() {} });
+  body.push("{");
+  return body;
+}
+
+/** Wait `ms` of real time, also when `setTimeout` is fake. */
+async function realWait(ms: number) {
+  const end = performance.now() + ms;
+  while (performance.now() < end) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
+/** Wait until `check` is true, for at most 10 s of real time. */
+async function until(check: () => boolean) {
+  const end = performance.now() + 10_000;
+  while (!check()) {
+    if (performance.now() > end) throw new Error("the wait timed out");
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
+/**
+ * Open a `CONNECT` tunnel of `run` to the upstream on a raw socket, and
+ * start a request that declares a body of `declared` bytes. It sends
+ * `sent` bytes of it, and then nothing. `reply` is all that the tunnel
+ * gets until it closes, and `status()` is the status that it got so far.
+ */
+async function startBody(
+  proxy: string,
+  run: RemoteRun,
+  declared: number,
+  sent: number,
+) {
+  const socket = await openTunnel(proxy, run.url);
+  const authority = new URL(origin).host;
+  const chunks: Buffer[] = [];
+  socket.on("data", (chunk: Buffer) => chunks.push(chunk));
+  socket.on("error", () => socket.destroy());
+  const reply = once(socket, "close").then(() =>
+    Buffer.concat(chunks).toString(),
+  );
+  socket.write(
+    `POST /v1/messages HTTP/1.1\r\nhost: ${authority}\r\ncontent-length: ${declared}\r\n\r\n`,
+  );
+  socket.write(Buffer.alloc(sent, "a"));
+  const status = () =>
+    Number(
+      /^HTTP\/1.1 (\d{3})/.exec(Buffer.concat(chunks).toString())?.[1] ?? 0,
+    );
+  return { socket, reply, status };
+}
+
+/** The status of a whole body of `bytes` through a raw tunnel of `run`. */
+async function answer(proxy: string, run: RemoteRun, bytes: number) {
+  const { status } = await startBody(proxy, run, bytes, bytes);
+  await until(() => status() > 0);
+  return status();
+}
+
+/** The heap that this process uses, in bytes. */
+const heap = () => process.memoryUsage().heapUsed;
+
+/** `count` distinct values `v<n>`, from `v<from>`, with spaces between. */
+const ids = (from: number, count: number) =>
+  Array.from({ length: count }, (_, n) => `v${from + n}`).join(" ");
+
+/** `count` runs of `z` of different lengths, from 30,000 + `from`. */
+const zRuns = (from: number, count: number) =>
+  Array.from({ length: count }, (_, n) => "z".repeat(30_000 + from + n));
 
 /** Start a run, with one recorded rule. Without `token`, it has no token. */
 async function startRun(
@@ -115,6 +193,7 @@ async function send(
     status: response.statusCode,
     body: await response.body.text(),
     source: response.headers["x-roach"],
+    retryAfter: response.headers["retry-after"],
   };
 }
 
@@ -727,9 +806,11 @@ describe("limits of the service", () => {
         },
       ],
     });
+    // 7 bodies of 4 MiB fit in the 32 MiB that the runs of one client can
+    // hold.
     const prompt = "a".repeat(4 * 1024 * 1024);
     const sent = Promise.allSettled(
-      Array.from({ length: 20 }, () => send(run.url, { prompt })),
+      Array.from({ length: 7 }, () => send(run.url, { prompt })),
     );
     const waits = await caWaitsUntil(sent);
     // The keys are made in a worker, so the service answers at once.
@@ -772,6 +853,307 @@ describe("limits of the service", () => {
     expect((await send(writer.url, { prompt })).status).toBe(200);
   });
 
+  it("answers 503 when the bodies of runs without a token fill the budget", async () => {
+    // Each request holds its body until its key is done. Before the budget,
+    // 30 parallel bodies of 16 MiB took about 1.9 GB.
+    const reader = await startRun(undefined, "replay");
+    const prompt = "a".repeat(16 * 1024 * 1024 - 64);
+    const results = await Promise.all(
+      Array.from({ length: 12 }, () => send(reader.url, { prompt })),
+    );
+    // The runs of one client can hold 32 MiB, 2 of these bodies. The bytes
+    // count when they come, so parts of more bodies can fill it.
+    const busy = results.filter((result) => result.status === 503);
+    expect(busy.length).toBeGreaterThanOrEqual(4);
+    for (const result of results) expect([412, 503]).toContain(result.status);
+    for (const result of busy) {
+      expect(result.body).toMatch(/too many large requests/);
+      expect(result.retryAfter).toBe("1");
+    }
+    // The run goes on, and the bodies gave their bytes back.
+    await expect(reader.stats()).resolves.toBeDefined();
+    const again = await Promise.all(
+      Array.from({ length: 2 }, () => send(reader.url, { prompt })),
+    );
+    expect(again.map((result) => result.status)).toEqual([412, 412]);
+
+    // A client that declares large bodies and then stops holds only the
+    // bytes that it sent.
+    const stalled = new AbortController();
+    const stalls = Array.from({ length: 9 }, () => {
+      const agent = new ProxyAgent({ uri: reader.url, proxyTunnel: true });
+      agents.push(agent);
+      return request(`${origin}/v1/messages`, {
+        method: "POST",
+        dispatcher: agent,
+        headers: { "content-length": String(16 * 1024 * 1024 - 64) },
+        body: stalledBody(),
+        signal: stalled.signal,
+      }).catch(() => undefined);
+    });
+    // Give the stalled requests the time to reach the service.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect((await send(reader.url, { prompt })).status).toBe(412);
+    stalled.abort();
+    await Promise.all(stalls);
+  });
+
+  it("keeps the budget for other clients while one client stalls its bodies", async () => {
+    const local = await startRoachService({
+      directory,
+      privateNetworks: true,
+      writeTokenHash: hash("write-token"),
+      proxyProtocol: true,
+    });
+    onTestFinished(() => local.close());
+    const config = {
+      tenant: "acme/alpha",
+      mode: "replay",
+      allow: [origin],
+      rules: [
+        { name: "model", match: { method: "POST", url: `${origin}/v1/` } },
+      ],
+    };
+    const startFrom = async (client: string) =>
+      JSON.parse(
+        (await rawRequest(local.url, client, "POST", "/__roach/runs", config))
+          .body,
+      ) as RemoteRun;
+    const attacker = await startFrom("203.0.113.1");
+    const other = await startFrom("203.0.113.2");
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+
+    // Each body declares 16 MiB, sends all but 1 KiB, and then stops. Before
+    // the part for each client, 8 of them held the whole budget.
+    const size = 16 * 1024 * 1024;
+    const stalls = await Promise.all(
+      Array.from({ length: 8 }, () =>
+        startBody(local.url, attacker, size, size - 1024),
+      ),
+    );
+    await until(() =>
+      stalls.every(
+        ({ socket, status }) => socket.writableLength === 0 || status() > 0,
+      ),
+    );
+    await realWait(500);
+    const small = 700 * 1024;
+    expect(await answer(local.url, other, small)).toBe(412);
+    // The runs of the attacker can hold only 32 MiB, 2 of the bodies.
+    await until(
+      () => stalls.filter(({ status }) => status() === 503).length >= 6,
+    );
+    const holders = stalls.filter(({ status }) => status() === 0);
+    expect(holders.length).toBeLessThanOrEqual(2);
+
+    // A body that does not come in 30 s gets HTTP 408, and its tunnel
+    // closes. Then the attacker has its part again.
+    await vi.advanceTimersByTimeAsync(30_000);
+    for (const holder of holders) {
+      expect(await holder.reply).toMatch(
+        /^HTTP\/1.1 408 [^]*the body did not come in 30 s/,
+      );
+    }
+    expect(await answer(local.url, attacker, small)).toBe(412);
+  });
+
+  it("fails a request with millions of values before it fills the memory", async () => {
+    // `replace()` finds all matches before it counts them, so these bodies
+    // stopped the worker at its heap limit. The count stops at the limit.
+    const rules = [
+      {
+        name: "model",
+        match: { method: "POST", url: `${origin}/v1/` },
+        values: { v: "x" },
+      },
+    ];
+    const reader = await startRun(undefined, "replay", { rules });
+    for (const body of [
+      { v: "x".repeat(8 * 1024 * 1024) },
+      "x ".repeat(4 * 1024 * 1024),
+    ]) {
+      const started = performance.now();
+      const tooMany = await send(reader.url, body);
+      expect(tooMany.status).toBe(400);
+      expect(tooMany.body).toMatch(/too many changing values/);
+      expect(performance.now() - started).toBeLessThan(5000);
+    }
+    // The worker did not stop, and the run goes on.
+    expect((await send(reader.url, { prompt: "x" })).status).toBe(412);
+    await expect(reader.stats()).resolves.toBeDefined();
+  });
+
+  it("ends a run without a token whose sessions remember too many values", async () => {
+    // The probe of the review: 64 sessions, each with one 15 MB request of
+    // distinct values. Before the limit, the main heap grew past 1.2 GB.
+    const rules = [
+      {
+        name: "model",
+        match: { method: "POST", url: `${origin}/v1/` },
+        values: { v: "[a-z]{150}" },
+      },
+    ];
+    const before = heap();
+    let peak = before;
+    const sampler = setInterval(() => (peak = Math.max(peak, heap())), 20);
+    onTestFinished(() => clearInterval(sampler));
+    const reader = await startRun(undefined, "replay", { rules });
+    const sessions = await Promise.all(
+      Array.from({ length: 64 }, (_, n) => reader.startSession(`s${n}`)),
+    );
+    let next = 0;
+    // A distinct value of 150 letters: the number in base 25, with the
+    // digits `b` to `z`, after `a` as padding.
+    const value = () =>
+      (next++)
+        .toString(25)
+        .replace(/./g, (digit) =>
+          String.fromCharCode(98 + Number.parseInt(digit, 25)),
+        )
+        .padStart(150, "a");
+    const results: Array<{ status: number; body: string }> = [];
+    for (const opened of sessions) {
+      const words = Array.from({ length: 15_000_000 / 151 }, value);
+      const result = await send(opened.url, { prompt: words.join(" ") }).catch(
+        (error: unknown) => ({ status: 407, body: String(error) }),
+      );
+      results.push(result);
+      if (result.status !== 412) break;
+    }
+    expect(results).toHaveLength(1);
+    expect(results[0]!.status).toBe(400);
+    expect(results[0]!.body).toMatch(
+      /over 10000 changing values or 262144 characters.*This run has ended/s,
+    );
+    await expect(reader.stats()).rejects.toThrow(/404/);
+    expect(peak - before).toBeLessThan(300 * 1024 * 1024);
+  });
+
+  it("counts the remembered values of all sessions of a run without a token", async () => {
+    const rules = [
+      {
+        name: "model",
+        match: { method: "POST", url: `${origin}/v1/` },
+        values: { v: "v\\d+", z: "z+" },
+      },
+    ];
+
+    // 6,000 and then 5,000 values of two open sessions are over 10,000.
+    const values = await startRun(undefined, "replay", { rules });
+    const first = await values.startSession("first");
+    const second = await values.startSession("second");
+    expect((await send(first.url, { prompt: ids(0, 6000) })).status).toBe(412);
+    const over = await send(second.url, { prompt: ids(6000, 5000) });
+    expect(over.status).toBe(400);
+    expect(over.body).toMatch(/over 10000 changing values/);
+    await expect(values.stats()).rejects.toThrow(/404/);
+
+    // A session forgets its values when it ends.
+    const ended = await startRun(undefined, "replay", { rules });
+    const early = await ended.startSession("early");
+    expect((await send(early.url, { prompt: ids(0, 6000) })).status).toBe(412);
+    await early.end(true);
+    const late = await ended.startSession("late");
+    expect((await send(late.url, { prompt: ids(6000, 6000) })).status).toBe(
+      412,
+    );
+    // Values that the session knows do not count again.
+    expect((await send(late.url, { prompt: ids(6000, 6000) })).status).toBe(
+      412,
+    );
+
+    // Nine values of about 30,000 characters are over 256 Ki characters.
+    const chars = await startRun(undefined, "replay", { rules });
+    const long = await chars.startSession("long");
+    const eight = await send(long.url, { prompt: zRuns(0, 8).join(" ") });
+    expect(eight.status).toBe(412);
+    const ninth = await send(long.url, { prompt: zRuns(8, 1).join(" ") });
+    expect(ninth.status).toBe(400);
+    expect(ninth.body).toMatch(/or 262144 characters/);
+
+    // A run with the token has no limit.
+    const writer = await startRun("write-token", "auto", { rules });
+    const opened = await writer.startSession("writer");
+    expect((await send(opened.url, { prompt: ids(0, 20_000) })).status).toBe(
+      200,
+    );
+  });
+
+  it("leaves a value of over 32,767 characters out of the memory of a session", async () => {
+    const rule = {
+      name: "model",
+      match: { method: "POST", url: `${origin}/v1/` },
+      values: { v: "y+" },
+    };
+    const toKey = (prompt: string) => ({
+      method: "POST",
+      url: `${origin}/v1/messages`,
+      headers: {},
+      body: JSON.stringify({ prompt }),
+    });
+    const long = "y".repeat(40_000);
+    // Before, the session remembered the value, and V8 does not run the
+    // pattern of a value this long. So each later request failed and had no
+    // key. To leave the value out changes no key.
+    expect(() =>
+      keyRequest(rule, toKey("later y"), new Map([[long, "v"]])),
+    ).toThrow(/too large/);
+
+    for (const [token, mode, status] of [
+      [undefined, "replay", 412],
+      ["write-token", "auto", 200],
+    ] as const) {
+      const run = await startRun(token, mode, { rules: [rule] });
+      const opened = await run.startSession("long");
+      expect((await send(opened.url, { prompt: long })).status).toBe(status);
+      for (let n = 0; n < 3; n += 1) {
+        expect(
+          (await send(opened.url, { prompt: `later ${n} y` })).status,
+        ).toBe(status);
+      }
+      await opened.end(true);
+      await expect(run.stats()).resolves.toBeDefined();
+    }
+    // Each recording has the key of its request without the long value.
+    const keys = [long, "later 0 y", "later 1 y", "later 2 y"].map(
+      (prompt) => `${keyRequest(rule, toKey(prompt)).key}.json`,
+    );
+    expect((await recordings("acme/alpha")).toSorted()).toEqual(
+      keys.toSorted(),
+    );
+  });
+
+  it("keys a 60 MiB body of small text blocks from a run with the token", async () => {
+    // The worker has a heap limit for runs without the token. A run with
+    // the token makes its keys on the main thread, so a body that keyed
+    // before the worker still keys.
+    const writer = await startRun("write-token", "auto", {
+      rules: [
+        {
+          name: "model",
+          match: { method: "POST", url: `${origin}/v1/` },
+          values: { uuid: VALUE_PATTERNS.uuid, time: VALUE_PATTERNS.isoTime },
+        },
+      ],
+    });
+    const block = { type: "text", text: "hello there" };
+    const count = Math.floor(
+      (60 * 1024 * 1024) / (JSON.stringify(block).length + 1),
+    );
+    const body = {
+      model: "m",
+      messages: [
+        { role: "user", content: Array.from({ length: count }, () => block) },
+      ],
+    };
+    const sent = await send(writer.url, body);
+    expect(sent).toMatchObject({ status: 200, source: "live" });
+    expect(await writer.close()).toMatchObject({ written: 1 });
+  }, 120_000);
+
   it("ends a run without a token whose key fills the memory of the worker", async () => {
     // Each `{}` is an object for `JSON.parse()`, so the body needs more
     // memory than the worker has.
@@ -789,8 +1171,8 @@ describe("limits of the service", () => {
     expect(Math.max(...waits)).toBeLessThan(500);
     await expect(reader.stats()).rejects.toThrow(/404/);
     // The next key gets a new worker.
-    const writer = await startRun("write-token", "auto");
-    expect((await send(writer.url, { prompt: "hi" })).status).toBe(200);
+    const next = await startRun(undefined, "replay");
+    expect((await send(next.url, { prompt: "hi" })).status).toBe(412);
   });
 
   it("stops a key that the time limit of vm cannot stop", async () => {
@@ -800,10 +1182,11 @@ describe("limits of the service", () => {
     const options = {
       timeLimitMs: 1,
       maxValues: Infinity,
-      first: true,
       skip: () => false,
     };
-    const body = `[${"{},".repeat(16 * 1024 * 1024)}{}]`;
+    // An object with 2.1 M keys takes about 2 s to parse, and it fits in
+    // the heap of the worker.
+    const body = `{${Array.from({ length: 2_100_000 }, (_, n) => `"k${n}":0`).join(",")}}`;
     const started = performance.now();
     const error = await keyInWorker(
       rule,
@@ -1075,6 +1458,21 @@ describe("limits of the service", () => {
     );
     // The run goes on.
     expect((await send(run.url, { prompt: "hi" })).status).toBe(412);
+
+    // A closed request gives its bytes of the budget back. Without that,
+    // 2 bodies of 15 MiB fill the part of the client.
+    for (let n = 0; n < 2; n += 1) {
+      const size = 15 * 1024 * 1024;
+      const { socket } = await startBody(service.url, run, size + 1, size);
+      await until(() => socket.writableLength === 0);
+      await realWait(300);
+      socket.destroy();
+      await realWait(300);
+    }
+    expect(await answer(service.url, run, 3 * 1024 * 1024)).toBe(412);
+    expect(log.mock.calls.map(([text]) => String(text)).join("")).not.toMatch(
+      /Request failed/,
+    );
   });
 
   it("limits the runs without a token of each client", async () => {
@@ -1147,5 +1545,21 @@ describe("limits of the service", () => {
     );
     expect(ended.status).toBe(200);
     expect((await startFrom("203.0.113.1")).status).toBe(201);
+  });
+
+  it("groups an IPv4 address in each IPv6 form as the IPv4 address", () => {
+    for (const address of [
+      "192.0.2.1",
+      "::ffff:192.0.2.1",
+      "::FFFF:c000:201",
+      "0:0:0:0:0:ffff:192.0.2.1",
+      "0000:0000:0000:0000:0000:ffff:c000:0201",
+    ]) {
+      expect(clientGroup(address)).toBe("192.0.2.1");
+    }
+    expect(clientGroup("2001:db8:0:1:ffff::1")).toBe("2001:db8:0:1::/64");
+    expect(clientGroup("2001:DB8:0:1::1%eth0")).toBe("2001:db8:0:1::/64");
+    // An address that only ends in IPv4 form is IPv6.
+    expect(clientGroup("::ffff:0:192.0.2.1")).toBe("0:0:0:0::/64");
   });
 });
