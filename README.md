@@ -231,7 +231,9 @@ A run takes `RunConfig` (`packages/roach/src/types.ts`): `tenant`, `mode`, `rule
   1 Mi characters. A run with the token learns at most 16,384 values, with
   a total of 16 Mi characters, for credentials that change on each
   request, such as AWS signatures. The whole value and each part of it
-  count, also for the `secrets` of the run. A run whose `secrets` go past
+  count, also for the `secrets` of the run. The proxy also redacts each
+  part with `\/` for `/`, as some servers write it in JSON. These forms
+  do not count. A run whose `secrets` go past
   the limit gets HTTP 400 when it starts. Past the limit, a request with a
   new credential gets HTTP 431, and the proxy does not send or record it.
   A request with known credentials goes on. Start a new run to learn more.
@@ -305,12 +307,14 @@ A run takes `RunConfig` (`packages/roach/src/types.ts`): `tenant`, `mode`, `rule
   `secret_key`, `private_key`, and `secret_access_key`. In JSON, these
   fields count at each depth. In an `application/x-www-form-urlencoded`
   body, the form fields count. No key uses this text, so this list can be
-  longer. Then the proxy looks for each value of these fields in the
-  text. When it finds one, the request sample has no text, and the proxy
-  writes a log line with the key. This occurs when a value pattern takes
-  a quote away, or when the value is also in other text of the body, such
-  as in a key of an object. A body with more than 64 different values of
-  these fields gets a sample with no text too. A miss has no change then.
+  longer. The proxy replaces the value at the place of each field, and
+  each other string that is the same value. A value pattern can change
+  the text of a key, so then the proxy checks the result. It parses the
+  body again, and the body must be JSON. Each field must hold
+  `<<redacted>>` at its place, and no string can be one of the values.
+  When a check fails, the request sample has no text, and the proxy writes
+  a log line with the key. This occurs when a value pattern takes a quote,
+  or a name of a field, away. A miss has no change then.
 - The proxy parses a JSON body to find the fields, so a long string value
   cannot stop it. It does not find a field whose value is not a string,
   such as an array, or a field in JSON text that is itself a string, such
