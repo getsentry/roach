@@ -503,6 +503,12 @@ manager accepts it, Craft:
 The action runs `src/action.ts` from the tag, and the package has the
 sources, so a release has no build step.
 
+Craft takes the last version from the newest `v<version>` tag in the
+history of `main`. Do not rewrite `main`, or the tag leaves its history and
+Craft bumps from 0.0.0. The workflow deletes the floating `v<major>` tags in
+its checkout first (`.github/scripts/drop-floating-tags.sh`), because
+`git describe` picks them over the release tag on the same commit.
+
 The `Release` workflow uses the token of Sentry Release Bot. A push with
 `GITHUB_TOKEN` starts no workflows, so the release branch gets no checks and
 no image, and Craft cannot publish it.
