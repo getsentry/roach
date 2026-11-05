@@ -8,6 +8,8 @@ targets:
   # The client and the vitest integration. CI uploads the tarball of each
   # commit as the artifact `<sha>`.
   - name: npm
+    id: "@sentry/roach"
+    includeNames: /^sentry-roach-\d.*\.tgz$/
     access: public
   # The service image. The Image workflow pushes `:<sha>` for the release
   # branch, and Craft copies it to `:<version>`.

@@ -603,7 +603,9 @@ manager accepts it, Craft:
 - makes the GitHub release `v<version>`, with the changelog, and moves the
   `v<major>` tag. Repositories use the action as `getsentry/roach@v<major>`.
 - publishes `@sentry/roach` to npm: the tarball that the `package` job of
-  `CI` uploads for the release commit. On the release branch, Craft runs
+  `CI` uploads for the release commit. Craft publishes only
+  `sentry-roach-<version>.tgz`, and CI makes sure that it has `LICENSE` and
+  `README.md` (`.github/scripts/check-tarball.sh`). On the release branch, Craft runs
   `.github/scripts/bump-version.sh`, which writes the version to
   `packages/roach/package.json`. The workspace root and `packages/service`
   are private and have no version.

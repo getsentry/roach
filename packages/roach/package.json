@@ -24,7 +24,7 @@
     "access": "public"
   },
   "scripts": {
-    "prepack": "cp ../../README.md README.md",
+    "prepack": "cp ../../README.md ../../LICENSE .",
     "test": "vitest run",
     "typecheck": "tsc -p ."
   },
