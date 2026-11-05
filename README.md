@@ -900,9 +900,11 @@ once after it.
 With `proxyProtocol`, the service reads a PROXY header when a connection
 has one, and it uses the address of the connection when it does not. The
 load balancer writes its header before the first byte of the client, so a
-client cannot put its own header first. A false header changes only the
-address for the limit of runs for each client, and the firewall lets only
-the Google ranges connect to the VM.
+client cannot put its own header first. A client can send its own header
+only when the service has `proxyProtocol` and the load balancer does not
+send the header: from step 3 to step 4 above. So do step 4 at once. A
+false header changes only the address for the limit of runs for each
+client, and the firewall lets only the Google ranges connect to the VM.
 
 To add a project, add its repository to the repositories of the
 `ROACH_TOKEN` organization secret, in the GitHub settings of the
@@ -943,7 +945,8 @@ The service also has:
 - `POST /__roach/runs` with a `RunConfig`: start a run. Send
   `Authorization: Bearer <write token>` for any mode but `replay`. Returns
   HTTP 201 with the `id`, `token`, proxy `url`, `controlUrl`, and `caCert`
-  of the run. A config that is not valid gets HTTP 400, a mode other than
+  of the run. A body that is not JSON or a config that is not valid gets
+  HTTP 400, a body over 1 MiB gets HTTP 413, a mode other than
   `replay` without the token gets HTTP 401, and a run past the limit of
   runs without a token gets HTTP 429 (see [Limits](#limits)).
 - `DELETE /__roach/runs/<id>`: end the run. Returns its stats.
@@ -990,8 +993,8 @@ pnpm install
 pnpm check   # format, lint, types, unused code, and tests
 ```
 
-CI also runs the tests with coverage (`pnpm test:coverage`) and packs
-`@sentry/roach`. `AGENTS.md` has the conventions and the commands for one
+CI runs the tests only with coverage (`pnpm test:coverage`), and packs
+`@sentry/roach`. It does not run `pnpm check`, so run it before you push. `AGENTS.md` has the conventions and the commands for one
 file.
 
 - `packages/roach/tests/package.test.ts` checks what the npm package
