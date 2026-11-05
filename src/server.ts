@@ -1,5 +1,5 @@
 /**
- * The proxy sockets of the service (`service.ts`).
+ * The proxy sockets of the service (`service/service.ts`).
  *
  * The proxy is a forward proxy. It intercepts HTTPS with its own
  * certificate authority (`certificates.ts`). It gives each request that a
