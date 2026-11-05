@@ -3,8 +3,9 @@
 Use this file to answer questions about Roach from its Sentry data. Examples:
 "how many requests replayed?", "why does this run miss?", and "how much time
 do recordings save?". "Sentry" in `README.md` lists the metrics, spans, and
-errors. The code in `packages/service/src/service.ts` and
-`packages/service/src/recorder.ts` is authoritative.
+errors. The code in `packages/service/src/service.ts`,
+`packages/service/src/server.ts`, and `packages/service/src/recorder.ts` is
+authoritative.
 
 ## Where To Query
 
@@ -79,6 +80,9 @@ For metrics, use `-f dataset=tracemetrics`,
 | `roach.session`             | session (test) name of a request           | `roach.request`                   |
 | `roach.key`                 | recording key of a request                 | `roach.key`, `roach.store.read`   |
 | `roach.write`               | the run has the write token (boolean)      | `roach.run.start`                 |
+| `roach.recordings`          | files that one write sends to the store    | `roach.store.write`               |
+| `roach.written`             | files that were new or changed             | `roach.store.write`               |
+| `http.request.method`       | method of the request                      | `roach.request`, `roach.upstream` |
 | `http.response.status_code` | status to the client                       | `roach.request`, `roach.upstream` |
 | `gen_ai.request.model`      | model of a model call                      | `roach.request`                   |
 | `miss.sample`               | `found`, `withheld`, or `none` for a miss  | `roach.request`                   |
@@ -153,6 +157,15 @@ tests send the same live requests again on the next run.
 ```bash
 sentry explore sentry/roach --dataset metrics --metric roach.recording.write \
   --agg sum --period 24h -F roach.rule -F roach.result
+```
+
+Keys that change on each run. A key that only one run uses shows that a
+value changes on each run. Add `-F roach.run.id` to see the runs.
+
+```bash
+sentry explore sentry/roach --dataset spans --period 24h \
+  -q 'span.op:roach.key roach.tenant:getsentry/junior' -F roach.rule \
+  -F roach.key -F 'count()' -s 'count()'
 ```
 
 Runs with the most live requests. When the same tests stay live from run to
@@ -275,8 +288,8 @@ and the next run makes it again. Compare `roach.recording.write` with
   metric does not count samples.
 - An error event has the message of the error. The message can have the
   body of a GCS response. Only Sentry gets it. The client gets only the id
-  of the event. The service log gets the id, the class, and the HTTP status
-  of the error.
+  of the event. The service log gets the id of the event, and the class,
+  the code, and the HTTP status of the error.
 - An error of the control API, such as a failed write at the end of a
   session, has no `roach.*` tags.
 - Cost is on spans only, not on metrics.

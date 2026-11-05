@@ -32,7 +32,7 @@
 
 - The repository is a pnpm workspace. The root is private and has only the tools. `packages/roach` is the npm package `@sentry/roach`: the client, the vitest integration, and the action. `packages/service` is the private `@sentry/roach-service`: the service and the proxy. Put a shared dependency version in the catalog of `pnpm-workspace.yaml`, and refer to it as `catalog:`.
 - Use Node built-ins and the `openssl` command. `@sentry/roach` has no runtime dependencies. `@sentry/node` is the only one of `@sentry/roach-service`, and only `packages/service/src/service.ts` imports it. The service imports `@sentry/roach` by package name (`workspace:*`), never by a relative path. `@sentry/roach` never imports the service. `packages/roach/tests/package.test.ts` fails when an export or the action loads a package that is not a Node built-in or vitest, or when a file in `packages/roach/src/` is not used.
-- `deploy/gcp/` is the production setup (Terraform). Change it in the same change when the service config (`RoachServiceConfig`) changes. CI runs `terraform validate` on it.
+- `deploy/gcp/` is the production setup (Terraform). Change it in the same change when the service config (`RoachServiceConfig`) changes. The `Image` workflow runs `terraform fmt -check` and `terraform validate` on it.
 - Node runs both packages as TypeScript with type stripping. Use only erasable syntax, and import local files with the `.ts` extension.
 - Use functions and plain objects, not classes.
 - Start each source file with a comment that says what the file owns. Give each export a short JSDoc.
