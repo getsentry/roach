@@ -1,4 +1,33 @@
 # Changelog
+## 0.2.0
+
+### New Features ✨
+
+#### Deploy
+
+- Auto-deploy green commits of main by @sentry-junior in [#25](https://github.com/getsentry/roach/pull/25)
+- Set the Sentry DSN in roach.tfvars by @sentry-junior in [#22](https://github.com/getsentry/roach/pull/22)
+
+#### Service
+
+- Add Sentry spans and cache metrics by @sentry-junior in [#13](https://github.com/getsentry/roach/pull/13)
+- Take origins and value patterns from the run by @sentry-junior in [#12](https://github.com/getsentry/roach/pull/12)
+- Redact the secrets that a run sends by @sentry-junior in [#11](https://github.com/getsentry/roach/pull/11)
+
+#### Other
+
+- Concurrent sessions, a vitest integration, and an npm package by @sentry-junior in [#28](https://github.com/getsentry/roach/pull/28)
+- Report model token usage on request spans by @sentry-junior in [#24](https://github.com/getsentry/roach/pull/24)
+
+### Bug Fixes 🐛
+
+- (release) Let Craft find v0.1.0 so the next release bumps from it by @sentry-junior in [#29](https://github.com/getsentry/roach/pull/29)
+- (secrets) Do not treat x-session-affinity as a credential by @sentry-junior in [#27](https://github.com/getsentry/roach/pull/27)
+
+### Documentation 📚
+
+- Add TELEMETRY.md with Sentry query recipes by @sentry-junior in [#23](https://github.com/getsentry/roach/pull/23)
+
 ## 0.1.0
 
 ### New Features ✨
