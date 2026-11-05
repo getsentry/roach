@@ -16,11 +16,18 @@
  * never replayed. A request that ends after its session ended follows the
  * result of that session. A request outside a session is written at once.
  *
+ * With each new recording, the recorder writes the redacted text of its
+ * request as a sample. The first miss of a session reads the sample of its
+ * place and finds the first change (`misses.ts`). The span of the request
+ * always gets the change and its text. Only a run with the write token gets
+ * the change in its stats, and never its text.
+ *
  * The recorder never writes a known credential (`secrets.ts`). It reports
  * spans and metrics through the `Telemetry` hooks of `service.ts`.
  */
 import { randomBytes } from "node:crypto";
 import type { IncomingHttpHeaders } from "node:http";
+import { firstChange, sampleKey, toSample } from "./misses.ts";
 import { keyRequest, type KeyedRequest } from "./request-key.ts";
 import { createSecrets } from "./secrets.ts";
 import {
@@ -28,6 +35,7 @@ import {
   RULE_NAME,
   type Recording,
   type RecordingStore,
+  type RequestSample,
 } from "./store.ts";
 import {
   isEventStream,
@@ -89,12 +97,30 @@ export interface Telemetry {
   time(name: string, ms: number, attributes: Attributes): void;
 }
 
-interface Session {
+/** Requests by their place, for the samples of `misses.ts`. */
+interface Places {
+  /** Requests so far, by rule name. */
+  sent: Map<string, number>;
+  /** Set after the first miss, which is the one to explain. */
+  explained: boolean;
+}
+
+/**
+ * A new recording, and the samples of its requests. A session can send the
+ * same request at more than one place, so one recording can have more than
+ * one sample.
+ */
+interface NewRecording {
+  recording: Recording;
+  samples: Array<[string, RequestSample]>;
+}
+
+interface Session extends Places {
   /** The id in the proxy URL of the session. */
   id: string;
   name: string;
   /** New recordings, by key. */
-  recorded: Map<string, Recording>;
+  recorded: Map<string, NewRecording>;
   /** Requests that `replay` mode failed. */
   missed: number;
   /**
@@ -194,6 +220,14 @@ export interface RecorderConfig {
   rules: RecordingRule[];
   /** Credentials to redact, in addition to the ones that it learns. */
   secrets?: string[];
+  /**
+   * Add the first change from a request sample to the first miss of each
+   * session in the stats (`misses.ts`). Only a run with the write token may
+   * set it: a change shows a part of a recorded request, so a public run
+   * could read the requests of a tenant back. The span gets the change
+   * without it.
+   */
+  explainMisses?: boolean;
   telemetry: Telemetry;
 }
 
@@ -235,8 +269,19 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
       telemetry.count("roach.recording.write", value, { rule, result });
     }
   };
-  const write = async (recordings: Array<[string, Recording]>) => {
-    stats.written += await store.write(recordings);
+  const write = async (recordings: Array<[string, NewRecording]>) => {
+    stats.written += await store.write(
+      recordings.map(([key, { recording }]) => [key, recording]),
+    );
+    // A sample only explains a later miss, so a failed write does not fail
+    // the request or the session.
+    await store
+      .write(recordings.flatMap(([, { samples }]) => samples))
+      .catch((error: unknown) => {
+        process.stderr.write(
+          `[roach] Request samples were not written: ${(error as Error).message}\n`,
+        );
+      });
     countRecordings(
       recordings.map(([key]) => key),
       "written",
@@ -250,10 +295,15 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
   const record = async (
     owner: Session | undefined,
     key: string,
-    recording: Recording,
+    recording: NewRecording,
   ) => {
     if (owner && owner.passed === undefined) {
-      owner.recorded.set(key, recording);
+      // The last response wins, but each place keeps its sample.
+      const earlier = owner.recorded.get(key)?.samples ?? [];
+      owner.recorded.set(key, {
+        ...recording,
+        samples: [...earlier, ...recording.samples],
+      });
     } else if (owner?.passed === false) {
       drop([key]);
     } else {
@@ -261,15 +311,56 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
     }
   };
 
-  const reportMiss = (rule: RecordingRule, key: string, owner?: Session) => {
-    const miss: RecordingMiss = {
-      rule: rule.name,
-      session: owner?.name,
-      file: key,
-    };
-    if (stats.misses.length < MAX_MISSES) stats.misses.push(miss);
+  /** Requests outside a session. */
+  const outside: Places = { sent: new Map(), explained: false };
+
+  /** The sample key of the next request of `rule` in `owner`. */
+  const nextSample = (rule: string, owner: Session | undefined) => {
+    const places = owner ?? outside;
+    const index = places.sent.get(rule) ?? 0;
+    places.sent.set(rule, index + 1);
+    return sampleKey(rule, owner?.name, index);
+  };
+
+  /**
+   * Report a miss. The first miss of a session reads the sample of its
+   * place (`sample`), and finds the first change from it to the text of the
+   * request (`text`). The span of the request gets the change and its
+   * text. The stats get only its key and offset, and only with
+   * `explainMisses`. A failed read only leaves the change out.
+   */
+  const reportMiss = async (
+    rule: RecordingRule,
+    key: string,
+    owner: Session | undefined,
+    sample: string,
+    text: () => string,
+  ) => {
     const where = owner ? ` in "${owner.name}"` : "";
     process.stderr.write(`[roach] No ${rule.name} recording${where}: ${key}\n`);
+    const miss: RecordingMiss | undefined =
+      stats.misses.length < MAX_MISSES
+        ? { rule: rule.name, session: owner?.name, file: key }
+        : undefined;
+    if (miss) stats.misses.push(miss);
+    const places = owner ?? outside;
+    if (places.explained) return;
+    places.explained = true;
+    const recorded = (await store.read(sample).catch(() => undefined)) as
+      | RequestSample
+      | undefined;
+    const change = recorded && firstChange(recorded, text());
+    telemetry.annotate({ "miss.sample": recorded ? "found" : "none" });
+    if (!change) return;
+    telemetry.annotate({
+      "miss.changed_at": change.at,
+      "miss.compared": change.file,
+      "miss.recorded": change.recorded,
+      "miss.request": change.request,
+    });
+    if (config.explainMisses && miss) {
+      miss.change = { file: change.file, at: change.at };
+    }
   };
 
   /** End a session. Returns its requests that `replay` mode failed. */
@@ -333,8 +424,9 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
       const origin = request.url.origin;
       // A request belongs to the session that was open when it started.
       const owner = sessionOf(sessionId);
+      const sample = nextSample(rule.name, owner);
       const counts = stats.counts[rule.name]!;
-      secrets.learn(request.headers);
+      secrets.learn(request.headers, request.url);
       telemetry.annotate({ rule: rule.name });
       const { keyed, key } = telemetry.span(
         { op: "roach.key", attributes: { rule: rule.name } },
@@ -354,6 +446,7 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
           return { keyed: result, key: name };
         },
       );
+      const redactedText = () => secrets.redactRequest(keyed.text, request.url);
       if (owner) {
         for (const [name, list] of keyed.values) {
           for (const value of list) {
@@ -381,14 +474,14 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
       };
 
       if (config.mode !== "record") {
-        const recording = await store.read(key);
+        const recording = (await store.read(key)) as Recording | undefined;
         if (recording) {
           counts.replayed += 1;
           const response = fromRecording(recording, keyed.values);
           report("replayed", response);
           return { ...response, source: "replayed" };
         }
-        reportMiss(rule, key, owner);
+        await reportMiss(rule, key, owner, sample, redactedText);
         if (config.mode === "replay") {
           counts.missed += 1;
           if (owner) owner.missed += 1;
@@ -427,7 +520,10 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
         ),
       ) as Recording;
       if (!isTemporaryStatus(recording.response.status)) {
-        await record(owner, key, recording);
+        await record(owner, key, {
+          recording,
+          samples: [[sample, toSample(key, redactedText())]],
+        });
       }
       const response = fromRecording(recording, keyed.values);
       report("live", response);
@@ -464,6 +560,8 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
         recorded: new Map(),
         missed: 0,
         known: new Map(),
+        sent: new Map(),
+        explained: false,
       });
       return id;
     },

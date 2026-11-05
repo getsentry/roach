@@ -228,4 +228,23 @@ https.request = refuse;
     expect(result.output).toContain("had no recording in replay mode");
     expect(liveRequests).toHaveLength(0);
   });
+
+  it("shows what changed in the request of a miss", async () => {
+    await runVitest({ ROACH_TOKEN: TOKEN });
+    await writeFile(path.join(project, "a.fixture.ts"), testFile("a-changed"));
+
+    // Only a run with the write token gets the change.
+    const result = await runVitest({
+      ROACH_TOKEN: TOKEN,
+      ROACH_MODE: "replay",
+    });
+
+    expect(result.code).toBe(1);
+    expect(result.output).toMatch(
+      /- a\.fixture\.ts > passes: model\/[0-9a-f]{64}\.json\n {2}Changed at character \d+ of the request of model\/[0-9a-f]{64}\.json\. See miss\.recorded and miss\.request on the roach\.request span in Sentry\.\n/,
+    );
+    // CI logs are public, so the output has no text of either request.
+    expect(result.output).not.toContain(String.raw`{\"model\":\"a\"}`);
+    expect(result.output).not.toContain("a-changed");
+  });
 });
