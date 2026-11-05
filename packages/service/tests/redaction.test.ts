@@ -675,6 +675,24 @@ describe("redaction", () => {
     expect(text.includes("p".repeat(4096))).toBe(false);
   }, 120_000);
 
+  it("redacts a credential field of a request with escapes in its value", async () => {
+    // `\/` and `\u` are other ways to write the same value. The key writes
+    // a body that parses again, but keeps the text of one that does not,
+    // such as one after a byte order mark.
+    const escaped = String.raw`{"password":"pass\/word\u002dsecret"}`;
+    const run = await start("auto");
+    await send(run, "/v1/escaped-field", escaped);
+    await send(run, "/v1/escaped-field-bom", `\uFEFF${escaped}`);
+    const samples = [...(await stored("_requests/api")).values()].map(
+      (sample) => (JSON.parse(sample) as RequestSample).text,
+    );
+    expect(samples).toHaveLength(2);
+    for (const text of samples) {
+      expect(text).not.toContain("secret");
+      expect(text).toContain(`"password":"<<redacted>>"`);
+    }
+  });
+
   it("reads a string that does not close only once", async () => {
     // The pattern takes the quotes from around a long value of escaped
     // quotes, so in the text of the key that string does not close.
