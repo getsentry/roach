@@ -225,7 +225,8 @@ A run takes `RunConfig` (`packages/roach/src/types.ts`): `tenant`, `mode`, `rule
 - Compressed bodies: the proxy asks the upstream for a body without a
   content encoding. When the upstream sends `gzip`, `deflate`, or `br`
   all the same, the proxy decodes the body before it redacts and records
-  it. When the body does not decode, the proxy does not record it. It
+  it. It decodes 64 MiB at most. When the body does not decode, or when
+  it decodes to more than 64 MiB, the proxy does not record it. It
   writes a log line, and the client gets the body as it came.
 - Bodies that are not text: a recording keeps such a body, such as
   `application/octet-stream`, as base64. The proxy redacts the known
@@ -233,9 +234,11 @@ A run takes `RunConfig` (`packages/roach/src/types.ts`): `tenant`, `mode`, `rule
   value change, so a binary body stays binary. The client gets the same
   bytes as a replay gives.
 - Credentials that the upstream makes: in a response body, the proxy also
-  redacts the value of each JSON field or form field that holds a
-  credential that a server mints, such as the token of an OAuth server.
-  The fields are `access_token`, `refresh_token`, `id_token`,
+  redacts the value of each field that holds a credential that a server
+  mints, such as the token of an OAuth server. In JSON, only the fields
+  of the object at the top count, because a server puts a minted
+  credential there. In an `application/x-www-form-urlencoded` body, the
+  form fields count. The fields are `access_token`, `refresh_token`, `id_token`,
   `session_token`, `auth_token`, and `client_secret`. A bare `token`
   field counts only when its value starts like a credential: a GitHub
   token (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`, or `github_pat_`), a JWT
@@ -244,18 +247,21 @@ A run takes `RunConfig` (`packages/roach/src/types.ts`): `tenant`, `mode`, `rule
   probabilities, so the length alone never counts. The names compare
   without case, `_`, and `-`, so `accessToken` is the same as
   `access_token`.
-  - The list is short on purpose. A model can repeat a field of its
-    response in a later request, such as the input of a tool call. A
-    redacted value there gives a new key, so the request misses on
-    replay. So the proxy does not redact a field such as `password` in a
-    response.
+  - The list is short, and only the top of a JSON body counts, on
+    purpose. A model can repeat a part of its response in a later
+    request, such as the input of a tool call. A redacted value there
+    gives a new key, so the request misses on replay. So the proxy does
+    not redact a field such as `password` in a response, or a field at a
+    lower depth, or text in a string, such as `?access_token=` in a
+    command.
   - A recording shows `<<redacted>>` in place of the value. A JSON body
     stays valid JSON. The proxy also does this for a body that is valid
     UTF-8 JSON when its content type is not JSON, or when it has none.
     A recording keeps an `application/x-www-form-urlencoded` body as
     text. The `location` header of a recording shows `<<redacted>>` for
-    each credential parameter of its query and its fragment, such as
-    `#access_token=`.
+    each known value, and for each of these fields in its query and its
+    fragment, such as `#access_token=`. Other parameters do not change,
+    such as `keyword` or `pageToken`, so a replay can follow the redirect.
   - A live response gives the client the real value, so the run can use
     the credential in its next requests. From then on, the run also
     redacts that value where it knows credentials, when it is 12
@@ -269,11 +275,14 @@ A run takes `RunConfig` (`packages/roach/src/types.ts`): `tenant`, `mode`, `rule
 - Credentials in a request body: a request sample and the text of a miss
   in Sentry show `<<redacted>>` for the fields above, and also for
   `bearer_token`, `client_assertion`, `password`, `api_key`,
-  `secret_key`, `private_key`, and `secret_access_key`. No key uses this
-  text, so this list can be longer.
-- The proxy does not find a field whose name has a unicode escape, a
-  field whose value is an array, or a field in JSON text that is itself
-  a string, such as the escaped arguments of a tool call.
+  `secret_key`, `private_key`, and `secret_access_key`. In JSON, these
+  fields count at each depth. In an `application/x-www-form-urlencoded`
+  body, the form fields count. No key uses this text, so this list can be
+  longer.
+- The proxy parses a JSON body to find the fields, so a long string value
+  cannot stop it. It does not find a field whose value is not a string,
+  such as an array, or a field in JSON text that is itself a string, such
+  as the escaped arguments of a tool call.
 - Keys: redaction never changes the key of a request. The key is the hash
   of the request as the client sent it, so recordings from before stay
   valid.

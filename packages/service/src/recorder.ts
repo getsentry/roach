@@ -32,7 +32,8 @@
  */
 import { randomBytes } from "node:crypto";
 import type { IncomingHttpHeaders } from "node:http";
-import { brotliDecompressSync, gunzipSync, inflateSync } from "node:zlib";
+import { promisify } from "node:util";
+import { brotliDecompress, gunzip, inflate } from "node:zlib";
 import { firstChange, sampleKey, toSample } from "./misses.ts";
 import { keyRequest, type KeyedRequest } from "./request-key.ts";
 import { createSecrets, redactUrl } from "./secrets.ts";
@@ -158,45 +159,55 @@ const TEXT_CONTENT_TYPE = /^text\/|json|xml|x-www-form-urlencoded/i;
 /** Response headers that a recording keeps. Other headers change each run. */
 const RECORDED_HEADERS = ["content-type", "location"];
 const NULL_BODY_STATUSES = new Set([101, 204, 205, 304]);
-/** The largest body that the recorder decodes from a content encoding. */
-const MAX_DECODED_BYTES = 256 * 1024 * 1024;
-/** Decoders of the content encodings that the recorder can read. */
+/**
+ * The largest body that the recorder decodes from a content encoding. It
+ * is the largest request body that the proxy reads (`server.ts`), so a
+ * small compressed body cannot fill the memory of the service.
+ */
+const MAX_DECODED_BYTES = 64 * 1024 * 1024;
+/**
+ * Decoders of the content encodings that the recorder can read. They run
+ * on the thread pool of zlib, so they do not block other requests.
+ */
 const DECODERS: Record<
   string,
-  (body: Buffer, options: { maxOutputLength: number }) => Buffer
+  (body: Buffer, options: { maxOutputLength: number }) => Promise<Buffer>
 > = {
-  gzip: gunzipSync,
-  "x-gzip": gunzipSync,
-  deflate: inflateSync,
-  br: brotliDecompressSync,
+  gzip: promisify(gunzip),
+  "x-gzip": promisify(gunzip),
+  deflate: promisify(inflate),
+  br: promisify(brotliDecompress),
 };
 
 /**
  * The body of a response without its content encoding. The proxy asks for
  * `identity`, but an upstream can encode the body all the same, and the
  * recorder must decode it to find credentials in it. An empty body, such
- * as of a 304, stays empty. Throws when it does not know an encoding, or
- * when the body is not valid.
+ * as of a 304, stays empty. Rejects when it does not know an encoding,
+ * when the body is not valid, or when the decoded body is larger than
+ * `MAX_DECODED_BYTES`.
  */
-function decodeBody({ headers, body }: ProxyResponse): Buffer {
+async function decodeBody({ headers, body }: ProxyResponse): Promise<Buffer> {
   if (body.length === 0) return body;
   const encodings = (headers["content-encoding"] ?? "")
     .split(",")
     .map((encoding) => encoding.trim().toLowerCase())
     .filter((encoding) => encoding !== "" && encoding !== "identity");
-  return encodings.reduceRight((bytes, encoding) => {
+  let result = body;
+  for (const encoding of encodings.toReversed()) {
     const decoder = DECODERS[encoding];
     if (!decoder) throw new Error(`unknown content encoding ${encoding}`);
-    return decoder(bytes, { maxOutputLength: MAX_DECODED_BYTES });
-  }, body);
+    result = await decoder(result, { maxOutputLength: MAX_DECODED_BYTES });
+  }
+  return result;
 }
 
-/** The text of `body` when it is valid UTF-8 JSON, or `undefined`. */
-function jsonText(body: Buffer): string | undefined {
+/** The text of `body` when it is valid UTF-8, or `undefined`. */
+function utf8Text(body: Buffer): string | undefined {
   try {
-    const text = new TextDecoder("utf-8", { fatal: true }).decode(body);
-    JSON.parse(text);
-    return text;
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
+      body,
+    );
   } catch {
     return undefined;
   }
@@ -306,22 +317,24 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
    * credentials that the upstream minted (`secrets.redactFields`), because
    * the client needs them for its next live requests. A body that is not
    * text gets this too when it is UTF-8 JSON, whatever its content type
-   * says. The `location` header loses the values of its credential
-   * parameters. The minted values are known from then on, so the recording
-   * is redacted again.
+   * says. The `location` header loses the values of its minted credential
+   * parameters (`secrets.redactLocation`). The minted values are known
+   * from then on, so the recording is redacted again.
    */
   const toStored = (recording: Recording): Recording => {
     const { response } = recording;
     const headers = { ...response.headers };
-    if (headers.location) headers.location = redactUrl(headers.location);
+    if (headers.location) {
+      headers.location = secrets.redactLocation(headers.location);
+    }
     let { body } = response;
     if (response.bodyEncoding === "utf8") {
-      body = secrets.redactFields(body);
+      body = secrets.redactFields(body, headers["content-type"]);
     } else {
-      const text = jsonText(Buffer.from(body, "base64"));
-      if (text !== undefined) {
-        const redacted = Buffer.from(secrets.redactFields(text));
-        body = secrets.redactBytes(redacted).toString("base64");
+      const text = utf8Text(Buffer.from(body, "base64"));
+      const redacted = text && secrets.redactFields(text);
+      if (redacted && redacted !== text) {
+        body = secrets.redactBytes(Buffer.from(redacted)).toString("base64");
       }
     }
     return JSON.parse(
@@ -535,7 +548,7 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
           return { keyed: result, key: name };
         },
       );
-      const redactedText = () => secrets.redactRequest(keyed.text, request.url);
+      const redactedText = () => secrets.redactRequest(keyed.text, request);
       if (owner) {
         for (const [name, list] of keyed.values) {
           for (const value of list) {
@@ -603,10 +616,11 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
       counts.live += 1;
       let live: ProxyResponse;
       try {
-        live = { ...upstream, body: decodeBody(upstream) };
+        live = { ...upstream, body: await decodeBody(upstream) };
       } catch (error) {
         // The recorder cannot find credentials in a body that it cannot
-        // read, so it does not record it. The client gets it as it came.
+        // read, or that decodes to more than `MAX_DECODED_BYTES`, so it
+        // does not record it. The client gets it as it came.
         process.stderr.write(
           `[roach] The ${rule.name} response was not recorded, because its body could not be decoded (${(error as Error).message}): ${key}\n`,
         );

@@ -6,7 +6,7 @@
  */
 import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
-import { gzipSync } from "node:zlib";
+import { brotliCompressSync, constants, gzipSync } from "node:zlib";
 import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -27,6 +27,19 @@ const GITHUB_TOKEN = "ghs_0123456789abcdefghijABCDEFGHIJ012345";
 const JWT = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhcHAifQ.c2lnbmF0dXJl";
 const SLACK_TOKEN = "xoxb-123-456-abcdef";
 const FRAGMENT_TOKEN = "fragtok";
+/** Inputs of a tool call that a model can send back in its next request. */
+const TOOL_INPUTS: Record<string, Record<string, unknown>> = {
+  password: { user: "me", password: TOOL_PASSWORD },
+  query: { command: "curl 'https://api.test/v1/me?access_token=abc123def'" },
+  fragment: { url: "https://app.test/cb#access_token=abc123def&expires_in=60" },
+  nested: { grant: { refresh_token: "tool-refresh-token-123" } },
+};
+/** A string value larger than 8 MiB, with no character to escape. */
+const LARGE = "QUJD".repeat(2.25 * 1024 * 1024);
+/** Brotli of 1 MiB more than the proxy decodes. It is a few hundred bytes. */
+const BOMB = brotliCompressSync(Buffer.alloc(65 * 1024 * 1024), {
+  params: { [constants.BROTLI_PARAM_QUALITY]: 4 },
+});
 /** Bytes that are not valid UTF-8, around the echo of the API key. */
 const BINARY_HEAD = Buffer.from([0x00, 0xff, 0xfe, 0x80]);
 const BINARY_TAIL = Buffer.from([0xc3, 0x28, 0x00, 0x01]);
@@ -72,6 +85,7 @@ async function send(
   return {
     body: Buffer.from(await response.body.arrayBuffer()),
     source: response.headers["x-roach"],
+    location: response.headers.location as string | undefined,
   };
 }
 
@@ -93,17 +107,17 @@ async function stored(dir: string): Promise<Map<string, string>> {
  * Two turns of a model that calls a tool. The second request repeats the
  * tool call of the first response. Returns where each response came from.
  */
-async function toolLoop(run: RemoteRoach) {
+async function toolLoop(run: RemoteRoach, input: string) {
   const user = { role: "user", content: "log in" };
   const first = await send(
     run,
-    "/v1/tools",
+    `/v1/tools?input=${input}`,
     JSON.stringify({ messages: [user] }),
   );
   const reply = JSON.parse(first.body.toString()) as { content: unknown };
   const second = await send(
     run,
-    "/v1/tools",
+    `/v1/tools?input=${input}`,
     JSON.stringify({
       messages: [
         user,
@@ -115,6 +129,16 @@ async function toolLoop(run: RemoteRoach) {
       ],
     }),
   );
+  return [first.source, second.source];
+}
+
+/**
+ * A request that gets a redirect, and a request to its location. Returns
+ * where each response came from.
+ */
+async function follow(run: RemoteRoach) {
+  const first = await send(run, "/v1/search", "{}");
+  const second = await send(run, first.location!, "{}");
   return [first.source, second.source];
 }
 
@@ -130,7 +154,10 @@ beforeEach(async () => {
     const chunks: Buffer[] = [];
     incoming.on("data", (chunk: Buffer) => chunks.push(chunk));
     incoming.on("end", () => {
-      const { pathname } = new URL(incoming.url!, "http://upstream");
+      const { pathname, searchParams } = new URL(
+        incoming.url!,
+        "http://upstream",
+      );
       if (pathname === "/v1/binary") {
         // A binary body that shows the key of the caller.
         outgoing.writeHead(200, { "content-type": "application/octet-stream" });
@@ -162,7 +189,8 @@ beforeEach(async () => {
         });
         outgoing.end(`access_token=${MINTED}&scope=repo&token_type=bearer`);
       } else if (pathname === "/v1/tools") {
-        // A model that calls a tool with a password, then answers.
+        // A model that calls a tool with an input that looks like a
+        // credential, then answers.
         const { messages } = JSON.parse(Buffer.concat(chunks).toString()) as {
           messages: unknown[];
         };
@@ -177,7 +205,7 @@ beforeEach(async () => {
                       type: "tool_use",
                       id: "toolu_1",
                       name: "login",
-                      input: { user: "me", password: TOOL_PASSWORD },
+                      input: TOOL_INPUTS[searchParams.get("input")!],
                     },
                   ],
                 }
@@ -185,30 +213,48 @@ beforeEach(async () => {
           ),
         );
       } else if (pathname === "/v1/app-token") {
-        // A GitHub App installation token, and log probabilities.
+        // A token of a GitHub App installation, a JWT, or Slack, and log
+        // probabilities.
+        const tokens: Record<string, string> = {
+          github: GITHUB_TOKEN,
+          jwt: JWT,
+          slack: SLACK_TOKEN,
+        };
         outgoing.writeHead(200, { "content-type": "application/json" });
         outgoing.end(
           JSON.stringify({
-            token: GITHUB_TOKEN,
+            token: tokens[searchParams.get("kind")!],
             expires_at: "2026-01-01T00:00:00Z",
-            jwt: { token: JWT },
-            slack: { token: SLACK_TOKEN },
             logprobs: [{ token: "Hello", logprob: -0.1 }, { token: "a" }],
           }),
         );
       } else if (pathname === "/v1/untyped") {
         // JSON without a content type, so the recording keeps it as base64.
-        outgoing.end(
-          JSON.stringify({
-            access_token: MINTED,
-            redirect: `https://app.test/cb#access_token=${FRAGMENT_TOKEN}&expires_in=60`,
-          }),
-        );
+        outgoing.end(JSON.stringify({ access_token: MINTED, expires_in: 60 }));
       } else if (pathname === "/v1/redirect") {
         outgoing.writeHead(302, {
           location: `/cb?state=s&code_key=abc#access_token=${FRAGMENT_TOKEN}&expires_in=60`,
         });
         outgoing.end();
+      } else if (pathname === "/v1/search") {
+        // A redirect whose parameters have names like credentials.
+        outgoing.writeHead(302, {
+          location: "/v1/cb?keyword=foo&author=jane&pageToken=p2",
+        });
+        outgoing.end();
+      } else if (pathname === "/v1/cb") {
+        outgoing.writeHead(200, { "content-type": "application/json" });
+        outgoing.end(JSON.stringify({ query: incoming.url }));
+      } else if (pathname === "/v1/large") {
+        // A large image, as a model of images gives it.
+        outgoing.writeHead(200, { "content-type": "application/json" });
+        outgoing.end(JSON.stringify({ data: [{ b64_json: LARGE }] }));
+      } else if (pathname === "/v1/bomb") {
+        outgoing.writeHead(200, {
+          "content-type": "application/json",
+          "content-encoding": "br",
+        });
+        outgoing.end(BOMB);
       } else if (pathname === "/v1/gzip") {
         // The proxy asks for `identity`, but this upstream compresses.
         outgoing.writeHead(200, {
@@ -353,6 +399,7 @@ describe("redaction", () => {
       run,
       "/v1/oauth/token?form=1",
       "grant_type=password&username=me&password=pw-2&client_secret=cs-3",
+      { "content-type": "application/x-www-form-urlencoded" },
     );
 
     const samples = [...(await stored("_requests/api")).values()].map(
@@ -371,44 +418,58 @@ describe("redaction", () => {
     }
   });
 
-  it("keeps a credential field of a model response, so the next turn replays", async () => {
-    // The next request of the model repeats the input of the tool call. A
-    // redacted input there would change its key, so it would miss on
-    // replay.
-    await expect(toolLoop(await start("auto"))).resolves.toEqual([
-      "live",
-      "live",
-    ]);
-    const replay = await start("replay");
-    await expect(toolLoop(replay)).resolves.toEqual(["replayed", "replayed"]);
-    expect((await replay.stats()).misses).toEqual([]);
-    // The request samples do not show the password. No key uses them.
-    for (const sample of (await stored("_requests/api")).values()) {
-      expect(sample).not.toContain(TOOL_PASSWORD);
-    }
-  });
+  it.each(Object.keys(TOOL_INPUTS))(
+    "keeps a %s tool input of a model response, so the next turn replays",
+    async (input) => {
+      // The next request of the model repeats the input of the tool call.
+      // A redacted input there would change its key, so it would miss on
+      // replay.
+      await expect(toolLoop(await start("auto"), input)).resolves.toEqual([
+        "live",
+        "live",
+      ]);
+      expect((await stored("api")).size).toBe(2);
+      const replay = await start("replay");
+      await expect(toolLoop(replay, input)).resolves.toEqual([
+        "replayed",
+        "replayed",
+      ]);
+      expect((await replay.stats()).misses).toEqual([]);
+      // The request samples do not show credential fields at any depth. No
+      // key uses them.
+      for (const sample of (await stored("_requests/api")).values()) {
+        expect(sample).not.toContain(TOOL_PASSWORD);
+        expect(sample).not.toContain("tool-refresh-token-123");
+      }
+    },
+  );
 
   it("redacts a bare token field only when its value has a credential prefix", async () => {
     const run = await start("auto");
-    const live = await send(run, "/v1/app-token", "{}");
+    const live = await send(run, "/v1/app-token?kind=github", "{}");
     expect(JSON.parse(live.body.toString())).toMatchObject({
       token: GITHUB_TOKEN,
     });
+    await send(run, "/v1/app-token?kind=jwt", "{}");
+    await send(run, "/v1/app-token?kind=slack", "{}");
 
-    const { text } = await onlyRecording();
-    for (const secret of [GITHUB_TOKEN, JWT, SLACK_TOKEN]) {
-      expect(text).not.toContain(secret);
+    const recordings = [...(await stored("api")).values()];
+    expect(recordings).toHaveLength(3);
+    for (const text of recordings) {
+      for (const secret of [GITHUB_TOKEN, JWT, SLACK_TOKEN]) {
+        expect(text).not.toContain(secret);
+      }
     }
     const replay = await start("replay");
-    const replayed = await send(replay, "/v1/app-token", "{}");
-    expect(JSON.parse(replayed.body.toString())).toEqual({
-      token: "<<redacted>>",
-      expires_at: "2026-01-01T00:00:00Z",
-      jwt: { token: "<<redacted>>" },
-      slack: { token: "<<redacted>>" },
-      // Text tokens of a model do not change.
-      logprobs: [{ token: "Hello", logprob: -0.1 }, { token: "a" }],
-    });
+    for (const kind of ["github", "jwt", "slack"]) {
+      const replayed = await send(replay, `/v1/app-token?kind=${kind}`, "{}");
+      expect(JSON.parse(replayed.body.toString())).toEqual({
+        token: "<<redacted>>",
+        expires_at: "2026-01-01T00:00:00Z",
+        // Text tokens of a model do not change.
+        logprobs: [{ token: "Hello", logprob: -0.1 }, { token: "a" }],
+      });
+    }
   });
 
   it("redacts a minted credential in a JSON body without a JSON content type", async () => {
@@ -421,20 +482,54 @@ describe("redaction", () => {
     expect(file.response.bodyEncoding).toBe("base64");
     expect(
       JSON.parse(Buffer.from(file.response.body, "base64").toString()),
-    ).toEqual({
-      access_token: "<<redacted>>",
-      redirect: "https://app.test/cb#access_token=<<redacted>>&expires_in=60",
-    });
+    ).toEqual({ access_token: "<<redacted>>", expires_in: 60 });
   });
 
-  it("redacts the credential parameters of a stored location header", async () => {
+  it("redacts the minted credential parameters of a stored location header", async () => {
     const run = await start("auto");
-    await send(run, "/v1/redirect", "{}");
+    const live = await send(run, "/v1/redirect", "{}");
+    // The live client gets the real location.
+    expect(live.location).toBe(
+      `/cb?state=s&code_key=abc#access_token=${FRAGMENT_TOKEN}&expires_in=60`,
+    );
     const { file } = await onlyRecording();
     // A relative URL stays relative.
     expect(file.response.headers.location).toBe(
-      "/cb?state=s&code_key=<<redacted>>#access_token=<<redacted>>&expires_in=60",
+      "/cb?state=s&code_key=abc#access_token=<<redacted>>&expires_in=60",
     );
+  });
+
+  it("keeps the other parameters of a location header, so a replay follows the redirect", async () => {
+    // `keyword`, `author`, and `pageToken` have names like credentials, but
+    // the next request sends them back, and its key must not change.
+    await expect(follow(await start("auto"))).resolves.toEqual([
+      "live",
+      "live",
+    ]);
+    const replay = await start("replay");
+    await expect(follow(replay)).resolves.toEqual(["replayed", "replayed"]);
+    expect((await replay.stats()).misses).toEqual([]);
+  });
+
+  it("redacts a request and a response with a string value larger than 8 MiB", async () => {
+    const body = JSON.stringify({
+      document: LARGE,
+      client_secret: "large-request-secret",
+    });
+    const run = await start("auto");
+    const live = await send(run, "/v1/large", body);
+    expect(live.source).toBe("live");
+    const expected = JSON.stringify({ data: [{ b64_json: LARGE }] });
+    expect(live.body.equals(Buffer.from(expected))).toBe(true);
+    const [sample] = [...(await stored("_requests/api")).values()];
+    const { text } = JSON.parse(sample!) as RequestSample;
+    // `includes`, so a failure does not print 8 MiB.
+    expect(text.includes('"client_secret":"<<redacted>>"')).toBe(true);
+    expect(text.includes("large-request-secret")).toBe(false);
+
+    const replayed = await send(await start("replay"), "/v1/large", body);
+    expect(replayed.source).toBe("replayed");
+    expect(replayed.body.equals(live.body)).toBe(true);
   });
 
   it("decodes a compressed response before it redacts and records it", async () => {
@@ -461,6 +556,15 @@ describe("redaction", () => {
       source: "live",
     });
     expect((await stored("api")).size).toBe(1);
+  });
+
+  it("does not record a compressed body that decodes to more than 64 MiB", async () => {
+    const run = await start("auto");
+    const live = await send(run, "/v1/bomb", "{}");
+    // The client gets the body as it came, without the proxy decoding it.
+    expect(live.source).toBe("live");
+    expect(live.body.equals(BOMB)).toBe(true);
+    expect((await stored("api")).size).toBe(0);
   });
 
   it("keeps the keys of requests with credentials", async () => {
