@@ -17,7 +17,7 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { startRoachService, type RoachService } from "../src/service.ts";
+import { startRoachService, type RoachService } from "../service/service.ts";
 
 const TOKEN = "write-token";
 const TENANT = "acme/vitest";

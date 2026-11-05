@@ -1,0 +1,13 @@
+{
+  "name": "@sentry/roach-service",
+  "private": true,
+  "description": "The shared Roach service and the image that runs it. Not published.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "dependencies": {
+    "@sentry/node": "11.6.0"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

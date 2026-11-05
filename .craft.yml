@@ -1,8 +1,9 @@
 minVersion: "2.21.0"
 changelog:
   policy: auto
-# Without a preReleaseCommand, Craft writes the version to package.json
-# for the npm target.
+# Write the version only to the root package.json, `@sentry/roach`. See the
+# script for why Craft does not do it on its own.
+preReleaseCommand: sh .github/scripts/bump-version.sh
 targets:
   # The client and the vitest integration. CI uploads the tarball of each
   # commit as the artifact `<sha>`.

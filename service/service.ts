@@ -37,10 +37,10 @@ import * as Sentry from "@sentry/node";
 import {
   createCertificateAuthority,
   type CertificateAuthorityPem,
-} from "./certificates.ts";
-import { createGcsStore } from "./gcs.ts";
-import { createRecorder, type Telemetry } from "./recorder.ts";
-import { createFileStore } from "./recordings.ts";
+} from "../src/certificates.ts";
+import { createGcsStore } from "../src/gcs.ts";
+import { createRecorder, type Telemetry } from "../src/recorder.ts";
+import { createFileStore } from "../src/recordings.ts";
 import {
   controlRecorder,
   listenProxy,
@@ -50,16 +50,16 @@ import {
   sendJson,
   type ProxyTarget,
   type TargetResult,
-} from "./server.ts";
-import { RULE_NAME, type RecordingStore } from "./store.ts";
+} from "../src/server.ts";
+import { RULE_NAME, type RecordingStore } from "../src/store.ts";
 import {
   CONTROL_PATH,
   type RecordingMode,
   type RecordingStats,
   type RemoteRun,
   type RunConfig,
-} from "./types.ts";
-import { invalidValuePatterns } from "./values.ts";
+} from "../src/types.ts";
+import { invalidValuePatterns } from "../src/values.ts";
 
 /** The configuration of the service. The operator owns it. */
 export interface RoachServiceConfig {
