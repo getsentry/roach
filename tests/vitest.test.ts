@@ -88,6 +88,22 @@ function runVitest(
   });
 }
 
+/** Write the vitest config of the project, with more setup files after Roach's. */
+function writeVitestConfig(setupFiles: string[] = []): Promise<void> {
+  const setup = [path.join(ROOT, "src/vitest-setup.ts"), ...setupFiles];
+  return writeFile(
+    path.join(project, "vitest.config.ts"),
+    `export default {
+  test: {
+    include: ["*.fixture.ts"],
+    globalSetup: [${JSON.stringify(path.join(ROOT, "src/vitest.ts"))}],
+    setupFiles: ${JSON.stringify(setup)},
+  },
+};
+`,
+  );
+}
+
 /** The sessions of the recordings of the tenant. */
 async function recordedSessions(): Promise<string[]> {
   const rule = path.join(directory, TENANT, "model");
@@ -140,17 +156,7 @@ beforeEach(async () => {
       rules: [{ name: "model", match: { method: "POST", url: `${origin}/` } }],
     }),
   );
-  await writeFile(
-    path.join(project, "vitest.config.ts"),
-    `export default {
-  test: {
-    include: ["*.fixture.ts"],
-    globalSetup: [${JSON.stringify(path.join(ROOT, "src/vitest.ts"))}],
-    setupFiles: [${JSON.stringify(path.join(ROOT, "src/vitest-setup.ts"))}],
-  },
-};
-`,
-  );
+  await writeVitestConfig();
   await writeFile(path.join(project, "a.fixture.ts"), testFile("a"));
   await writeFile(path.join(project, "b.fixture.ts"), testFile("b"));
 });
@@ -192,6 +198,27 @@ describe("vitest", () => {
     expect(result).toMatchObject({ code: 0 });
     expect(liveRequests).toHaveLength(4);
     await expect(recordedSessions()).resolves.toEqual([]);
+  });
+
+  it("keeps its control calls out of an HTTP mock of the tests", async () => {
+    // Like MSW or nock with no handler: the mock refuses every request
+    // through node:http and node:https.
+    await writeFile(
+      path.join(project, "mock.setup.ts"),
+      `import http from "node:http";
+import https from "node:https";
+
+const refuse = () => {
+  throw new Error("mock: unhandled request");
+};
+http.request = refuse;
+https.request = refuse;
+`,
+    );
+    await writeVitestConfig(["./mock.setup.ts"]);
+    const result = await runVitest({ ROACH_TOKEN: TOKEN });
+    expect(result).toMatchObject({ code: 0 });
+    await expect(recordedSessions()).resolves.toHaveLength(4);
   });
 
   it("fails a test whose request has no recording in replay mode", async () => {

@@ -47,6 +47,16 @@ export interface RoachControl {
 }
 
 /**
+ * The request functions of `node:http` and `node:https` as this module
+ * loads. In-process HTTP mocks, such as MSW and nock, replace them when they
+ * start. Control calls go to the service, never to a mock, so they use the
+ * originals. Load the setup file of Roach before a setup file that starts a
+ * mock.
+ */
+const httpRequest = http.request;
+const httpsRequest = https.request;
+
+/**
  * Call the control API at `base`, and return the JSON of the response.
  * `token` is the bearer token.
  */
@@ -59,9 +69,9 @@ function callControl<T>(
 ): Promise<T> {
   const payload = body === undefined ? undefined : JSON.stringify(body);
   const url = route ? `${base}/${route}` : base;
-  const client = url.startsWith("https:") ? https : http;
+  const send = url.startsWith("https:") ? httpsRequest : httpRequest;
   return new Promise((resolve, reject) => {
-    const request = client.request(
+    const request = send(
       url,
       {
         // Its own agent, so that a proxy agent of the process is not used.
