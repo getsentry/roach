@@ -2,7 +2,14 @@
  * Text reports of a Roach run, for logs and CI summaries.
  */
 import { appendFile } from "node:fs/promises";
-import type { RecordingMiss, RecordingStats } from "./types.ts";
+import type { RecordingMiss, RecordingStats, RefusalReason } from "./types.ts";
+
+/** What to fix for each refusal reason. */
+const REFUSAL_HINTS: Record<RefusalReason, string> = {
+  notAllowed: "not in allow",
+  notPublic: "not a public address",
+  replayOnly: "no rule records it, and the run can only replay",
+};
 
 /** Describe the totals of a run in one line. */
 export function describeRecordingStats(stats: RecordingStats): string {
@@ -16,7 +23,14 @@ export function describeRecordingStats(stats: RecordingStats): string {
     Object.entries(stats.passthrough)
       .map(([origin, count]) => `${origin} ${count}`)
       .join(", ") || "none";
-  return `${rules}. ${stats.written} recordings new or changed, ${stats.discarded} dropped from failed sessions. Not recorded: ${passthrough}.`;
+  const refused = Object.entries(stats.refused ?? {}).flatMap(
+    ([reason, origins]) =>
+      Object.entries(origins).map(
+        ([origin, count]) =>
+          `${origin} ${count} (${REFUSAL_HINTS[reason as RefusalReason]})`,
+      ),
+  );
+  return `${rules}. ${stats.written} recordings new or changed, ${stats.discarded} dropped from failed sessions. Not recorded: ${passthrough}.${refused.length ? ` Refused: ${refused.join(", ")}.` : ""}`;
 }
 
 /**

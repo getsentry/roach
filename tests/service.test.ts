@@ -141,6 +141,9 @@ describe("roach service", () => {
     const unmatched = await request(`${origin}/other`, { dispatcher: agent });
     expect(unmatched.statusCode).toBe(403);
     await unmatched.body.dump();
+    expect((await reader.stats()).refused).toEqual({
+      replayOnly: { [origin]: 1 },
+    });
     // Without the token, no mode that can write.
     for (const mode of ["auto", "record", "off"] as const) {
       await expect(startRun(undefined, mode)).rejects.toThrow(/401/);
@@ -357,6 +360,10 @@ describe("roach service", () => {
           expect(response.statusCode).toBe(403);
           expect(await response.body.text()).toMatch(/not a public address/);
         }
+        // The stats tell this refusal apart from an origin not in `allow`.
+        expect((await run.stats()).refused).toEqual({
+          notPublic: { [target]: 2 },
+        });
       }
     } finally {
       await guarded.close();
