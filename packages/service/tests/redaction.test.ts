@@ -1190,4 +1190,40 @@ describe("redaction", () => {
       expect.stringContaining(kept),
     );
   });
+
+  it("does not let a key header take the place of a form field in the text of a miss", async () => {
+    // A run with the token redacts the text of a miss in its own process.
+    // The key header ends with a field that holds `<<redacted>>`, and the
+    // pattern takes the `&` before the password away.
+    const rules = [{ ...rule(), values: { v: "x&" }, keyHeaders: ["x-trace"] }];
+    const form = { "content-type": "application/x-www-form-urlencoded" };
+    const recorded = await start("auto", rules);
+    await send(recorded, "/v1/fields", `note=y&password=${HIDDEN}`, {
+      ...form,
+      "x-trace": "b",
+    });
+    const [sample] = [...(await stored("_requests/api")).values()];
+    expect(JSON.parse(sample!)).not.toHaveProperty("withheld");
+    const replay = await start("replay", rules);
+    const missed = await send(
+      replay,
+      "/v1/fields",
+      `note=x&password=${HIDDEN}`,
+      {
+        ...form,
+        "x-trace": "a&password=<<redacted>>",
+      },
+    );
+    expect(missed.source).toBe("missed");
+    // The text of the miss shows the password, so it has no change, and
+    // the span gets no `miss.request`.
+    const { misses } = await replay.stats();
+    expect(misses).toHaveLength(1);
+    expect(misses[0]!.change).toBeUndefined();
+    for (const dir of ["api", "_requests/api"]) {
+      const files = [...(await stored(dir)).values()];
+      expect(files.length).toBeGreaterThan(0);
+      expect(files.join("")).not.toContain("SECRET");
+    }
+  });
 });
