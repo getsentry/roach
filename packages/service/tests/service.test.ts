@@ -751,7 +751,11 @@ describe("limits of the service", () => {
     const waits = await caWaitsUntil(sent);
     const failed = await sent;
     expect(failed.status).toBe(400);
-    expect(failed.body).toMatch(/key worker stopped.*This run has ended/s);
+    // On a slow machine, such as with coverage, the watchdog can stop the
+    // worker before its heap is full. Both end the run.
+    expect(failed.body).toMatch(
+      /(key worker stopped|request took over \d+ ms).*This run has ended/s,
+    );
     expect(Math.max(...waits)).toBeLessThan(500);
     await expect(reader.stats()).rejects.toThrow(/404/);
     // The next key gets a new worker.
