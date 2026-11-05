@@ -158,9 +158,10 @@ const sha256 = (text: string) =>
  * The key and the changing values of a request. `known` holds the values
  * of earlier requests in the same session (`@sentry/roach/values`). It
  * throws an error with HTTP status 400 when it takes longer than
- * `timeLimitMs`, by default `keyTimeLimit()` of the body, or when the
- * request has more than `maxValues` changing values. The limits never
- * change a key: a request gets its key, or it fails.
+ * `timeLimitMs`, by default `keyTimeLimit()` of the body, when the
+ * request has more than `maxValues` changing values, or when its JSON body
+ * is nested too deep for the key. The limits never change a key: a request
+ * gets its key, or it fails.
  */
 export function keyRequest(
   rule: RecordingRule,
@@ -169,9 +170,24 @@ export function keyRequest(
   timeLimitMs = keyTimeLimit(Buffer.byteLength(request.body)),
   maxValues = Infinity,
 ): KeyedRequest {
-  return withTimeLimit(timeLimitMs, () =>
-    keyRequestNow(rule, request, known, maxValues),
-  );
+  try {
+    return withTimeLimit(timeLimitMs, () =>
+      keyRequestNow(rule, request, known, maxValues),
+    );
+  } catch (error) {
+    // The key walks a JSON body with recursion, so a body that is nested
+    // very deep, such as 5,000 levels of `[`, fills the call stack. Such a
+    // body never got a key. It is the fault of the client, so it gets HTTP
+    // 400 and does not go to Sentry.
+    const overflow =
+      error instanceof RangeError &&
+      error.message === "Maximum call stack size exceeded";
+    if (!overflow) throw error;
+    throw Object.assign(
+      new Error("the JSON body is nested too deep to make its key"),
+      { status: 400 },
+    );
+  }
 }
 
 function keyRequestNow(

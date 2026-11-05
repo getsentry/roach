@@ -832,6 +832,40 @@ describe("limits of the service", () => {
     expect((await send(writer.url, { prompt })).status).toBe(200);
   });
 
+  it("fails a request whose JSON body is nested too deep for its key", async () => {
+    // The key walks a JSON body with recursion. Before, such a body filled
+    // the stack: the client got HTTP 502, and Sentry got an error.
+    const log = vi.spyOn(process.stderr, "write");
+    onTestFinished(() => log.mockRestore());
+    const body = `${"[".repeat(100_000)}${"]".repeat(100_000)}`;
+    const sendText = async (proxyUrl: string) => {
+      const agent = new ProxyAgent({ uri: proxyUrl, proxyTunnel: true });
+      agents.push(agent);
+      const response = await request(`${origin}/v1/messages`, {
+        body,
+        dispatcher: agent,
+        method: "POST",
+      });
+      return { status: response.statusCode, body: await response.body.text() };
+    };
+    // A run without the token makes the key in the key worker, and a run
+    // with the token in this process.
+    const reader = await startRun(undefined, "replay");
+    const writer = await startRun("write-token", "auto");
+    for (const run of [reader, writer]) {
+      const deep = await sendText(run.url);
+      expect(deep.status).toBe(400);
+      expect(deep.body).toMatch(/nested too deep/);
+    }
+    expect(liveRequests).toBe(0);
+    expect(log.mock.calls.map(([text]) => String(text)).join("")).not.toMatch(
+      /Request failed/,
+    );
+    // The request fails, but the runs go on.
+    expect((await send(reader.url, { prompt: "hi" })).status).toBe(412);
+    expect((await send(writer.url, { prompt: "hi" })).status).toBe(200);
+  });
+
   it("answers 503 when the bodies of runs without a token fill the budget", async () => {
     // Each request holds its body until its key is done. Before the budget,
     // 30 parallel bodies of 16 MiB took about 1.9 GB.
