@@ -73,6 +73,15 @@ const TUNNEL_FIRST_BYTE_MS = 10_000;
  */
 const TUNNEL_IDLE_MS = 10 * 60 * 1000;
 /**
+ * The HTTP servers of the proxy. Headers that do not come in 10 s get
+ * HTTP 408 from Node. A whole request, with its body, has Node's default
+ * of 300 s. Node checks these times each second.
+ */
+const HTTP_OPTIONS: http.ServerOptions = {
+  headersTimeout: 10_000,
+  connectionsCheckingInterval: 1000,
+};
+/**
  * A PROXY protocol v1 header, such as
  * `PROXY TCP4 203.0.113.7 10.0.0.2 51234 443`. It is at most 107 bytes.
  * The first bytes of a connection must come in `PROXY_HEADER_MS`.
@@ -183,9 +192,22 @@ function readBody(
       chunks.push(chunk);
     });
     stream.on("end", () => resolve(Buffer.concat(chunks)));
-    stream.on("error", reject);
+    stream.on("error", (error: Error & { code?: string }) => {
+      // A client that closes its connection before its body came is not a
+      // failure of the proxy, so it does not go to Sentry. `method` is set
+      // only on a request, not on an upstream response.
+      const aborted = stream.method !== null && error.code === "ECONNRESET";
+      reject(aborted ? abortedError() : error);
+    });
   });
 }
+
+/** The error of a request whose client closed it before its body came. */
+const abortedError = () =>
+  Object.assign(
+    httpError(400, "the client closed the request before its body came"),
+    { aborted: true },
+  );
 
 /**
  * Read a JSON object body of a control API call. A body over
@@ -588,6 +610,14 @@ function answerError(
     status === undefined
       ? reportInternal("Request", error, target.telemetry.capture(error))
       : (error as Error).message;
+  if ((error as { aborted?: boolean }).aborted) {
+    const attributes = { "roach.result": "aborted" };
+    target.telemetry.annotate(attributes);
+    target.telemetry.count("roach.request", 1, {
+      ...attributes,
+      "roach.origin": origin,
+    });
+  }
   if (!outgoing.headersSent) {
     outgoing.writeHead(status ?? 502, { "content-type": "text/plain" });
   }
@@ -612,7 +642,7 @@ export async function listenProxy(
   const sockets = new Set<Socket>();
 
   // Requests inside a CONNECT tunnel. The tunnel gives the origin.
-  const tunnelServer = http.createServer((incoming, outgoing) => {
+  const tunnelServer = http.createServer(HTTP_OPTIONS, (incoming, outgoing) => {
     const tunnel = tunnels.get(incoming.socket);
     if (!tunnel) {
       outgoing.writeHead(400).end();
@@ -620,7 +650,7 @@ export async function listenProxy(
     }
     serveProxied(tunnel, incoming, outgoing, tunnel.origin);
   });
-  const server = http.createServer((incoming, outgoing) => {
+  const server = http.createServer(HTTP_OPTIONS, (incoming, outgoing) => {
     // A request to the proxy itself has a path. A proxied plain HTTP
     // request has an absolute URL.
     if (!incoming.url?.startsWith("/")) {
@@ -736,6 +766,14 @@ export async function listenProxy(
     },
   );
 
+  // Node checks `headersTimeout` and `requestTimeout` only after the
+  // `listening` event of a server. The tunnel server, and `server` with
+  // `proxyProtocol`, get their connections from another server and never
+  // listen. So send the event to them. This relies on Node internals
+  // (`setupConnectionsTracking` in `lib/_http_server.js`), and the test
+  // "times out slow headers" fails when Node changes them.
+  tunnelServer.emit("listening");
+  if (listener !== server) server.emit("listening");
   await new Promise<void>((resolve, reject) => {
     listener.once("error", reject);
     listener.listen(options.port, options.host, () => resolve());

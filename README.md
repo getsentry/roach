@@ -594,11 +594,11 @@ attribute of Roach starts with `roach.`. Metrics have only attributes with
 few values: `roach.tenant`, `roach.mode`, `roach.rule`, `roach.origin`,
 `roach.result`, and `roach.reason`.
 
-| Metric                   | Type              | Value                                                                                                                                                                                                                                                |
-| ------------------------ | ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `roach.request`          | counter           | 1 for each proxied request. `roach.result` is `replayed`, `live`, `missed`, `passthrough`, or `refused`. A `passthrough` or `refused` request has no `roach.rule`. A `refused` request has `roach.reason`, and `other` for an origin not in `allow`. |
-| `roach.request.duration` | distribution (ms) | The time to answer a request that a rule records, by `roach.result`.                                                                                                                                                                                 |
-| `roach.recording.write`  | counter           | Recordings by `roach.rule`. `roach.result` is `written` (the proxy sent them to the store) or `dropped` (their session failed).                                                                                                                      |
+| Metric                   | Type              | Value                                                                                                                                                                                                                                                                                                                            |
+| ------------------------ | ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `roach.request`          | counter           | 1 for each proxied request. `roach.result` is `replayed`, `live`, `missed`, `passthrough`, `refused`, or `aborted` (the client closed the request before its body came). A `passthrough`, `refused`, or `aborted` request has no `roach.rule`. A `refused` request has `roach.reason`, and `other` for an origin not in `allow`. |
+| `roach.request.duration` | distribution (ms) | The time to answer a request that a rule records, by `roach.result`.                                                                                                                                                                                                                                                             |
+| `roach.recording.write`  | counter           | Recordings by `roach.rule`. `roach.result` is `written` (the proxy sent them to the store) or `dropped` (their session failed).                                                                                                                                                                                                  |
 
 Each proxied request is one trace. Each span has `roach.tenant`,
 `roach.mode`, `roach.run.id` (the `name` of the run, else its id), and the
@@ -686,6 +686,9 @@ To see how well the cache works:
   before the service parses it.
 - Keys and the redaction of misses have time limits. See
   [Changing values](#changing-values).
+- Request headers that do not come in 10 s get HTTP 408, and a request
+  whose body does not come in 300 s too. This is also true in a tunnel
+  and with `proxyProtocol`.
 - A `CONNECT` tunnel that sends no byte for 10 s after the `200` closes. A
   tunnel that sends and gets no byte for 10 minutes closes.
 - The credentials that a run learns and the values that a session

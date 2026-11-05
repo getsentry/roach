@@ -44,6 +44,36 @@ const runs: RemoteRoach[] = [];
 const hash = (token: string) =>
   createHash("sha256").update(token).digest("hex");
 
+/**
+ * Open a `CONNECT` tunnel to the upstream through the service at
+ * `serviceUrl`, with the credentials of the proxy URL of a run. Returns
+ * the socket after the `200`.
+ */
+async function openTunnel(serviceUrl: string, runUrl: string) {
+  const { username, password } = new URL(runUrl);
+  const authority = new URL(origin).host;
+  const socket = connect(Number(new URL(serviceUrl).port), "127.0.0.1");
+  onTestFinished(() => {
+    socket.destroy();
+  });
+  await once(socket, "connect");
+  const credentials = Buffer.from(`${username}:${password}`).toString("base64");
+  socket.write(
+    `CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\nProxy-Authorization: Basic ${credentials}\r\n\r\n`,
+  );
+  const [reply] = (await once(socket, "data")) as [Buffer];
+  expect(reply.toString()).toMatch(/^HTTP\/1.1 200/);
+  return socket;
+}
+
+/** All that a socket gets until it closes. */
+async function readUntilClose(socket: ReturnType<typeof connect>) {
+  const chunks: Buffer[] = [];
+  socket.on("data", (chunk: Buffer) => chunks.push(chunk));
+  await once(socket, "close");
+  return Buffer.concat(chunks).toString();
+}
+
 /** Start a run, with one recorded rule. Without `token`, it has no token. */
 async function startRun(
   token: string | undefined,
@@ -984,6 +1014,69 @@ describe("limits of the service", () => {
       ]),
     ).resolves.toBe("closed");
   });
+  it("times out slow headers, also with proxyProtocol and in a tunnel", async () => {
+    // With `proxyProtocol`, the HTTP servers get their connections from a
+    // TCP server, and Node did not check their time limits.
+    const local = await startRoachService({
+      directory,
+      privateNetworks: true,
+      writeTokenHash: hash("write-token"),
+      proxyProtocol: true,
+    });
+    onTestFinished(() => local.close());
+    const started = await rawRequest(
+      local.url,
+      "203.0.113.1",
+      "POST",
+      "/__roach/runs",
+      {
+        tenant: "acme/alpha",
+        mode: "replay",
+        allow: [origin],
+        rules: [{ name: "model", match: {} }],
+      },
+    );
+    const run = JSON.parse(started.body) as RemoteRun;
+    const direct = connect(Number(new URL(local.url).port), "127.0.0.1");
+    await once(direct, "connect");
+    const tunnel = await openTunnel(local.url, run.url);
+    const begin = performance.now();
+    direct.write(
+      "PROXY TCP4 203.0.113.1 10.0.0.2 51234 443\r\nGET / HTTP/1.1\r\nhost: roach\r\n",
+    );
+    tunnel.write("POST /v1/messages HTTP/1.1\r\nhost: upstream\r\n");
+    // The headers never end. Node answers 408 after 10 s.
+    const replies = await Promise.all(
+      [direct, tunnel].map((socket) =>
+        Promise.race([
+          readUntilClose(socket),
+          new Promise((resolve) => setTimeout(() => resolve("open"), 15_000)),
+        ]),
+      ),
+    );
+    for (const reply of replies) expect(reply).toMatch(/^HTTP\/1.1 408 /);
+    expect(performance.now() - begin).toBeGreaterThan(9000);
+  });
+
+  it("does not send a request to Sentry when its client closes it", async () => {
+    const run = await startRun(undefined, "replay");
+    const log = vi.spyOn(process.stderr, "write");
+    onTestFinished(() => log.mockRestore());
+    const tunnel = await openTunnel(service.url, run.url);
+    tunnel.write(
+      "POST /v1/messages HTTP/1.1\r\nhost: upstream\r\ncontent-length: 1000\r\n\r\n{",
+    );
+    // Let the proxy start to read the body, then close the connection.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    tunnel.destroy();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(log.mock.calls.map(([text]) => String(text)).join("")).not.toMatch(
+      /Request failed/,
+    );
+    // The run goes on.
+    expect((await send(run.url, { prompt: "hi" })).status).toBe(412);
+  });
+
   it("limits the runs without a token of each client", async () => {
     // Behind the load balancer, each connection starts with a PROXY
     // header. It gives the address of the client.

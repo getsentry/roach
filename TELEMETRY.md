@@ -50,6 +50,9 @@ For metrics, use `-f dataset=tracemetrics`,
   `roach.reason` tells why: `notAllowed` (the origin is not in `allow`),
   `notPublic` (the address is not public), or `replayOnly` (a run without
   the token, and no rule records the request).
+- **Aborted**: the client closed its connection before the body of its
+  request came. The proxy sent the request nowhere. It is not an error,
+  so Sentry gets no event.
 - **Dropped**: a live response was recorded, but its session failed, so the
   recording was not written. The next run sends the request live again.
 
@@ -96,8 +99,8 @@ The examples use the `sentry` CLI. The same fields work in Explore. The
 counts are estimates (see [Sampling](#sampling)).
 
 Cached and uncached requests by rule. The hit rate of a rule is
-`replayed / (replayed + live + missed)`. Do not count `passthrough` or
-`refused`.
+`replayed / (replayed + live + missed)`. Do not count `passthrough`,
+`refused`, or `aborted`.
 
 ```bash
 sentry explore sentry/roach --dataset metrics --metric roach.request --agg sum \
