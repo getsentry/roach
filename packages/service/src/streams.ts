@@ -3,9 +3,9 @@
  *
  * A model stream sends a tool call or a text in many small deltas, so an id
  * that the model repeats can be split over two events. Before the proxy
- * writes changing values as placeholders (`values.ts`), it merges the
- * deltas of each Anthropic Messages content block into one event. A client
- * joins the deltas anyway, so it gets the same content.
+ * writes changing values as placeholders (`@sentry/roach/values`), it
+ * merges the deltas of each Anthropic Messages content block into one
+ * event. A client joins the deltas anyway, so it gets the same content.
  *
  * Thinking blocks keep their recorded text. A signature covers that text,
  * and the provider refuses a changed thinking block in a later request.

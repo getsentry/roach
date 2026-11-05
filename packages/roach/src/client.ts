@@ -2,7 +2,7 @@
  * The client of Roach. See `README.md`.
  *
  * `startRemoteRun()` starts a run on a Roach service
- * (`service/service.ts`). It returns `env`, the variables that send the
+ * (`@sentry/roach-service`). It returns `env`, the variables that send the
  * traffic of a process through the run. `connectRoach()` controls a run
  * from another process, such as a test worker.
  */
@@ -145,7 +145,7 @@ export function connectRoach({
   };
 }
 
-/** A run on a Roach service (`service/service.ts`). */
+/** A run on a Roach service (`@sentry/roach-service`). */
 export interface RemoteRoach extends RemoteRun, RoachControl {
   /**
    * The variables that send the HTTP traffic of a process through the run:

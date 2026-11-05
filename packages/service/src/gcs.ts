@@ -1,6 +1,6 @@
 /**
  * The GCS store: the recordings of the shared service
- * (`service/service.ts`) in a Google Cloud Storage bucket.
+ * (`service.ts`) in a Google Cloud Storage bucket.
  *
  * Each recording is the object `<prefix><key>`. A lifecycle rule of the
  * bucket deletes it 30 days after it was written (`deploy/gcp/`), so

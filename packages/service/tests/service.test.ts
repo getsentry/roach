@@ -16,10 +16,10 @@ import {
   connectRoach,
   startRemoteRun,
   type RemoteRoach,
-} from "../src/client.ts";
-import { startRoachService, type RoachService } from "../service/service.ts";
-import type { RunConfig } from "../src/types.ts";
-import { VALUE_PATTERNS } from "../src/values.ts";
+} from "@sentry/roach/client";
+import { startRoachService, type RoachService } from "../src/service.ts";
+import type { RunConfig } from "@sentry/roach/types";
+import { VALUE_PATTERNS } from "@sentry/roach/values";
 
 let upstream: Server;
 let origin: string;

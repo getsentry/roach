@@ -7,16 +7,16 @@
 
 ## Commands
 
-| Task             | Command                                               |
-| ---------------- | ----------------------------------------------------- |
-| Test file        | `pnpm exec vitest run tests/recording.test.ts`        |
-| Test case        | `pnpm exec vitest run tests/recording.test.ts -t "…"` |
-| Lint file        | `pnpm exec oxlint --deny-warnings service/server.ts`  |
-| Format           | `pnpm format`                                         |
-| Typecheck        | `pnpm typecheck`                                      |
-| Deployed shape   | `pnpm exec vitest run tests/deployed.test.ts`         |
-| Unused code/deps | `pnpm knip`                                           |
-| Everything (CI)  | `pnpm check`                                          |
+| Task             | Command                                                                |
+| ---------------- | ---------------------------------------------------------------------- |
+| Test file        | `pnpm exec vitest run packages/service/tests/recording.test.ts`        |
+| Test case        | `pnpm exec vitest run packages/service/tests/recording.test.ts -t "…"` |
+| Lint file        | `pnpm exec oxlint --deny-warnings packages/service/src/server.ts`      |
+| Format           | `pnpm format`                                                          |
+| Typecheck        | `pnpm typecheck`                                                       |
+| Deployed shape   | `pnpm exec vitest run packages/service/tests/deployed.test.ts`         |
+| Unused code/deps | `pnpm knip`                                                            |
+| Everything (CI)  | `pnpm check`                                                           |
 
 ## External References
 
@@ -24,20 +24,21 @@
 | -------------------------------------- | ------------------------------------- |
 | Usage, config, recordings, control API | `README.md`                           |
 | Service access, limits, and deploy     | "Service" and "Deploy" in `README.md` |
-| Public types                           | `src/types.ts`                        |
+| Public types                           | `packages/roach/src/types.ts`         |
 | Map of source files                    | "Files" in `README.md`                |
 | Sentry queries and cache hit rate      | `TELEMETRY.md`                        |
 
 ## Key Conventions
 
-- Use Node built-ins and the `openssl` command. The npm package (the root) ships `src/`, which has only the client, the vitest integration, and the action, and has no runtime dependencies. The proxy and the service are in the private `service/` package. Its only dependency is `@sentry/node`, and only `service/service.ts` imports it. Code in `src/` never imports from `service/`. `tests/package.test.ts` fails when a file in `src/` is not used by an export or the action.
+- The repository is a pnpm workspace. The root is private and has only the tools. `packages/roach` is the npm package `@sentry/roach`: the client, the vitest integration, and the action. `packages/service` is the private `@sentry/roach-service`: the service and the proxy. Put a shared dependency version in the catalog of `pnpm-workspace.yaml`, and refer to it as `catalog:`.
+- Use Node built-ins and the `openssl` command. `@sentry/roach` has no runtime dependencies. `@sentry/node` is the only one of `@sentry/roach-service`, and only `packages/service/src/service.ts` imports it. The service imports `@sentry/roach` by package name (`workspace:*`), never by a relative path. `@sentry/roach` never imports the service. `packages/roach/tests/package.test.ts` fails when an export or the action loads a package that is not a Node built-in or vitest, or when a file in `packages/roach/src/` is not used.
 - `deploy/gcp/` is the production setup (Terraform). Change it in the same change when the service config (`RoachServiceConfig`) changes. CI runs `terraform validate` on it.
-- Node runs `src/` and `service/` as TypeScript with type stripping. Use only erasable syntax, and import local files with the `.ts` extension.
+- Node runs both packages as TypeScript with type stripping. Use only erasable syntax, and import local files with the `.ts` extension.
 - Use functions and plain objects, not classes.
 - Start each source file with a comment that says what the file owns. Give each export a short JSDoc.
 - Update `README.md` in the same change when behavior, config, or the control API changes.
-- Test through a real proxy and a local upstream server in `tests/`. Do not mock modules. Do not reach the internet.
-- The proxy decrypts HTTPS. Never write a credential: every recording goes through `service/secrets.ts`.
+- Test through a real proxy and a local upstream server in `packages/service/tests/`. Do not mock modules. Do not reach the internet.
+- The proxy decrypts HTTPS. Never write a credential: every recording goes through `packages/service/src/secrets.ts`.
 - The upstream host always comes from `allow`, never from the client.
 - Write docs in ASD-STE100 English: common words, active voice, short sentences.
 

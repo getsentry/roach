@@ -1,0 +1,24 @@
+{
+  "name": "@sentry/roach-service",
+  "private": true,
+  "description": "The shared Roach service and the image that runs it. Not published.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc -p ."
+  },
+  "dependencies": {
+    "@sentry/node": "11.6.0",
+    "@sentry/roach": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "typescript": "catalog:",
+    "undici": "^8.11.2",
+    "vitest": "catalog:"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

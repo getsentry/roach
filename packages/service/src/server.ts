@@ -1,5 +1,5 @@
 /**
- * The proxy sockets of the service (`service/service.ts`).
+ * The proxy sockets of the service (`service.ts`).
  *
  * The proxy is a forward proxy. It intercepts HTTPS with its own
  * certificate authority (`certificates.ts`). It gives each request that a
@@ -30,7 +30,7 @@ import {
 } from "./addresses.ts";
 import type { CertificateAuthority } from "./certificates.ts";
 import type { ProxyRequest, Recorder, Telemetry } from "./recorder.ts";
-import type { OpenedSession } from "../src/types.ts";
+import type { OpenedSession } from "@sentry/roach/types";
 
 /** Headers for one connection, which the proxy must not forward. */
 const HOP_HEADERS = new Set([

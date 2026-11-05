@@ -2,11 +2,10 @@ import { defineConfig } from "vitest/config";
 
 export default defineConfig({
   test: {
-    include: ["tests/**/*.test.ts"],
-    testTimeout: 30_000,
+    projects: ["packages/*"],
     coverage: {
       provider: "v8",
-      include: ["src/**/*.ts", "service/**/*.ts"],
+      include: ["packages/*/src/**/*.ts"],
       reporter: ["text-summary", "lcov"],
     },
   },

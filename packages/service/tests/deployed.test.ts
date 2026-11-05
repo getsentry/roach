@@ -7,7 +7,7 @@
  *   TLS and passes the bytes to the service.
  * - A local server plays the GCS JSON API and the metadata server of the
  *   VM. Another one plays Sentry.
- * - Each CI job runs the GitHub Action (`src/action.ts`). Its command sends
+ * - Each CI job runs the GitHub Action (`packages/roach/src/action.ts`). Its command sends
  *   HTTPS through the service with only the proxy variables of its run.
  */
 import { execFile, spawn, type ChildProcess } from "node:child_process";
@@ -22,7 +22,7 @@ import path from "node:path";
 import tls from "node:tls";
 import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import type { RoachServiceConfig } from "../service/service.ts";
+import type { RoachServiceConfig } from "../src/service.ts";
 
 const execFileAsync = promisify(execFile);
 const ROOT = path.join(import.meta.dirname, "..");
@@ -154,7 +154,7 @@ function requestMetrics(mode: string, result: string) {
 }
 
 /**
- * Run one CI job: the action (`src/action.ts`) with a command that sends
+ * Run one CI job: the action (`packages/roach/src/action.ts`) with a command that sends
  * one HTTPS request with plain `fetch`. Returns the exit code of the
  * action, what the command saw, and the job summary.
  */
@@ -195,7 +195,7 @@ console.log(JSON.stringify({
     [
       "--experimental-strip-types",
       "--disable-warning=ExperimentalWarning",
-      path.join(ROOT, "src/action.ts"),
+      path.join(ROOT, "../roach/src/action.ts"),
     ],
     {
       cwd: workspace,
@@ -368,7 +368,7 @@ beforeAll(async () => {
     [
       "--experimental-strip-types",
       "--disable-warning=ExperimentalWarning",
-      path.join(ROOT, "service/cli.ts"),
+      path.join(ROOT, "src/cli.ts"),
       "service",
       configFile,
     ],

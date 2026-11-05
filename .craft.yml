@@ -1,8 +1,8 @@
 minVersion: "2.21.0"
 changelog:
   policy: auto
-# Write the version only to the root package.json, `@sentry/roach`. See the
-# script for why Craft does not do it on its own.
+# Write the version only to `@sentry/roach` (packages/roach/package.json).
+# See the script for why Craft does not do it on its own.
 preReleaseCommand: sh .github/scripts/bump-version.sh
 targets:
   # The client and the vitest integration. CI uploads the tarball of each

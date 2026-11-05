@@ -17,4 +17,4 @@ inputs:
 
 runs:
   using: node24
-  main: src/action.ts
+  main: packages/roach/src/action.ts

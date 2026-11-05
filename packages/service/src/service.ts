@@ -58,8 +58,8 @@ import {
   type RecordingStats,
   type RemoteRun,
   type RunConfig,
-} from "../src/types.ts";
-import { invalidValuePatterns } from "../src/values.ts";
+} from "@sentry/roach/types";
+import { invalidValuePatterns } from "@sentry/roach/values";
 
 /** The configuration of the service. The operator owns it. */
 export interface RoachServiceConfig {
