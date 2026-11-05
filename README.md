@@ -785,6 +785,16 @@ both pass and the commit is still the head of `main`, it moves `:main` to
 the open runs, so their CI jobs fail. A red commit does not deploy, and an
 older commit never replaces a newer one.
 
+Sometimes GitHub starts no workflow for a push to `main`. Then the head of
+`main` has no CI and no image, and it does not deploy. Run both by hand:
+
+```sh
+gh workflow run ci.yml --repo getsentry/roach --ref main
+gh workflow run image.yml --repo getsentry/roach --ref main
+```
+
+The `Deploy` workflow accepts these runs like push runs.
+
 ### Set up
 
 1. Make the package `ghcr.io/getsentry/roach` public once, after the first

@@ -1,6 +1,7 @@
 name: Deploy
 
-# Deploy main when it is green. When the Image workflow pushed `:<sha>`,
+# Deploy main when it is green. When the Image workflow pushed `:<sha>`
+# (on a push, or a manual run on main),
 # CI passed for the same commit, and the commit is still the head of main,
 # move `:main` to `:<sha>` and reset the VM, which pulls `:main` at each
 # start. See "Deploy" in README.md.
@@ -32,7 +33,7 @@ jobs:
     name: promote
     if: >-
       github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'push'
+      github.event.workflow_run.event != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -42,23 +43,14 @@ jobs:
     outputs:
       promoted: ${{ steps.head.outputs.promoted }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
       - name: Wait for CI
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          for _ in $(seq 60); do
-            run=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml \
-              --commit "$SHA" --event push --limit 1 --json status,conclusion)
-            if [ "$(jq -r '.[0].status' <<<"$run")" = completed ]; then
-              conclusion=$(jq -r '.[0].conclusion' <<<"$run")
-              if [ "$conclusion" = success ]; then exit 0; fi
-              echo "::error::CI of $SHA is $conclusion. Nothing deploys."
-              exit 1
-            fi
-            sleep 20
-          done
-          echo "::error::CI of $SHA did not end in 20 minutes."
-          exit 1
+        run: .github/scripts/wait-for-ci.sh "$SHA"
 
       # Do not go back to an older commit when a newer one is on main.
       # The newer commit deploys when it is green.
