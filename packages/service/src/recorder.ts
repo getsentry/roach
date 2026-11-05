@@ -22,11 +22,18 @@
  * always gets the change and its text. Only a run with the write token gets
  * the change in its stats, and never its text.
  *
- * The recorder never writes a known credential (`secrets.ts`). It reports
- * spans and metrics through the `Telemetry` hooks of `service.ts`.
+ * The recorder never writes a known credential (`secrets.ts`). It decodes
+ * a compressed body first, and it redacts a body that is not text as
+ * bytes, before it encodes it. It also redacts the credentials that the
+ * upstream mints, such as `access_token` in a response body. The live
+ * client gets these, so the run can use them. A replay gives
+ * `<<redacted>>` in their place. The recorder reports spans
+ * and metrics through the `Telemetry` hooks of `service.ts`.
  */
 import { randomBytes } from "node:crypto";
 import type { IncomingHttpHeaders } from "node:http";
+import { promisify } from "node:util";
+import { brotliDecompress, gunzip, inflate } from "node:zlib";
 import { reportInternal } from "./errors.ts";
 import { firstChange, sampleKey, toSample } from "./misses.ts";
 import {
@@ -36,7 +43,7 @@ import {
   type JobOptions,
 } from "./key-worker.ts";
 import { keyTimeLimit, type KeyedRequest } from "./request-key.ts";
-import { createSecrets, type LearnLimit } from "./secrets.ts";
+import { createSecrets, redactUrl, type LearnLimit } from "./secrets.ts";
 import {
   recordingKey,
   RULE_NAME,
@@ -169,9 +176,64 @@ const MAX_OPEN_SESSIONS = 64;
  * repeats one has it in its key as it is.
  */
 const MAX_KNOWN = { values: 1000, length: 32 * 1024 };
+/** Content types that a recording keeps as text. Other bodies are base64. */
+const TEXT_CONTENT_TYPE = /^text\/|json|xml|x-www-form-urlencoded/i;
 /** Response headers that a recording keeps. Other headers change each run. */
 const RECORDED_HEADERS = ["content-type", "location"];
 const NULL_BODY_STATUSES = new Set([101, 204, 205, 304]);
+/**
+ * The largest body that the recorder decodes from a content encoding. It
+ * is the largest request body that the proxy reads (`server.ts`), so a
+ * small compressed body cannot fill the memory of the service.
+ */
+const MAX_DECODED_BYTES = 64 * 1024 * 1024;
+/**
+ * Decoders of the content encodings that the recorder can read. They run
+ * on the thread pool of zlib, so they do not block other requests.
+ */
+const DECODERS: Record<
+  string,
+  (body: Buffer, options: { maxOutputLength: number }) => Promise<Buffer>
+> = {
+  gzip: promisify(gunzip),
+  "x-gzip": promisify(gunzip),
+  deflate: promisify(inflate),
+  br: promisify(brotliDecompress),
+};
+
+/**
+ * The body of a response without its content encoding. The proxy asks for
+ * `identity`, but an upstream can encode the body all the same, and the
+ * recorder must decode it to find credentials in it. An empty body, such
+ * as of a 304, stays empty. Rejects when it does not know an encoding,
+ * when the body is not valid, or when the decoded body is larger than
+ * `MAX_DECODED_BYTES`.
+ */
+async function decodeBody({ headers, body }: ProxyResponse): Promise<Buffer> {
+  if (body.length === 0) return body;
+  const encodings = (headers["content-encoding"] ?? "")
+    .split(",")
+    .map((encoding) => encoding.trim().toLowerCase())
+    .filter((encoding) => encoding !== "" && encoding !== "identity");
+  let result = body;
+  for (const encoding of encodings.toReversed()) {
+    const decoder = DECODERS[encoding];
+    if (!decoder) throw new Error(`unknown content encoding ${encoding}`);
+    result = await decoder(result, { maxOutputLength: MAX_DECODED_BYTES });
+  }
+  return result;
+}
+
+/** The text of `body` when it is valid UTF-8, or `undefined`. */
+function utf8Text(body: Buffer): string | undefined {
+  try {
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
+      body,
+    );
+  } catch {
+    return undefined;
+  }
+}
 
 /** Statuses that are never recorded, because they are temporary. */
 const isTemporaryStatus = (status: number) => status === 429 || status >= 500;
@@ -192,13 +254,17 @@ function matches(
 
 /**
  * The response as a recording keeps it. A stream gets one delta per content
- * block, and each value of the request becomes a placeholder.
+ * block, and each value of the request becomes a placeholder. A body that
+ * is not text gets `redactBytes` before it is encoded, because a redaction
+ * of the encoded text cannot find a credential in it. The URL has the
+ * value of each credential query parameter redacted.
  */
 function toRecording(
   request: ProxyRequest,
   keyed: KeyedRequest,
   session: string | undefined,
   response: ProxyResponse,
+  redactBytes: (body: Buffer) => Buffer,
 ): Recording {
   const contentType = response.headers["content-type"];
   const headers: Record<string, string> = {};
@@ -206,9 +272,11 @@ function toRecording(
     const value = response.headers[name];
     if (typeof value === "string") headers[name] = value;
   }
-  let body = response.body.toString("base64");
+  let body = "";
   let bodyEncoding: Recording["response"]["bodyEncoding"] = "base64";
-  if (/^text\/|json|xml/i.test(contentType ?? "")) {
+  if (!TEXT_CONTENT_TYPE.test(contentType ?? "")) {
+    body = redactBytes(response.body).toString("base64");
+  } else {
     const text = response.body.toString("utf8");
     const template = (part: string) => templateValues(part, keyed.values);
     body = isEventStream(contentType)
@@ -218,7 +286,7 @@ function toRecording(
   }
   return {
     session,
-    request: { method: request.method, url: request.url.href },
+    request: { method: request.method, url: redactUrl(request.url.href) },
     response: { status: response.status, headers, body, bodyEncoding },
   };
 }
@@ -312,6 +380,40 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
     if (workMs > workLimit.totalMs && !closed) {
       config.endRun(`it used over ${workLimit.totalMs} ms in the key worker`);
     }
+  };
+  /**
+   * A recording as the store keeps it. Only the stored recording loses the
+   * credentials that the upstream minted (`secrets.redactFields`), because
+   * the client needs them for its next live requests. A body that is not
+   * text gets this too when it is UTF-8 JSON, whatever its content type
+   * says. The `location` header loses the values of its minted credential
+   * parameters (`secrets.redactLocation`). The minted values are known
+   * from then on, so the recording is redacted again.
+   */
+  const toStored = (recording: Recording): Recording => {
+    const { response } = recording;
+    const headers = { ...response.headers };
+    if (headers.location) {
+      headers.location = secrets.redactLocation(headers.location);
+    }
+    let { body } = response;
+    if (response.bodyEncoding === "utf8") {
+      body = secrets.redactFields(body, headers["content-type"]);
+    } else {
+      const text = utf8Text(Buffer.from(body, "base64"));
+      const redacted = text && secrets.redactFields(text);
+      if (redacted && redacted !== text) {
+        body = secrets.redactBytes(Buffer.from(redacted)).toString("base64");
+      }
+    }
+    return JSON.parse(
+      secrets.redact(
+        JSON.stringify({
+          ...recording,
+          response: { ...response, headers, body },
+        }),
+      ),
+    ) as Recording;
   };
   const refused: NonNullable<RecordingStats["refused"]> = {};
   const stats: RecordingStats = {
@@ -557,7 +659,11 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
         redactInWorker(
           secrets.list(),
           keyed.text,
-          request.url.href,
+          {
+            href: request.url.href,
+            body: request.body.toString("utf8"),
+            contentType: request.headers["content-type"],
+          },
           jobOptions(keyed.text.length),
         ).then(
           (result) => {
@@ -628,7 +734,7 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
         }
       }
 
-      const live = await telemetry.span(
+      const upstream = await telemetry.span(
         {
           op: "roach.upstream",
           name: `${request.method} ${origin}`,
@@ -646,21 +752,37 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
       // Count it only when it went out. A refused address counts as
       // refused (`server.ts`).
       counts.live += 1;
-      // The client gets the redacted response too, so a live run and a
-      // replay give the same body.
+      let live: ProxyResponse;
+      try {
+        live = { ...upstream, body: await decodeBody(upstream) };
+      } catch (error) {
+        // The recorder cannot find credentials in a body that it cannot
+        // read, or that decodes to more than `MAX_DECODED_BYTES`, so it
+        // does not record it. The client gets it as it came.
+        process.stderr.write(
+          `[roach] The ${rule.name} response was not recorded, because its body could not be decoded (${(error as Error).message}): ${key}\n`,
+        );
+        report("live");
+        const headers: IncomingHttpHeaders = {};
+        for (const name of ["content-type", "content-encoding"]) {
+          if (upstream.headers[name]) headers[name] = upstream.headers[name];
+        }
+        return { ...upstream, headers, source: "live" };
+      }
+      // The client gets the known credentials redacted too, so a live run
+      // and a replay give the same body.
       const recording = JSON.parse(
         secrets.redact(
-          JSON.stringify(toRecording(request, keyed, owner?.name, live)),
+          JSON.stringify(
+            toRecording(request, keyed, owner?.name, live, secrets.redactBytes),
+          ),
         ),
       ) as Recording;
       if (!isTemporaryStatus(recording.response.status)) {
         await record(owner, key, {
-          recording,
+          recording: toStored(recording),
           samples: [
-            [
-              sample,
-              toSample(key, secrets.redactRequest(keyed.text, request.url)),
-            ],
+            [sample, toSample(key, secrets.redactRequest(keyed.text, request))],
           ],
         });
       }

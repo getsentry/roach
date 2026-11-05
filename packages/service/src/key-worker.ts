@@ -13,7 +13,7 @@ import { performance } from "node:perf_hooks";
 import { parentPort, Worker, workerData } from "node:worker_threads";
 import type { IncomingHttpHeaders } from "node:http";
 import { keyRequest, type KeyedRequest } from "./request-key.ts";
-import { redactRequestWith } from "./secrets.ts";
+import { redactRequestWith, type RequestToRedact } from "./secrets.ts";
 import type { RecordingRule } from "@sentry/roach/types";
 import { type KnownValues, withTimeLimit } from "@sentry/roach/values";
 
@@ -34,7 +34,7 @@ type Job =
       kind: "redact";
       values: string[];
       text: string;
-      href: string;
+      request: RequestToRedact;
       timeLimitMs: number;
     };
 
@@ -74,7 +74,7 @@ function runJob(job: Job): unknown {
     return keyRequest(job.rule, job.request, job.known, job.timeLimitMs);
   }
   return withTimeLimit(job.timeLimitMs, () =>
-    redactRequestWith(job.values, job.text, job.href),
+    redactRequestWith(job.values, job.text, job.request),
   );
 }
 
@@ -182,11 +182,11 @@ export function keyInWorker(
 export function redactInWorker(
   values: string[],
   text: string,
-  href: string,
+  request: RequestToRedact,
   options: JobOptions,
 ): Promise<JobResult<string>> {
   return runInWorker(
-    { kind: "redact", values, text, href, timeLimitMs: options.timeLimitMs },
+    { kind: "redact", values, text, request, timeLimitMs: options.timeLimitMs },
     options,
   );
 }
