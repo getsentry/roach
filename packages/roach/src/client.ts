@@ -11,6 +11,7 @@ import http from "node:http";
 import https from "node:https";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { DEFAULT_NO_PROXY } from "./config.ts";
 import {
   CONTROL_PATH,
   type OpenedSession,
@@ -91,7 +92,7 @@ function callControl<T>(
           if (status >= 400) {
             reject(
               new Error(
-                `Roach ${method} ${route} failed with HTTP ${status}: ${text}`,
+                `Roach: ${method} ${route} failed with HTTP ${status}: ${text}`,
               ),
             );
           } else {
@@ -129,7 +130,7 @@ export function connectRoach({
       const url = opened?.url;
       if (typeof url !== "string") {
         throw new Error(
-          `Roach service at ${new URL(controlUrl).origin} is older than this client: it returned no session URL. Deploy the service at ${SESSION_URL_VERSION} or later.`,
+          `Roach: the service at ${new URL(controlUrl).origin} is older than this client: it returned no session URL. Deploy the service at ${SESSION_URL_VERSION} or later.`,
         );
       }
       return {
@@ -168,7 +169,7 @@ export interface RemoteRoach extends RemoteRun, RoachControl {
 export async function startRemoteRun(
   service: { url: string; token?: string | undefined },
   config: RunConfig,
-  { noProxy = "localhost,127.0.0.1,::1" }: { noProxy?: string } = {},
+  { noProxy = DEFAULT_NO_PROXY }: { noProxy?: string } = {},
 ): Promise<RemoteRoach> {
   const run = await callControl<RemoteRun>(
     `${service.url.replace(/\/$/, "")}${CONTROL_PATH}`,

@@ -19,6 +19,7 @@ import {
   type ProvidedContext,
 } from "vitest";
 import { connectRoach } from "./client.ts";
+import { swapEnv } from "./config.ts";
 
 const provided = inject("roach");
 if (provided === undefined) {
@@ -36,12 +37,10 @@ function useRun(run: NonNullable<ProvidedContext["roach"]>): void {
     // The full name starts with the file, so tests of two files never share
     // a session.
     const session = await control.startSession(task.fullName);
-    const previous = {
-      HTTP_PROXY: process.env.HTTP_PROXY,
-      HTTPS_PROXY: process.env.HTTPS_PROXY,
-    };
-    process.env.HTTP_PROXY = session.url;
-    process.env.HTTPS_PROXY = session.url;
+    const restoreEnv = swapEnv({
+      HTTP_PROXY: session.url,
+      HTTPS_PROXY: session.url,
+    });
     const restoreProxy = http.setGlobalProxyFromEnv({
       HTTP_PROXY: session.url,
       HTTPS_PROXY: session.url,
@@ -49,10 +48,7 @@ function useRun(run: NonNullable<ProvidedContext["roach"]>): void {
     });
     onTestFinished(async ({ task: finished }) => {
       restoreProxy();
-      for (const [name, value] of Object.entries(previous)) {
-        if (value === undefined) delete process.env[name];
-        else process.env[name] = value;
-      }
+      restoreEnv();
       const { missed } = await session.end(finished.result?.state === "pass");
       // `replay` mode failed these requests, so nothing went live. The test
       // must fail, also when it recovered from the error.
