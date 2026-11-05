@@ -19,10 +19,12 @@ import tls from "node:tls";
 import type { TestProject } from "vitest/node";
 import { startRemoteRun } from "./client.ts";
 import {
+  DEFAULT_NO_PROXY,
   DEFAULT_SERVICE_URL,
   readEnv,
   readRoachFile,
   runConfigOf,
+  swapEnv,
 } from "./config.ts";
 import { writeRunReport } from "./report.ts";
 import type { RemoteRun } from "./types.ts";
@@ -54,9 +56,9 @@ export async function startRoach(
   }
   // Only a run needs it, so `off` mode works on older Node too.
   if (typeof http.setGlobalProxyFromEnv !== "function") {
-    throw new Error("Roach needs Node 24.14 or later for vitest");
+    throw new Error("Roach: vitest needs Node 24.14 or later");
   }
-  const noProxy = file.noProxy ?? "localhost,127.0.0.1,::1";
+  const noProxy = file.noProxy ?? DEFAULT_NO_PROXY;
   const run = await startRemoteRun(
     { url: readEnv("ROACH_URL") ?? DEFAULT_SERVICE_URL, token },
     config,
@@ -66,11 +68,8 @@ export async function startRoach(
   if (process.env.GITHUB_ACTIONS) {
     process.stdout.write(`::add-mask::${run.token}\n`);
   }
-  const previousEnv = Object.keys(run.env).map(
-    (name) => [name, process.env[name]] as const,
-  );
   // Test workers and their child processes start later and inherit these.
-  Object.assign(process.env, run.env);
+  const restoreEnv = swapEnv(run.env);
   // This process started before them, so it reads neither the proxy nor
   // the CA file. Set both here.
   const previousCa = tls.getCACertificates("default");
@@ -95,10 +94,7 @@ export async function startRoach(
     } finally {
       restoreProxy();
       tls.setDefaultCACertificates(previousCa);
-      for (const [name, value] of previousEnv) {
-        if (value === undefined) delete process.env[name];
-        else process.env[name] = value;
-      }
+      restoreEnv();
     }
   };
 }

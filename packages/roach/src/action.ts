@@ -51,7 +51,7 @@ function runCommand(command: string, env: NodeJS.ProcessEnv): Promise<number> {
 }
 
 const command = process.env.INPUT_RUN;
-if (!command) throw new Error("The run input is required");
+if (!command) throw new Error("Roach: the run input is required");
 // The runner gives an empty string for an input that the step does not set.
 const token = readEnv("INPUT_TOKEN");
 const file = await readRoachFile();

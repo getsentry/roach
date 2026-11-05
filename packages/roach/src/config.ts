@@ -17,6 +17,9 @@ import { VALUE_PATTERNS } from "./values.ts";
 /** The Roach service of Sentry. See "Deploy" in `README.md`. */
 export const DEFAULT_SERVICE_URL = "https://roach-proxy.getsentry.net";
 
+/** The hosts that do not use the proxy when `roach.json` sets no `noProxy`. */
+export const DEFAULT_NO_PROXY = "localhost,127.0.0.1,::1";
+
 /** The name of the config file. */
 const FILE_NAME = "roach.json";
 
@@ -66,6 +69,23 @@ export function readEnv(
 }
 
 /**
+ * Set the variables `values` in `process.env`. Returns a function that
+ * sets each of them back. A variable that was not set before is deleted.
+ */
+export function swapEnv(values: Record<string, string>): () => void {
+  const previous = Object.keys(values).map(
+    (name) => [name, process.env[name]] as const,
+  );
+  Object.assign(process.env, values);
+  return () => {
+    for (const [name, value] of previous) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  };
+}
+
+/**
  * Find `roach.json` in `from` or the closest parent directory, and read
  * it. Throws when no directory has one.
  */
@@ -79,10 +99,17 @@ export async function readRoachFile(
       () => false,
     );
     if (found) {
-      return {
-        ...(JSON.parse(await readFile(file, "utf8")) as RoachFile),
-        path: file,
-      };
+      const text = await readFile(file, "utf8");
+      let parsed: RoachFile;
+      try {
+        parsed = JSON.parse(text) as RoachFile;
+      } catch (error) {
+        throw new Error(
+          `Roach: ${file} is not valid JSON: ${(error as Error).message}`,
+          { cause: error },
+        );
+      }
+      return { ...parsed, path: file };
     }
     const parent = path.dirname(directory);
     if (parent === directory) {

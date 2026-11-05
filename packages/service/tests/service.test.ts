@@ -698,7 +698,7 @@ describe("roach service", () => {
         token: "run-token",
       }).startSession("test"),
     ).rejects.toThrow(
-      `Roach service at ${oldUrl} is older than this client: it returned no session URL. Deploy the service at 0.2.0 or later.`,
+      `Roach: the service at ${oldUrl} is older than this client: it returned no session URL. Deploy the service at 0.2.0 or later.`,
     );
   });
 
