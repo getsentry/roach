@@ -58,10 +58,23 @@ for (const [network, prefix] of [
   NOT_PUBLIC.addSubnet(network, prefix, "ipv6");
 }
 
+/**
+ * IPv6 addresses with an IPv4 address in them: IPv4-mapped
+ * (`::ffff:0:0/96`, such as `::ffff:8.8.8.8`) and IPv4-translated for SIIT
+ * (`::ffff:0:0:0/96`, such as `::ffff:0:7f00:1`). The proxy refuses all of
+ * them, also with a public IPv4 address in them. They are not in
+ * `NOT_PUBLIC`, because `BlockList` checks an IPv4 address as its mapped
+ * form too, so that rule would refuse all IPv4 addresses.
+ */
+const IPV4_IN_IPV6 = new BlockList();
+IPV4_IN_IPV6.addSubnet("::ffff:0:0", 96, "ipv6");
+IPV4_IN_IPV6.addSubnet("::ffff:0:0:0", 96, "ipv6");
+
 /** Check that an IP address is on the public internet. */
 export function isPublicAddress(address: string): boolean {
   const family = isIP(address);
   if (family === 0) return false;
+  if (family === 6 && IPV4_IN_IPV6.check(address, "ipv6")) return false;
   return !NOT_PUBLIC.check(address, family === 6 ? "ipv6" : "ipv4");
 }
 
