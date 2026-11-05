@@ -301,7 +301,8 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
    * Report a miss. With `explainMisses`, the first miss of a session reads
    * the sample of its place (`sample`), and adds the first change from it
    * to the text of the request (`text`). A failed read only leaves the
-   * change out.
+   * change out. The span of the request gets the offset of the change and
+   * the key of the recording, but never the text.
    */
   const reportMiss = async (
     rule: RecordingRule,
@@ -326,7 +327,13 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
       | RequestSample
       | undefined;
     const change = recorded && firstChange(recorded, text());
-    if (change) miss.change = change;
+    telemetry.annotate({ "miss.sample": recorded ? "found" : "none" });
+    if (!change) return;
+    miss.change = change;
+    telemetry.annotate({
+      "miss.changed_at": change.at,
+      "miss.compared": change.file,
+    });
   };
 
   /** End a session. Returns its requests that `replay` mode failed. */

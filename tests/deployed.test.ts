@@ -527,6 +527,12 @@ describe("deployed roach", () => {
     expect(span("roach.request", "miss-1")).not.toHaveProperty(
       "gen_ai.operation.name",
     );
+    // The first miss of the run with the token looked for a request sample,
+    // and found none. The run without the token did not look.
+    expect(span("roach.request", "writer-1")).toMatchObject({
+      "miss.sample": "none",
+    });
+    expect(span("roach.request", "miss-1")).not.toHaveProperty("miss.sample");
     expect(span("roach.key", "writer-1")).toMatchObject({ key: relativeKey });
     expect(span("roach.store.read", "writer-1")).toMatchObject({
       key: relativeKey,

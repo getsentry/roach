@@ -38,6 +38,8 @@ The code in `service/service.ts` and `src/recorder.ts` is authoritative.
 | `key`                       | recording key of a request      | `roach.key` span |
 | `http.response.status_code` | status to the client            | `roach.request`  |
 | `gen_ai.request.model`      | model of a model call           | `roach.request`  |
+| `miss.sample`               | `found` or `none` for a miss    | `roach.request`  |
+| `miss.changed_at`           | offset of the change of a miss  | `roach.request`  |
 
 `origin` is also a built-in Sentry field. A query on `origin` gives the span
 origin (`manual`) or nothing. Use `tags[origin,string]`.
@@ -94,6 +96,16 @@ sentry explore sentry/roach --dataset spans --period 24h \
   -q 'span.op:roach.request result:missed' -F run -F 'count()' -s '-count()'
 ```
 
+Where the requests of misses changed. The same `miss.changed_at` from run
+to run shows one value that changes on each run. `miss.sample:none` is a
+miss that has no recorded request to compare with.
+
+```bash
+sentry explore sentry/roach --dataset spans --period 24h \
+  -q 'span.op:roach.request has:miss.sample' -F tenant -F rule \
+  -F miss.sample -F miss.changed_at -F 'count()' -s '-count()'
+```
+
 Upstream errors. A live response with a temporary status is not recorded.
 
 ```bash
@@ -141,8 +153,11 @@ and the next run makes it again. Compare `roach.recording.write` with
 - Telemetry never has a body, a credential, or the path or query of a URL.
   From a model call, it has only the model name and the token counts. So
   you cannot see the prompt or the test name in Sentry.
-- Telemetry does not show what changed in the request of a miss. The run
-  report shows it ("Misses" in `README.md`).
+- Telemetry shows where the request of a miss changed, but not what
+  changed. The `roach.request` span of the first miss of a session in a
+  run with the write token has `miss.sample`, `miss.changed_at`, and
+  `miss.compared`. The run report shows the text ("Misses" in
+  `README.md`).
 - `roach.store.read` spans with a `key` that starts with `_requests/` read
   a request sample, not a recording. Leave them out of a hit rate of
   `roach.store.read`. Each write of recordings has a second

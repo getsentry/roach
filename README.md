@@ -463,7 +463,11 @@ Each proxied request is one trace. Each span has `tenant`, `mode`, and
   `origin`, `rule`, `result`, and `http.response.status_code`. When a
   replayed or live response has token usage, the span also has the
   `gen_ai` attributes of the model call (`usage.ts`). Sentry then
-  calculates its cost in USD as `gen_ai.cost.total_tokens`. It contains:
+  calculates its cost in USD as `gen_ai.cost.total_tokens`. When a run
+  with the write token explains a miss, the span also has `miss.sample`
+  (`found` or `none`). When it finds a change, it has `miss.changed_at`
+  (the offset of the first different character) and `miss.compared` (the
+  key of the recording). It never has the text of the change. It contains:
   - `roach.key`: the key of the request, with `rule` and `key`.
   - `roach.store.read`: a read of a recording, with `key` and `result`:
     `hit` or `miss`. In a run with the write token, the first miss of a
@@ -476,7 +480,8 @@ Each proxied request is one trace. Each span has `tenant`, `mode`, and
   recordings.
 
 Telemetry never has a credential, a body, or the path or query of a URL.
-The log of the service names only the key of a miss, not its change.
+The log and the spans of the service name only the key and the offset of
+a change, not its text.
 From a model call, it has only the model name and the token counts.
 So the service turns off the request data and the HTTP spans of the SDK,
 and it adds no trace headers to the requests that it sends.
