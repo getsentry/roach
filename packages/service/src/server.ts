@@ -73,6 +73,15 @@ const TUNNEL_FIRST_BYTE_MS = 10_000;
  */
 const TUNNEL_IDLE_MS = 10 * 60 * 1000;
 /**
+ * The HTTP servers of the proxy. Headers that do not come in 10 s get
+ * HTTP 408 from Node. A whole request, with its body, has Node's default
+ * of 300 s. Node checks these times each second.
+ */
+const HTTP_OPTIONS: http.ServerOptions = {
+  headersTimeout: 10_000,
+  connectionsCheckingInterval: 1000,
+};
+/**
  * A PROXY protocol v1 header, such as
  * `PROXY TCP4 203.0.113.7 10.0.0.2 51234 443`. It is at most 107 bytes.
  * The first bytes of a connection must come in `PROXY_HEADER_MS`.
@@ -248,9 +257,8 @@ function readBody(
       clearTimeout(deadline);
       reject(error);
     };
-    // Node does not time out a request in a tunnel (`listenProxy()`), so
-    // a client that sends a byte now and then could hold its bytes for
-    // as long as the tunnel stays open.
+    // Node gives a whole request 300 s (`HTTP_OPTIONS`). That is too long
+    // to hold a part of the budget, so these bodies have a shorter limit.
     const readMs = held.budget?.readMs;
     const deadline =
       readMs === undefined
@@ -277,12 +285,23 @@ function readBody(
       clearTimeout(deadline);
       resolve(Buffer.concat(chunks));
     });
-    stream.on("error", (error) => {
+    stream.on("error", (error: Error & { code?: string }) => {
       clearTimeout(deadline);
-      reject(error);
+      // A client that closes its connection before its body came is not a
+      // failure of the proxy, so it does not go to Sentry. `method` is set
+      // only on a request, not on an upstream response.
+      const aborted = stream.method !== null && error.code === "ECONNRESET";
+      reject(aborted ? abortedError() : error);
     });
   });
 }
+
+/** The error of a request whose client closed it before its body came. */
+const abortedError = () =>
+  Object.assign(
+    httpError(400, "the client closed the request before its body came"),
+    { aborted: true },
+  );
 
 /**
  * Read a JSON object body of a control API call. A body over
@@ -712,10 +731,16 @@ function answerError(
     status === undefined
       ? reportInternal("Request", error, target.telemetry.capture(error))
       : (error as Error).message;
-  // A body that did not fit in the budget, or that did not come in time,
-  // is not a miss and not an error. Count it, so that Sentry shows it.
-  const result =
-    status === 503 ? "busy" : status === 408 ? "timeout" : undefined;
+  // A body that did not fit in the budget, that did not come in time, or
+  // whose client closed the request is not a miss and not an error. Count
+  // it, so that Sentry shows it.
+  const result = (error as { aborted?: boolean }).aborted
+    ? "aborted"
+    : status === 503
+      ? "busy"
+      : status === 408
+        ? "timeout"
+        : undefined;
   if (result) {
     target.telemetry.annotate({ "roach.result": result });
     target.telemetry.count("roach.request", 1, {
@@ -754,7 +779,7 @@ export async function listenProxy(
   const sockets = new Set<Socket>();
 
   // Requests inside a CONNECT tunnel. The tunnel gives the origin.
-  const tunnelServer = http.createServer((incoming, outgoing) => {
+  const tunnelServer = http.createServer(HTTP_OPTIONS, (incoming, outgoing) => {
     const tunnel = tunnels.get(incoming.socket);
     if (!tunnel) {
       outgoing.writeHead(400).end();
@@ -762,7 +787,7 @@ export async function listenProxy(
     }
     serveProxied(tunnel, incoming, outgoing, tunnel.origin);
   });
-  const server = http.createServer((incoming, outgoing) => {
+  const server = http.createServer(HTTP_OPTIONS, (incoming, outgoing) => {
     // A request to the proxy itself has a path. A proxied plain HTTP
     // request has an absolute URL.
     if (!incoming.url?.startsWith("/")) {
@@ -878,6 +903,14 @@ export async function listenProxy(
     },
   );
 
+  // Node checks `headersTimeout` and `requestTimeout` only after the
+  // `listening` event of a server. The tunnel server, and `server` with
+  // `proxyProtocol`, get their connections from another server and never
+  // listen. So send the event to them. This relies on Node internals
+  // (`setupConnectionsTracking` in `lib/_http_server.js`), and the test
+  // "times out slow headers" fails when Node changes them.
+  tunnelServer.emit("listening");
+  if (listener !== server) server.emit("listening");
   await new Promise<void>((resolve, reject) => {
     listener.once("error", reject);
     listener.listen(options.port, options.host, () => resolve());

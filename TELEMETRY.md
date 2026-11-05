@@ -55,6 +55,9 @@ For metrics, use `-f dataset=tracemetrics`,
   The run goes on, and the client can send the request again.
 - **Timeout**: the body of a run without the token did not come in 30 s,
   and the proxy answered HTTP 408.
+- **Aborted**: the client closed its connection before the body of its
+  request came. The proxy sent the request nowhere. It is not an error,
+  so Sentry gets no event.
 - **Dropped**: a live response was recorded, but its session failed, so the
   recording was not written. The next run sends the request live again.
 
@@ -102,7 +105,7 @@ counts are estimates (see [Sampling](#sampling)).
 
 Cached and uncached requests by rule. The hit rate of a rule is
 `replayed / (replayed + live + missed)`. Do not count `passthrough`,
-`refused`, `busy`, or `timeout`.
+`refused`, `busy`, `timeout`, or `aborted`.
 
 ```bash
 sentry explore sentry/roach --dataset metrics --metric roach.request --agg sum \

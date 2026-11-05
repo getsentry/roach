@@ -606,11 +606,11 @@ attribute of Roach starts with `roach.`. Metrics have only attributes with
 few values: `roach.tenant`, `roach.mode`, `roach.rule`, `roach.origin`,
 `roach.result`, and `roach.reason`.
 
-| Metric                   | Type              | Value                                                                                                                                                                                                                                                                                                                                                                                |
-| ------------------------ | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `roach.request`          | counter           | 1 for each proxied request. `roach.result` is `replayed`, `live`, `missed`, `passthrough`, `refused`, `busy` (HTTP 503: the body did not fit in the budget), or `timeout` (HTTP 408: the body did not come in time). A `passthrough`, `refused`, `busy`, or `timeout` request has no `roach.rule`. A `refused` request has `roach.reason`, and `other` for an origin not in `allow`. |
-| `roach.request.duration` | distribution (ms) | The time to answer a request that a rule records, by `roach.result`.                                                                                                                                                                                                                                                                                                                 |
-| `roach.recording.write`  | counter           | Recordings by `roach.rule`. `roach.result` is `written` (the proxy sent them to the store) or `dropped` (their session failed).                                                                                                                                                                                                                                                      |
+| Metric                   | Type              | Value                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| ------------------------ | ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `roach.request`          | counter           | 1 for each proxied request. `roach.result` is `replayed`, `live`, `missed`, `passthrough`, `refused`, `busy` (HTTP 503: the body did not fit in the budget), `timeout` (HTTP 408: the body did not come in time), or `aborted` (the client closed the request before its body came). A `passthrough`, `refused`, `busy`, `timeout`, or `aborted` request has no `roach.rule`. A `refused` request has `roach.reason`, and `other` for an origin not in `allow`. |
+| `roach.request.duration` | distribution (ms) | The time to answer a request that a rule records, by `roach.result`.                                                                                                                                                                                                                                                                                                                                                                                            |
+| `roach.recording.write`  | counter           | Recordings by `roach.rule`. `roach.result` is `written` (the proxy sent them to the store) or `dropped` (their session failed).                                                                                                                                                                                                                                                                                                                                 |
 
 Each proxied request is one trace. Each span has `roach.tenant`,
 `roach.mode`, `roach.run.id` (the `name` of the run, else its id), and the
@@ -698,7 +698,7 @@ To see how well the cache works:
   run without the token. A control API body over 1 MiB gets HTTP 413
   before the service parses it.
 - The requests of all runs without the token can hold 128 MiB of bodies
-  at one time, and the runs of one client 32 MiB. The client of a run is
+  at one time, and the runs of one client 16 MiB. The client of a run is
   the client that started it, grouped as for the limit of runs. A request
   holds its body until it finishes, also while its key waits for the key
   worker. A request whose body does not fit gets HTTP 503 with
@@ -714,6 +714,9 @@ To see how well the cache works:
   2.0 GB.
 - Keys and the redaction of misses have time limits. See
   [Changing values](#changing-values).
+- Request headers that do not come in 10 s get HTTP 408, and a request
+  whose body does not come in 300 s too. This is also true in a tunnel
+  and with `proxyProtocol`.
 - A `CONNECT` tunnel that sends no byte for 10 s after the `200` closes. A
   tunnel that sends and gets no byte for 10 minutes closes.
 - The credentials that a run learns and the values that the sessions of
@@ -722,13 +725,8 @@ To see how well the cache works:
 - A gap: a client with an IPv6 /48 has 65,536 /64s, so it can open runs
   until the service has 100 runs without a token. Then other clients get
   HTTP 429 until its runs end. Its runs can also hold all of the budget of
-  bodies, for 30 s at a time.
-- A gap: Node times out the headers and the body of a request only on a
-  server that listens. The servers of tunnels, and the HTTP server with
-  `proxyProtocol`, get their connections from another server. So a
-  request of a run with the token, and a control API call with
-  `proxyProtocol`, have no time limit for their headers and body. A
-  tunnel closes only after 10 minutes without a byte.
+  bodies. A body gets HTTP 408 after 30 s, but the client can start the
+  next one at once, so it holds the budget for as long as it sends.
 - GCS deletes each recording 30 days after it was written, also when runs
   still replay it. Then `auto` mode records it again, and `replay` mode
   fails the request with HTTP 412.

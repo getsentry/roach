@@ -47,6 +47,38 @@ const runs: RemoteRoach[] = [];
 const hash = (token: string) =>
   createHash("sha256").update(token).digest("hex");
 
+/**
+ * Open a `CONNECT` tunnel to the upstream through the service at
+ * `serviceUrl`, with the credentials of the proxy URL of a run. Returns
+ * the socket after the `200`.
+ */
+async function openTunnel(serviceUrl: string, runUrl: string) {
+  const { username, password } = new URL(runUrl);
+  const authority = new URL(origin).host;
+  const socket = connect(Number(new URL(serviceUrl).port), "127.0.0.1");
+  onTestFinished(() => {
+    socket.destroy();
+  });
+  await once(socket, "connect");
+  const credentials = Buffer.from(
+    `${decodeURIComponent(username)}:${decodeURIComponent(password)}`,
+  ).toString("base64");
+  socket.write(
+    `CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\nProxy-Authorization: Basic ${credentials}\r\n\r\n`,
+  );
+  const [reply] = (await once(socket, "data")) as [Buffer];
+  expect(reply.toString()).toMatch(/^HTTP\/1.1 200/);
+  return socket;
+}
+
+/** All that a socket gets until it closes. */
+async function readUntilClose(socket: ReturnType<typeof connect>) {
+  const chunks: Buffer[] = [];
+  socket.on("data", (chunk: Buffer) => chunks.push(chunk));
+  await once(socket, "close");
+  return Buffer.concat(chunks).toString();
+}
+
 /** A body that sends one byte and then nothing. */
 function stalledBody(): Readable {
   const body = new Readable({ read() {} });
@@ -83,22 +115,8 @@ async function startBody(
   declared: number,
   sent: number,
 ) {
-  const { hostname, port } = new URL(proxy);
-  const { username, password } = new URL(run.url);
+  const socket = await openTunnel(proxy, run.url);
   const authority = new URL(origin).host;
-  const socket = connect(Number(port), hostname);
-  onTestFinished(() => {
-    socket.destroy();
-  });
-  await once(socket, "connect");
-  const credentials = Buffer.from(
-    `${decodeURIComponent(username)}:${decodeURIComponent(password)}`,
-  ).toString("base64");
-  socket.write(
-    `CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\nProxy-Authorization: Basic ${credentials}\r\n\r\n`,
-  );
-  const [established] = (await once(socket, "data")) as [Buffer];
-  expect(established.toString()).toMatch(/^HTTP\/1.1 200/);
   const chunks: Buffer[] = [];
   socket.on("data", (chunk: Buffer) => chunks.push(chunk));
   socket.on("error", () => socket.destroy());
@@ -788,11 +806,11 @@ describe("limits of the service", () => {
         },
       ],
     });
-    // 7 bodies of 4 MiB fit in the 32 MiB that the runs of one client can
+    // 3 bodies of 4 MiB fit in the 16 MiB that the runs of one client can
     // hold.
     const prompt = "a".repeat(4 * 1024 * 1024);
     const sent = Promise.allSettled(
-      Array.from({ length: 7 }, () => send(run.url, { prompt })),
+      Array.from({ length: 3 }, () => send(run.url, { prompt })),
     );
     const waits = await caWaitsUntil(sent);
     // The keys are made in a worker, so the service answers at once.
@@ -843,7 +861,7 @@ describe("limits of the service", () => {
     const results = await Promise.all(
       Array.from({ length: 12 }, () => send(reader.url, { prompt })),
     );
-    // The runs of one client can hold 32 MiB, 2 of these bodies. The bytes
+    // The runs of one client can hold 16 MiB, 1 of these bodies. The bytes
     // count when they come, so parts of more bodies can fill it.
     const busy = results.filter((result) => result.status === 503);
     expect(busy.length).toBeGreaterThanOrEqual(4);
@@ -854,10 +872,7 @@ describe("limits of the service", () => {
     }
     // The run goes on, and the bodies gave their bytes back.
     await expect(reader.stats()).resolves.toBeDefined();
-    const again = await Promise.all(
-      Array.from({ length: 2 }, () => send(reader.url, { prompt })),
-    );
-    expect(again.map((result) => result.status)).toEqual([412, 412]);
+    expect((await send(reader.url, { prompt })).status).toBe(412);
 
     // A client that declares large bodies and then stops holds only the
     // bytes that it sent.
@@ -924,12 +939,12 @@ describe("limits of the service", () => {
     await realWait(500);
     const small = 700 * 1024;
     expect(await answer(local.url, other, small)).toBe(412);
-    // The runs of the attacker can hold only 32 MiB, 2 of the bodies.
+    // The runs of the attacker can hold only 16 MiB, 1 of the bodies.
     await until(
-      () => stalls.filter(({ status }) => status() === 503).length >= 6,
+      () => stalls.filter(({ status }) => status() === 503).length >= 7,
     );
     const holders = stalls.filter(({ status }) => status() === 0);
-    expect(holders.length).toBeLessThanOrEqual(2);
+    expect(holders.length).toBeLessThanOrEqual(1);
 
     // A body that does not come in 30 s gets HTTP 408, and its tunnel
     // closes. Then the attacker has its part again.
@@ -1379,6 +1394,84 @@ describe("limits of the service", () => {
       ]),
     ).resolves.toBe("closed");
   });
+  it("times out slow headers, also with proxyProtocol and in a tunnel", async () => {
+    // With `proxyProtocol`, the HTTP servers get their connections from a
+    // TCP server, and Node did not check their time limits.
+    const local = await startRoachService({
+      directory,
+      privateNetworks: true,
+      writeTokenHash: hash("write-token"),
+      proxyProtocol: true,
+    });
+    onTestFinished(() => local.close());
+    const started = await rawRequest(
+      local.url,
+      "203.0.113.1",
+      "POST",
+      "/__roach/runs",
+      {
+        tenant: "acme/alpha",
+        mode: "replay",
+        allow: [origin],
+        rules: [{ name: "model", match: {} }],
+      },
+    );
+    const run = JSON.parse(started.body) as RemoteRun;
+    const direct = connect(Number(new URL(local.url).port), "127.0.0.1");
+    await once(direct, "connect");
+    const tunnel = await openTunnel(local.url, run.url);
+    const begin = performance.now();
+    direct.write(
+      "PROXY TCP4 203.0.113.1 10.0.0.2 51234 443\r\nGET / HTTP/1.1\r\nhost: roach\r\n",
+    );
+    tunnel.write("POST /v1/messages HTTP/1.1\r\nhost: upstream\r\n");
+    // The headers never end. Node answers 408 after 10 s.
+    const replies = await Promise.all(
+      [direct, tunnel].map((socket) =>
+        Promise.race([
+          readUntilClose(socket),
+          new Promise((resolve) => setTimeout(() => resolve("open"), 15_000)),
+        ]),
+      ),
+    );
+    for (const reply of replies) expect(reply).toMatch(/^HTTP\/1.1 408 /);
+    expect(performance.now() - begin).toBeGreaterThan(9000);
+  });
+
+  it("does not send a request to Sentry when its client closes it", async () => {
+    const run = await startRun(undefined, "replay");
+    const log = vi.spyOn(process.stderr, "write");
+    onTestFinished(() => log.mockRestore());
+    const tunnel = await openTunnel(service.url, run.url);
+    tunnel.write(
+      "POST /v1/messages HTTP/1.1\r\nhost: upstream\r\ncontent-length: 1000\r\n\r\n{",
+    );
+    // Let the proxy start to read the body, then close the connection.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    tunnel.destroy();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(log.mock.calls.map(([text]) => String(text)).join("")).not.toMatch(
+      /Request failed/,
+    );
+    // The run goes on.
+    expect((await send(run.url, { prompt: "hi" })).status).toBe(412);
+
+    // A closed request gives its bytes of the budget back. Without that,
+    // 2 bodies of 15 MiB fill the part of the client.
+    for (let n = 0; n < 2; n += 1) {
+      const size = 15 * 1024 * 1024;
+      const { socket } = await startBody(service.url, run, size + 1, size);
+      await until(() => socket.writableLength === 0);
+      await realWait(300);
+      socket.destroy();
+      await realWait(300);
+    }
+    expect(await answer(service.url, run, 3 * 1024 * 1024)).toBe(412);
+    expect(log.mock.calls.map(([text]) => String(text)).join("")).not.toMatch(
+      /Request failed/,
+    );
+  });
+
   it("limits the runs without a token of each client", async () => {
     // Behind the load balancer, each connection starts with a PROXY
     // header. It gives the address of the client.

@@ -173,10 +173,10 @@ const PUBLIC_BODY_BUDGET_BYTES = 128 * 1024 * 1024;
 /**
  * The part of `PUBLIC_BODY_BUDGET_BYTES` that the runs of one client
  * (`clientGroup()` of the client that started the run) can hold, so that
- * one client cannot take all of it. It is 2 bodies of 16 MiB, or about 50
- * of the largest model requests.
+ * one client cannot take all of it. It takes 8 clients to fill the budget.
+ * It is 1 body of 16 MiB, or about 25 of the largest model requests.
  */
-const PUBLIC_BODY_CLIENT_BYTES = 32 * 1024 * 1024;
+const PUBLIC_BODY_CLIENT_BYTES = 16 * 1024 * 1024;
 /**
  * A body of a run without a token that does not come in this time gets
  * HTTP 408, and gives its bytes back. So a client that sends a byte now
