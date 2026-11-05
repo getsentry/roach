@@ -441,8 +441,8 @@ describe("deployed roach", () => {
     expect(miss.response.status).toBe(412);
     expect(miss.exitCode).toBe(1);
     expect(miss.summary).toMatch(/^- test: model\/[0-9a-f]{64}\.json$/m);
-    // A run without the token does not see what changed, because that
-    // shows a part of the recorded request.
+    // A run without the token does not see what changed in its summary,
+    // because that shows a part of the recorded request. Sentry gets it.
     expect(miss.summary).not.toContain("Changed at character");
     expect(miss.summary).not.toContain(String.raw`\"prompt\":\"hi\"`);
     expect(liveRequests).toBe(1);
@@ -482,10 +482,10 @@ describe("deployed roach", () => {
     ]);
 
     // Only the spans of Roach: 4 for each run, 2 for the live request, and
-    // 2 for request samples: one write, and one read for the first miss of
-    // the run with the token.
+    // 3 for request samples: one write, and one read for the first miss of
+    // each run that misses.
     const ops = spans.map(({ attributes }) => attributes["sentry.op"]);
-    expect(ops).toHaveLength(16);
+    expect(ops).toHaveLength(17);
     expect(new Set(ops)).toEqual(
       new Set([
         "roach.run.start",
@@ -527,12 +527,22 @@ describe("deployed roach", () => {
     expect(span("roach.request", "miss-1")).not.toHaveProperty(
       "gen_ai.operation.name",
     );
-    // The first miss of the run with the token looked for a request sample,
-    // and found none. The run without the token did not look.
+    // The first miss of each run looks for a request sample. The writer
+    // found none. The run without the token found the writer's, and Sentry
+    // gets the redacted change, which its summary does not show.
     expect(span("roach.request", "writer-1")).toMatchObject({
       "miss.sample": "none",
     });
-    expect(span("roach.request", "miss-1")).not.toHaveProperty("miss.sample");
+    expect(span("roach.request", "writer-1")).not.toHaveProperty(
+      "miss.changed_at",
+    );
+    expect(span("roach.request", "miss-1")).toMatchObject({
+      "miss.sample": "found",
+      "miss.changed_at": expect.any(Number),
+      "miss.compared": relativeKey,
+      "miss.recorded": expect.stringContaining(String.raw`"prompt":"hi"}`),
+      "miss.request": expect.stringContaining(String.raw`"prompt":"bye"}`),
+    });
     expect(span("roach.key", "writer-1")).toMatchObject({ key: relativeKey });
     expect(span("roach.store.read", "writer-1")).toMatchObject({
       key: relativeKey,
@@ -551,15 +561,10 @@ describe("deployed roach", () => {
       written: 1,
     });
 
-    // Sentry gets no credential, no path, and no body, and the upstream
-    // gets no trace headers.
-    for (const secret of [
-      TOKEN,
-      GCS_TOKEN,
-      "/v1/messages",
-      "/__roach/",
-      "prompt",
-    ]) {
+    // Sentry gets no credential and no path, and the upstream gets no
+    // trace headers. The change of the miss starts in the body, so its 40
+    // characters before do not reach the path.
+    for (const secret of [TOKEN, GCS_TOKEN, "/v1/messages", "/__roach/"]) {
       expect(envelopes.join("\n")).not.toContain(secret);
     }
     for (const headers of upstreamHeaders) {

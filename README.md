@@ -310,10 +310,12 @@ what changed (`misses.ts`):
   and the number of requests of the rule that the session sent before
   it. So a sample is the last recorded request at the same place of the
   same test. A replay writes no sample.
-- Only runs with the write token get the change of a miss. A run without
-  the token, such as CI of a fork, gets no change in its stats or its
-  report. Reads are public, so a change would let anyone read back the
-  requests of a tenant.
+- Only runs with the write token get the change of a miss in their stats
+  and report. A run without the token, such as CI of a fork, gets no
+  change there. Reads are public, so a change would let anyone read back
+  the requests of a tenant. Sentry gets the change of every run, with or
+  without the token. So find the change of a fork in Sentry (see
+  [Sentry](#sentry)).
 - At the first miss of a session, the proxy reads the sample of the place
   of the request. It shows the first character that is not the same, with
   40 characters before it, and at most 120 characters from it. This is
@@ -420,7 +422,7 @@ Values that changed in real projects:
   anyone who can make its request. Do not record responses that must stay
   private. Only runs with the write token get the change of a miss, which
   shows a part of a recorded request (see [Misses](#misses)). So CI of a
-  fork does not show it.
+  fork does not show it. Sentry shows it.
 - **Runs.** Each run has its own id, token, mode, rules, sessions, and
   stats. A proxied request names its run in `Proxy-Authorization`, as
   `Basic base64(<id>:<token>)`. The proxy URL of the run has them, so
@@ -463,15 +465,17 @@ Each proxied request is one trace. Each span has `tenant`, `mode`, and
   `origin`, `rule`, `result`, and `http.response.status_code`. When a
   replayed or live response has token usage, the span also has the
   `gen_ai` attributes of the model call (`usage.ts`). Sentry then
-  calculates its cost in USD as `gen_ai.cost.total_tokens`. When a run
-  with the write token explains a miss, the span also has `miss.sample`
-  (`found` or `none`). When it finds a change, it has `miss.changed_at`
-  (the offset of the first different character) and `miss.compared` (the
-  key of the recording). It never has the text of the change. It contains:
+  calculates its cost in USD as `gen_ai.cost.total_tokens`. The span of
+  the first miss of a session also has `miss.sample` (`found` or `none`),
+  in every run. When the proxy finds a change, the span also has
+  `miss.changed_at` (the offset of the first different character),
+  `miss.compared` (the key of the recording), and the redacted text of the
+  change: `miss.recorded` and `miss.request`. These are the same texts as
+  in the run report ([Misses](#misses)). It contains:
   - `roach.key`: the key of the request, with `rule` and `key`.
   - `roach.store.read`: a read of a recording, with `key` and `result`:
-    `hit` or `miss`. In a run with the write token, the first miss of a
-    session also reads a request sample. Its `key` starts with `_requests/`.
+    `hit` or `miss`. The first miss of a session also reads a request
+    sample. Its `key` starts with `_requests/`.
   - `roach.upstream`: the live request, with `origin` and
     `http.response.status_code`.
 - `roach.store.write`: a write of recordings, with `recordings` and
@@ -479,9 +483,11 @@ Each proxied request is one trace. Each span has `tenant`, `mode`, and
   own trace. A second span writes the request samples of the same
   recordings.
 
-Telemetry never has a credential, a body, or the path or query of a URL.
-The log and the spans of the service name only the key and the offset of
-a change, not its text.
+Telemetry never has a credential. It has no body and no path or query of
+a URL, except `miss.recorded` and `miss.request`. These have at most 160
+characters of the redacted text of a request, which can include a part of
+its URL, headers, or body. The log of the service names only the key of a
+miss, not its change.
 From a model call, it has only the model name and the token counts.
 So the service turns off the request data and the HTTP spans of the SDK,
 and it adds no trace headers to the requests that it sends.
