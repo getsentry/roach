@@ -430,8 +430,9 @@ characters. A run without the token must use the same patterns as the run
 that recorded, or its keys do not match. Each key has a time limit: 1 s,
 and 0.5 s for each MiB of the body. The built-in patterns take about 60
 to 110 ms for each MiB. A request whose key takes longer fails with HTTP 400.
-So does a JSON body that is nested too deep for the key to read, such as
-thousands of levels of `[`. Such a body never got a key.
+So does a JSON body with arrays or objects nested over 1,000 levels deep.
+The key reads a body with recursion, and a few thousand levels fill its
+call stack.
 
 All runs share one process. Anyone can start a run without the token, so
 the service makes the keys of these runs in a worker process, one key at

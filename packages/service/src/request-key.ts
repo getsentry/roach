@@ -152,6 +152,31 @@ function normalizeJson(
   };
 }
 
+/**
+ * A JSON body nested deeper than this gets HTTP 400. The key walks a body
+ * with recursion, and a few thousand levels fill the call stack. Where
+ * that happens changes from run to run, so the limit is well below it.
+ */
+const MAX_JSON_DEPTH = 1000;
+
+/** Whether `json` has arrays or objects nested deeper than `limit`. */
+function nestedDeeperThan(json: unknown, limit: number): boolean {
+  // A loop, not recursion, so a deep body cannot fill the call stack here.
+  const values = [json];
+  const depths = [0];
+  while (values.length > 0) {
+    const value = values.pop();
+    const depth = depths.pop()!;
+    if (value === null || typeof value !== "object") continue;
+    if (depth >= limit) return true;
+    for (const item of Object.values(value)) {
+      values.push(item);
+      depths.push(depth + 1);
+    }
+  }
+  return false;
+}
+
 const sha256 = (text: string) =>
   createHash("sha256").update(text).digest("hex");
 /**
@@ -160,8 +185,8 @@ const sha256 = (text: string) =>
  * throws an error with HTTP status 400 when it takes longer than
  * `timeLimitMs`, by default `keyTimeLimit()` of the body, when the
  * request has more than `maxValues` changing values, or when its JSON body
- * is nested too deep for the key. The limits never change a key: a request
- * gets its key, or it fails.
+ * is nested deeper than `MAX_JSON_DEPTH`. The limits never change a key:
+ * a request gets its key, or it fails.
  */
 export function keyRequest(
   rule: RecordingRule,
@@ -170,24 +195,9 @@ export function keyRequest(
   timeLimitMs = keyTimeLimit(Buffer.byteLength(request.body)),
   maxValues = Infinity,
 ): KeyedRequest {
-  try {
-    return withTimeLimit(timeLimitMs, () =>
-      keyRequestNow(rule, request, known, maxValues),
-    );
-  } catch (error) {
-    // The key walks a JSON body with recursion, so a body that is nested
-    // very deep, such as 5,000 levels of `[`, fills the call stack. Such a
-    // body never got a key. It is the fault of the client, so it gets HTTP
-    // 400 and does not go to Sentry.
-    const overflow =
-      error instanceof RangeError &&
-      error.message === "Maximum call stack size exceeded";
-    if (!overflow) throw error;
-    throw Object.assign(
-      new Error("the JSON body is nested too deep to make its key"),
-      { status: 400 },
-    );
-  }
+  return withTimeLimit(timeLimitMs, () =>
+    keyRequestNow(rule, request, known, maxValues),
+  );
 }
 
 function keyRequestNow(
@@ -203,6 +213,13 @@ function keyRequestNow(
     ]),
   );
   const json = parseJson(request.body);
+  if (json !== undefined && nestedDeeperThan(json, MAX_JSON_DEPTH)) {
+    // It is the fault of the client, so it does not go to Sentry.
+    throw Object.assign(
+      new Error(`the JSON body is nested over ${MAX_JSON_DEPTH} levels deep`),
+      { status: 400 },
+    );
+  }
   const { text, values } =
     json === undefined
       ? extractValues(request.body, rule.values, known, maxValues)
