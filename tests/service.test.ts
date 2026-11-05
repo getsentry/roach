@@ -231,6 +231,15 @@ describe("roach service", () => {
         rules: [{ name: "../escape", match: {} }],
       }),
     ).rejects.toThrow(/rule name/);
+    for (const url of [[], [42], 42]) {
+      await expect(
+        startRun("write-token", "auto", {
+          rules: [
+            { name: "model", match: { url: url as unknown as string[] } },
+          ],
+        }),
+      ).rejects.toThrow(/match.url of rule model must be a string or a list/);
+    }
     await expect(
       startRun("write-token", "auto", {
         rules: [{ name: "model", match: {}, values: { broken: "(" } }],
