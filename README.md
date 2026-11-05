@@ -131,7 +131,6 @@ directory or the closest parent directory (`src/config.ts`):
 ```json
 {
   "allow": ["https://api.anthropic.com"],
-  "secretEnv": ["ANTHROPIC_API_KEY"],
   "rules": [
     {
       "name": "model",
@@ -148,8 +147,11 @@ directory or the closest parent directory (`src/config.ts`):
 - `allow` and `rules` are those of the run. See [Config](#config).
 - A value is a regular expression source, or `{ "builtin": "<name>" }`
   for a pattern of `VALUE_PATTERNS` in `values.ts`.
-- `secretEnv`: environment variables that hold credentials. Their values
-  are the `secrets` of the run.
+- `secretEnv`: environment variables that hold credentials that no request
+  header has, such as a token that goes to a model in a prompt. Their
+  values are the `secrets` of the run. Do not list API keys that go in a
+  header: the proxy redacts those on its own. See
+  [Config](#config).
 - `tenant`: default `GITHUB_REPOSITORY`. Set it, so local runs use the
   recordings of CI.
 - `noProxy`: hosts that do not use the proxy. Default: loopback.
