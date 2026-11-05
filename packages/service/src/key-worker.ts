@@ -279,14 +279,15 @@ export function keyInWorker(
 
 /**
  * `redactRequestWith()` in the worker, with the time limit of `options`.
- * Past it, the job fails with `timedOut`.
+ * Past it, the job fails with `timedOut`. The value is `undefined` when a
+ * credential field cannot be redacted.
  */
 export function redactInWorker(
   values: string[],
   text: string,
   request: RequestToRedact,
   options: JobOptions,
-): Promise<JobResult<string>> {
+): Promise<JobResult<string | undefined>> {
   return runInWorker(
     { kind: "redact", values, text, request, timeLimitMs: options.timeLimitMs },
     options,

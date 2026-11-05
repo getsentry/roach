@@ -35,7 +35,7 @@ import type { IncomingHttpHeaders } from "node:http";
 import { promisify } from "node:util";
 import { brotliDecompress, gunzip, inflate, zstdDecompress } from "node:zlib";
 import { reportInternal } from "./errors.ts";
-import { firstChange, sampleKey, toSample } from "./misses.ts";
+import { firstChange, sampleKey, toSample, withheldSample } from "./misses.ts";
 import {
   keyInWorker,
   redactInWorker,
@@ -43,7 +43,12 @@ import {
   type JobOptions,
 } from "./key-worker.ts";
 import { keyRequest, keyTimeLimit, type KeyedRequest } from "./request-key.ts";
-import { createSecrets, redactUrl, type LearnLimit } from "./secrets.ts";
+import {
+  createSecrets,
+  redactUrl,
+  toRedact,
+  type LearnLimit,
+} from "./secrets.ts";
 import {
   recordingKey,
   RULE_NAME,
@@ -571,13 +576,16 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
     const places = owner ?? outside;
     if (places.explained) return;
     places.explained = true;
-    const recorded = (await store.read(sample).catch(() => undefined)) as
+    const read = (await store.read(sample).catch(() => undefined)) as
       | RequestSample
       | undefined;
+    const recorded = read?.withheld ? undefined : read;
     // The redacted text has a time limit. Past it, the change is left out.
     const redacted = recorded && (await text());
     const change = redacted && firstChange(recorded, redacted);
-    telemetry.annotate({ "miss.sample": recorded ? "found" : "none" });
+    telemetry.annotate({
+      "miss.sample": read ? (recorded ? "found" : "withheld") : "none",
+    });
     if (!change) return;
     telemetry.annotate({
       "miss.changed_at": change.at,
@@ -722,7 +730,7 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
         if (!workLimit.untrusted) {
           try {
             return withTimeLimit(keyTimeLimit(keyed.text.length), () =>
-              secrets.redactRequest(keyed.text, request),
+              secrets.redactRequest(keyed.text, request, rule),
             );
           } catch {
             return undefined;
@@ -731,11 +739,7 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
         return redactInWorker(
           secrets.list(),
           keyed.text,
-          {
-            href: request.url.href,
-            body: request.body.toString("utf8"),
-            contentType: request.headers["content-type"],
-          },
+          toRedact(request, rule),
           jobOptions(keyed.text.length),
         ).then(
           (result) => {
@@ -855,10 +859,21 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
         } catch (error) {
           return notRecorded("it could not be redacted", error);
         }
+        const text = secrets.redactRequest(keyed.text, request, rule);
+        if (text === undefined) {
+          // A credential field of the request can stay in the text, so the
+          // recorder writes a sample without text.
+          process.stderr.write(
+            `[roach] The ${rule.name} request sample has no text, because a credential field could not be redacted: ${key}\n`,
+          );
+        }
         await record(owner, key, {
           recording: stored,
           samples: [
-            [sample, toSample(key, secrets.redactRequest(keyed.text, request))],
+            [
+              sample,
+              text === undefined ? withheldSample(key) : toSample(key, text),
+            ],
           ],
         });
       }

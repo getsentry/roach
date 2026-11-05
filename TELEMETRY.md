@@ -81,7 +81,7 @@ For metrics, use `-f dataset=tracemetrics`,
 | `roach.write`               | the run has the write token (boolean)      | `roach.run.start`                 |
 | `http.response.status_code` | status to the client                       | `roach.request`, `roach.upstream` |
 | `gen_ai.request.model`      | model of a model call                      | `roach.request`                   |
-| `miss.sample`               | `found` or `none` for a miss               | `roach.request`                   |
+| `miss.sample`               | `found`, `withheld`, or `none` for a miss  | `roach.request`                   |
 | `miss.changed_at`           | offset of the change of a miss             | `roach.request`                   |
 | `miss.compared`             | recording key of a miss change             | `roach.request`                   |
 | `miss.recorded`             | recorded text of a miss change             | `roach.request`                   |
@@ -185,7 +185,9 @@ sentry explore sentry/roach --dataset spans --period 24h \
 Where the requests of misses changed, and what changed. The same
 `miss.changed_at` from run to run shows one value that changes on each
 run. `miss.recorded` and `miss.request` show that value. `miss.sample:none`
-is a miss that has no recorded request to compare with. This works for
+is a miss that has no recorded request to compare with.
+`miss.sample:withheld` is a miss whose recorded request had a credential
+that the proxy could not redact, so its sample has no text. This works for
 runs without the token too, such as CI of a fork. Only Sentry has these
 texts: the run report shows only the offset and the key, because CI logs
 can be public.
