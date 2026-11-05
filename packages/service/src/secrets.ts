@@ -145,7 +145,10 @@ function credentialValues(
   while (pending.length > 0) {
     const value = pending.pop();
     if (value === null || typeof value !== "object") continue;
-    for (const [name, item] of Object.entries(value)) {
+    // `for...in`, not `Object.entries`, so an object with many fields does
+    // not make a list of pairs. A parsed value has only its own fields.
+    for (const name in value) {
+      const item = (value as Record<string, unknown>)[name];
       if (typeof item === "string" && test(name, item)) found.push(item);
       else if (deep) pending.push(item);
     }
@@ -196,8 +199,10 @@ function scanStrings(
         next === BACKSLASH && text.charCodeAt(end + 1) !== LINE_BREAK ? 2 : 1;
     }
     if (text.charCodeAt(end) !== QUOTE) {
-      // Not a string. Go on after the quote.
-      at += 1;
+      // Not a string. Each quote before `end` has a backslash before it, so
+      // no string can start there either. Go on at `end`, so each character
+      // is read once.
+      at = end;
       continue;
     }
     end += 1;
@@ -231,6 +236,20 @@ function replaceStrings(text: string, values: string[]): string {
   return parts.join("");
 }
 
+/** Tells whether a parsed JSON value is an object that is not an array. */
+const isObject = (json: unknown): json is Record<string, unknown> =>
+  json !== null && typeof json === "object" && !Array.isArray(json);
+
+/** Tells whether the field `name` of `json` holds a minted value. */
+const mintedValue = (json: Record<string, unknown>, name: string) => {
+  const value = json[name];
+  return typeof value === "string" && isMinted(name, value);
+};
+
+/** The value of a JSON string token. It parses only a token with escapes. */
+const decodeString = (token: string): string =>
+  token.includes("\\") ? (JSON.parse(token) as string) : token.slice(1, -1);
+
 /**
  * The JSON text of a response body with the value of each minted field of
  * the object at the top replaced (`isMinted`), and those values. It
@@ -242,25 +261,29 @@ function replaceStrings(text: string, values: string[]): string {
 function replaceMinted(text: string): { text: string; minted: string[] } {
   const json = parseJson(text);
   const none = { text, minted: [] };
-  if (json === null || typeof json !== "object" || Array.isArray(json)) {
-    return none;
-  }
-  if (credentialValues(json, isMinted, false).length === 0) return none;
+  if (!isObject(json)) return none;
+  // The fields of the top object that can hold a minted value.
+  const names: string[] = [];
+  for (const name in json) if (mintedName(name)) names.push(name);
+  if (!names.some((name) => mintedValue(json, name))) return none;
   const minted: string[] = [];
   const parts: string[] = [];
   let from = 0;
-  let field: string | undefined;
+  // The place of the last name. It decodes the name only when a string
+  // value comes after it, so many fields with other values cost little.
+  let field: [number, number] | undefined;
   scanStrings(text, (start, end, depth, name) => {
     if (depth !== 1) return;
     if (name) {
-      field = JSON.parse(text.slice(start, end)) as string;
+      field = [start, end];
       return;
     }
-    const of = field;
+    if (field === undefined) return;
+    const of = decodeString(text.slice(...field));
     field = undefined;
-    // Parse only the values of fields that can be minted.
-    if (of === undefined || !mintedName(of)) return;
-    const value = JSON.parse(text.slice(start, end)) as string;
+    // Decode only the values of fields that can be minted.
+    if (!mintedName(of)) return;
+    const value = decodeString(text.slice(start, end));
     if (!isMinted(of, value)) return;
     minted.push(value);
     parts.push(text.slice(from, start), REDACTED_JSON);
@@ -268,7 +291,11 @@ function replaceMinted(text: string): { text: string; minted: string[] } {
   });
   parts.push(text.slice(from));
   const result = parts.join("");
-  if (credentialValues(parseJson(result), isMinted, false).length > 0) {
+  // Parse the result again, and fail when a minted value stays. The pass
+  // replaces only whole strings with strings, so the names of the fields
+  // do not change. Thus only the names from the first parse can hold one.
+  const again = parseJson(result);
+  if (!isObject(again) || names.some((name) => mintedValue(again, name))) {
     throw new Error("a minted credential stayed in the body");
   }
   return { text: result, minted };

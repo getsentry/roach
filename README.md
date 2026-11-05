@@ -280,7 +280,8 @@ A run takes `RunConfig` (`packages/roach/src/types.ts`): `tenant`, `mode`, `rule
   - The proxy does not find these fields in text that is not one JSON
     value, such as the `data:` lines of a stream (`text/event-stream`), or
     JSON that is not valid. It keeps them there. It still redacts each
-    known value in such a body.
+    known value in such a body. When a field name of the top object comes
+    two times, it reads only the last value, as `JSON.parse` does.
     A recording keeps an `application/x-www-form-urlencoded` body as
     text. The `location` header of a recording shows `<<redacted>>` for
     each known value, and for each of these fields in its query and its

@@ -71,10 +71,13 @@ const rule = (): RecordingRule => ({
 });
 
 /** Start a run with the write token. */
-async function start(mode: RecordingMode): Promise<RemoteRoach> {
+async function start(
+  mode: RecordingMode,
+  rules: RecordingRule[] = [rule()],
+): Promise<RemoteRoach> {
   const run = await startRemoteRun(
     { url: service.url, token: TOKEN },
-    { tenant: TENANT, mode, allow: [origin], rules: [rule()] },
+    { tenant: TENANT, mode, allow: [origin], rules },
   );
   runs.push(run);
   return run;
@@ -671,6 +674,24 @@ describe("redaction", () => {
     // `includes`, so a failure does not print 8 MiB.
     expect(text.includes("p".repeat(4096))).toBe(false);
   }, 120_000);
+
+  it("reads a string that does not close only once", async () => {
+    // The pattern takes the quotes from around a long value of escaped
+    // quotes, so in the text of the key that string does not close.
+    const values = { v: String.raw`:"(?=\\)|(?<!\\)"(?=\}$)` };
+    const run = await start("auto", [{ ...rule(), values }]);
+    const body = JSON.stringify({
+      password: "secret-pass-1",
+      v: '"'.repeat(40 * 1024),
+    });
+    const started = performance.now();
+    const live = await send(run, "/v1/fields", body);
+    // About 5.7 s when it reads the rest of the line again at each quote.
+    expect(performance.now() - started).toBeLessThan(1000);
+    expect(live.source).toBe("live");
+    const [sample] = [...(await stored("_requests/api")).values()];
+    expect(sample).not.toContain("secret-pass-1");
+  });
 
   it("does not record a compressed body that decodes to more than 64 MiB", async () => {
     const run = await start("auto");

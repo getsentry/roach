@@ -765,7 +765,7 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
         );
         report("live");
         const headers: IncomingHttpHeaders = {};
-        for (const name of ["content-type", "content-encoding"]) {
+        for (const name of [...RECORDED_HEADERS, "content-encoding"]) {
           if (upstream.headers[name]) headers[name] = upstream.headers[name];
         }
         return { ...upstream, headers, source: "live" as const };
