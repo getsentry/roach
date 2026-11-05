@@ -106,6 +106,12 @@ function callControl<T>(
   });
 }
 
+/**
+ * The first service version that returns the proxy URL of a session. An
+ * older service answers `POST /session` with an empty body.
+ */
+const SESSION_URL_VERSION = "0.2.0";
+
 /** Control a run, for example from a test worker. */
 export function connectRoach({
   controlUrl,
@@ -113,13 +119,19 @@ export function connectRoach({
 }: Pick<RemoteRun, "controlUrl" | "token">): RoachControl {
   return {
     async startSession(name) {
-      const { url } = await callControl<OpenedSession>(
+      const opened = await callControl<OpenedSession | undefined>(
         controlUrl,
         token,
         "POST",
         "session",
         { name },
       );
+      const url = opened?.url;
+      if (typeof url !== "string") {
+        throw new Error(
+          `Roach service at ${new URL(controlUrl).origin} is older than this client: it returned no session URL. Deploy the service at ${SESSION_URL_VERSION} or later.`,
+        );
+      }
       return {
         url,
         end: (passed) =>

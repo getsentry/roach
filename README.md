@@ -560,7 +560,9 @@ The calls of a run are under `/__roach/runs/<id>`. They need
 - `POST /session` with `{"name": "..."}`: open a session. Returns
   `{"url": "..."}`, the proxy URL of the session. Its user is
   `<run id>-<session id>`. An open session with the same name fails
-  first. A run can have 64 open sessions. Another one gets HTTP 429.
+  first. A run can have 64 open sessions. Another one gets HTTP 429. A
+  service before 0.2.0 returns no URL. Then `client.ts` fails and tells
+  you to deploy a newer service.
 - `POST /session/end` with `{"name": "...", "passed": true}`: end it.
   Returns `{"missed": 0}`, the misses that `replay` mode failed. Returns
   HTTP 409 when the session is not open.
