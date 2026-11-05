@@ -37,10 +37,10 @@ import * as Sentry from "@sentry/node";
 import {
   createCertificateAuthority,
   type CertificateAuthorityPem,
-} from "../src/certificates.ts";
-import { createGcsStore } from "../src/gcs.ts";
-import { createRecorder, type Telemetry } from "../src/recorder.ts";
-import { createFileStore } from "../src/recordings.ts";
+} from "./certificates.ts";
+import { createGcsStore } from "./gcs.ts";
+import { createRecorder, type Telemetry } from "./recorder.ts";
+import { createFileStore } from "./recordings.ts";
 import {
   controlRecorder,
   listenProxy,
@@ -50,8 +50,8 @@ import {
   sendJson,
   type ProxyTarget,
   type TargetResult,
-} from "../src/server.ts";
-import { RULE_NAME, type RecordingStore } from "../src/store.ts";
+} from "./server.ts";
+import { RULE_NAME, type RecordingStore } from "./store.ts";
 import {
   CONTROL_PATH,
   type RecordingMode,

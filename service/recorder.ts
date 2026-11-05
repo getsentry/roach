@@ -41,8 +41,12 @@ import type {
   RecordingRule,
   RecordingStats,
   RefusalReason,
-} from "./types.ts";
-import { fillValues, templateValues, type RequestValues } from "./values.ts";
+} from "../src/types.ts";
+import {
+  fillValues,
+  templateValues,
+  type RequestValues,
+} from "../src/values.ts";
 
 /** A request with its whole body. */
 export interface ProxyRequest {

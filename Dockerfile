@@ -10,7 +10,7 @@ COPY service/package.json ./service/
 # package, `@sentry/roach`, has none.
 RUN pnpm install --prod --frozen-lockfile --ignore-scripts \
       --filter @sentry/roach-service
-# The service imports the proxy code in src/ by relative path.
+# The service imports the shared types and values in src/ by relative path.
 COPY src ./src
 COPY service/*.ts ./service/
 USER node

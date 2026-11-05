@@ -8,13 +8,7 @@
     "url": "git+https://github.com/getsentry/roach.git"
   },
   "files": [
-    "src/client.ts",
-    "src/config.ts",
-    "src/report.ts",
-    "src/types.ts",
-    "src/values.ts",
-    "src/vitest-setup.ts",
-    "src/vitest.ts"
+    "src"
   ],
   "type": "module",
   "exports": {

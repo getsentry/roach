@@ -19,7 +19,7 @@ import {
 import { startRemoteRun, type RemoteRoach } from "../src/client.ts";
 import { describeRecordingStats } from "../src/report.ts";
 import { startRoachService, type RoachService } from "../service/service.ts";
-import { keyRequest } from "../src/request-key.ts";
+import { keyRequest } from "../service/request-key.ts";
 import type { RecordingMode, RecordingRule } from "../src/types.ts";
 import { VALUE_PATTERNS } from "../src/values.ts";
 

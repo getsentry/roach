@@ -30,7 +30,7 @@ import {
 } from "./addresses.ts";
 import type { CertificateAuthority } from "./certificates.ts";
 import type { ProxyRequest, Recorder, Telemetry } from "./recorder.ts";
-import type { OpenedSession } from "./types.ts";
+import type { OpenedSession } from "../src/types.ts";
 
 /** Headers for one connection, which the proxy must not forward. */
 const HOP_HEADERS = new Set([

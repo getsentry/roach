@@ -1,12 +1,12 @@
 /**
- * The shape of the npm tarball of `@sentry/roach`.
+ * The shape of the npm package `@sentry/roach`. It ships `src/`.
  *
- * The `files` list in `package.json` must be the same as the files that the
- * package exports load. A missing file breaks an import of the package. An
- * extra file ships service code (the proxy, the recorder, the stores) that the
- * client does not use.
+ * The package exports and the action must load only files in `src/`, and
+ * each file in `src/` must be one that they load. Service code (the proxy,
+ * the recorder, the stores) goes in `service/`, which the package does not
+ * ship.
  */
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 
@@ -29,17 +29,18 @@ async function importGraph(entries: string[]): Promise<Set<string>> {
 }
 
 describe("npm package", () => {
-  it("ships exactly the files that its exports load", async () => {
+  it("ships in src/ only the files that its exports and the action load", async () => {
     const manifest = JSON.parse(
       await readFile(path.join(ROOT, "package.json"), "utf8"),
-    ) as {
-      exports: Record<string, string>;
-      files: string[];
-    };
-    const entries = Object.values(manifest.exports).map((entry) =>
-      path.posix.normalize(entry),
+    ) as { exports: Record<string, string>; files: string[] };
+    expect(manifest.files).toEqual(["src"]);
+    const entries = [...Object.values(manifest.exports), "src/action.ts"].map(
+      (entry) => path.posix.normalize(entry),
     );
     const graph = await importGraph(entries);
-    expect(manifest.files.toSorted()).toEqual([...graph].toSorted());
+    const shipped = (await readdir(path.join(ROOT, "src"))).map(
+      (file) => `src/${file}`,
+    );
+    expect([...graph].toSorted()).toEqual(shipped.toSorted());
   });
 });

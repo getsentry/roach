@@ -14,14 +14,14 @@
 import { createHash } from "node:crypto";
 import type { IncomingHttpHeaders } from "node:http";
 import { THINKING_BLOCK_TYPES } from "./streams.ts";
-import type { RecordingRule } from "./types.ts";
+import type { RecordingRule } from "../src/types.ts";
 import {
   extractValues,
   type KnownValues,
   type RequestValues,
   type ValuePatterns,
   withTimeLimit,
-} from "./values.ts";
+} from "../src/values.ts";
 
 /** Change this to make every recording a miss. */
 const KEY_VERSION = "http-v1";

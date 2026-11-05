@@ -642,31 +642,18 @@ pnpm check   # format, lint, types, unused code, and tests, as CI runs them
 
 ## Files
 
-The npm package `@sentry/roach` is the root of the repository. Its sources
-are in `src/`. The service is the private package in `service/`. It imports
-the proxy code from `src/` and is the only package that depends on
-`@sentry/node`. Tests are in `tests/`. The production setup is in
+The npm package `@sentry/roach` is the root of the repository. It ships
+`src/`: the client, the vitest integration, and the action. They have no
+runtime dependencies. The service and the proxy are the private package in
+`service/`. It imports the shared types and values from `src/`, and it is the
+only package that depends on `@sentry/node`. Code in `src/` never imports
+from `service/`. Tests are in `tests/`. The production setup is in
 `deploy/gcp/` and `Dockerfile`.
 
-The npm tarball has only the files in `src/` that the package exports load.
-The `files` list in `package.json` sets them. `tests/package.test.ts` fails
-when this list and the imports of the exports do not agree. The other files
-in `src/` are for the service and the action.
+In `src/`:
 
 - `types.ts`: rules, modes, runs, sessions, and the results of a run.
-- `server.ts`: sockets, HTTPS interception, the allow list, and the control
-  API.
-- `addresses.ts`: the public addresses that the proxy can send requests to.
-- `recorder.ts`: modes, sessions, replay, and misses.
-- `request-key.ts`: the key of a request.
-- `store.ts`: the recording format and the store contract.
-- `recordings.ts`: the file store, for tests and development.
-- `gcs.ts`: the GCS store.
 - `values.ts`: changing values and their placeholders.
-- `streams.ts`: merges the deltas of a recorded model stream.
-- `usage.ts`: the token usage of a model response, for Sentry.
-- `secrets.ts`: redaction of credentials.
-- `certificates.ts`: the certificate authority for HTTPS.
 - `client.ts`: starts a run and calls the control API.
 - `config.ts`: `roach.json`, for the action and vitest.
 - `vitest.ts`: the vitest global setup: one run for each invocation.
@@ -678,3 +665,15 @@ In `service/`:
 
 - `service.ts`: the shared service: tenants, runs, access, and metrics.
 - `cli.ts`: the command line, which the image runs.
+- `server.ts`: sockets, HTTPS interception, the allow list, and the control
+  API.
+- `addresses.ts`: the public addresses that the proxy can send requests to.
+- `recorder.ts`: modes, sessions, replay, and misses.
+- `request-key.ts`: the key of a request.
+- `store.ts`: the recording format and the store contract.
+- `recordings.ts`: the file store, for tests and development.
+- `gcs.ts`: the GCS store.
+- `streams.ts`: merges the deltas of a recorded model stream.
+- `usage.ts`: the token usage of a model response, for Sentry.
+- `secrets.ts`: redaction of credentials.
+- `certificates.ts`: the certificate authority for HTTPS.
