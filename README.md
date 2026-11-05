@@ -760,12 +760,12 @@ To see how well the cache works:
 - Request headers that do not come in 10 s get HTTP 408, and a request
   whose body does not come in 300 s too. This is also true in a tunnel
   and with `proxyProtocol`.
-- A `CONNECT` tunnel that sends no byte for 10 s after the `200` closes. A
-  tunnel that sends and gets no byte for 10 minutes while a request waits
-  for its response closes. Between two requests, a tunnel closes after
-  6 s without a new request (the `keepAliveTimeout` of Node, 5 s, and 1 s
-  that Node adds), and the client opens a new one. The 10-minute limit
-  holds for each request of a tunnel, with or without TLS.
+- A `CONNECT` tunnel that sends no byte for 10 s after the `200` closes.
+- A connection or tunnel that sends and gets no byte for 10 minutes
+  closes, also while a request waits for its response. This is true for
+  each request, with or without TLS. Between two requests, a connection
+  closes after 6 s without a new request (the `keepAliveTimeout` of Node,
+  5 s, and 1 s that Node adds), and the client opens a new one.
 - The credentials that a run learns and the values that the sessions of
   a run without the token remember have limits. See [Config](#config) and
   [Changing values](#changing-values).

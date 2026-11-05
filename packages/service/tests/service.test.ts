@@ -1450,37 +1450,58 @@ describe("limits of the service", () => {
       ]),
     ).resolves.toBe("closed");
   });
-  it("keeps the idle limit of a tunnel without TLS after its first request", async () => {
-    // Between two requests, Node sets the time limit of a socket to its
-    // keep-alive time, and at the next request to the `timeout` of the
-    // server. Before, that was 0, so a later request had no idle limit.
-    const run = await startRun(undefined, "replay");
-    const tunnel = await openTunnel(service.url, run.url);
-    // The service has its end of the tunnel in a socket of the same class.
-    const socketClass = Object.getPrototypeOf(tunnel) as typeof tunnel;
-    const setTimeoutSpy = vi.spyOn(socketClass, "setTimeout");
-    onTestFinished(() => setTimeoutSpy.mockRestore());
-    const port = Number(new URL(service.url).port);
-    /** The time limits that the service set on its end of the tunnel. */
-    const limits = () =>
-      setTimeoutSpy.mock.calls.flatMap(([ms], n) => {
-        const socket = setTimeoutSpy.mock.contexts[n] as typeof tunnel;
-        const ours =
-          socket.localPort === port && socket.remotePort === tunnel.localPort;
-        return ours ? [ms] : [];
-      });
-    const post = `POST /v1/messages HTTP/1.1\r\nhost: ${new URL(origin).host}\r\ncontent-length: 2\r\n\r\n`;
-    tunnel.write(`${post}{}`);
-    const [first] = (await once(tunnel, "data")) as [Buffer];
-    expect(first.toString()).toMatch(/^HTTP\/1.1 412 /);
-    // Node waits 5 s and 1 s more for the next request.
-    await until(() => limits().at(-1) === 6000);
-    const before = limits().length;
-    // A second request whose body does not come.
-    tunnel.write(`${post}{`);
-    await until(() => limits().length > before);
-    expect(limits().at(-1)).toBe(10 * 60 * 1000);
-  });
+  it.each(["a tunnel without TLS", "an absolute-form connection"])(
+    "keeps the idle limit of %s after its first request",
+    async (kind) => {
+      // Between two requests, Node sets the time limit of a socket to its
+      // keep-alive time, and at the next request to the `timeout` of the
+      // server. Before, that was 0, so a later request had no idle limit,
+      // also after Node read all of it (`requestTimeout` stops there).
+      const run = await startRun(undefined, "replay");
+      const host = new URL(origin).host;
+      let socket: ReturnType<typeof connect>;
+      let post: string;
+      if (kind === "a tunnel without TLS") {
+        socket = await openTunnel(service.url, run.url);
+        post = `POST /v1/messages HTTP/1.1\r\nhost: ${host}\r\ncontent-length: 2\r\n\r\n`;
+      } else {
+        const { username, password } = new URL(run.url);
+        const credentials = Buffer.from(
+          `${decodeURIComponent(username)}:${decodeURIComponent(password)}`,
+        ).toString("base64");
+        socket = connect(Number(new URL(service.url).port), "127.0.0.1");
+        onTestFinished(() => {
+          socket.destroy();
+        });
+        await once(socket, "connect");
+        post = `POST ${origin}/v1/messages HTTP/1.1\r\nhost: ${host}\r\nproxy-authorization: Basic ${credentials}\r\ncontent-length: 2\r\n\r\n`;
+      }
+      // The service has its end of the connection in a socket of the same
+      // class.
+      const socketClass = Object.getPrototypeOf(socket) as typeof socket;
+      const setTimeoutSpy = vi.spyOn(socketClass, "setTimeout");
+      onTestFinished(() => setTimeoutSpy.mockRestore());
+      const port = Number(new URL(service.url).port);
+      /** The time limits that the service set on its end of the connection. */
+      const limits = () =>
+        setTimeoutSpy.mock.calls.flatMap(([ms], n) => {
+          const peer = setTimeoutSpy.mock.contexts[n] as typeof socket;
+          const ours =
+            peer.localPort === port && peer.remotePort === socket.localPort;
+          return ours ? [ms] : [];
+        });
+      socket.write(`${post}{}`);
+      const [first] = (await once(socket, "data")) as [Buffer];
+      expect(first.toString()).toMatch(/^HTTP\/1.1 412 /);
+      // Node waits 5 s and 1 s more for the next request.
+      await until(() => limits().at(-1) === 6000);
+      const before = limits().length;
+      // A second request whose body does not come.
+      socket.write(`${post}{`);
+      await until(() => limits().length > before);
+      expect(limits().at(-1)).toBe(10 * 60 * 1000);
+    },
+  );
 
   it("times out slow headers, also with proxyProtocol and in a tunnel", async () => {
     // With `proxyProtocol`, the HTTP servers get their connections from a
