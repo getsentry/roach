@@ -12,7 +12,8 @@ GCS bucket, which deletes each one 30 days after it was written. See
 [Service](#service) and [Deploy](#deploy).
 
 Roach started in
-[`getsentry/junior`](https://github.com/getsentry/junior/tree/main/packages/junior-evals/src/roach).
+the evals of
+[`getsentry/junior`](https://github.com/getsentry/junior/tree/main/packages/junior-evals).
 It uses Node built-ins and the `openssl` command. Only the service uses the
 Sentry SDK (`@sentry/node`).
 
@@ -51,6 +52,13 @@ A project that has its own global setup calls `startRoach(project)` from
 - It needs Node 24.14 or later (`http.setGlobalProxyFromEnv`).
 - The tests of one file share one process, so they run one at a time. Do
   not use `test.concurrent`.
+- The setup file sets a new global `fetch` dispatcher for each test. A
+  dispatcher that you set before, such as one with `compose()` interceptors,
+  does not apply in the test. Set it again in a `beforeEach` of a setup
+  file that comes after `@sentry/roach/vitest/setup` in `setupFiles`, with
+  `sequence.setupFiles: "list"`. Restore it with `onTestFinished`.
+- A client that gives `fetch` its own undici dispatcher, such as
+  `@vercel/sandbox`, does not use the proxy. Its requests go direct.
 - The package has TypeScript sources. Vitest compiles them, but Node does
   not strip types in `node_modules`, so plain Node scripts cannot import it.
 
