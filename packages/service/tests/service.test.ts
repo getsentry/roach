@@ -12,6 +12,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 import { ProxyAgent, request } from "undici";
 import {
   afterEach,
@@ -45,6 +46,13 @@ const runs: RemoteRoach[] = [];
 
 const hash = (token: string) =>
   createHash("sha256").update(token).digest("hex");
+
+/** A body that sends one byte and then nothing. */
+function stalledBody(): Readable {
+  const body = new Readable({ read() {} });
+  body.push("{");
+  return body;
+}
 
 /** The heap that this process uses, in bytes. */
 const heap = () => process.memoryUsage().heapUsed;
@@ -98,6 +106,7 @@ async function send(
     status: response.statusCode,
     body: await response.body.text(),
     source: response.headers["x-roach"],
+    retryAfter: response.headers["retry-after"],
   };
 }
 
@@ -753,6 +762,51 @@ describe("limits of the service", () => {
     // A run with the token has no limit.
     const writer = await startRun("write-token", "auto", { rules });
     expect((await send(writer.url, { prompt })).status).toBe(200);
+  });
+
+  it("answers 503 when the bodies of runs without a token fill the budget", async () => {
+    // Each request holds its body until its key is done. Before the budget,
+    // 30 parallel bodies of 16 MiB took about 1.9 GB.
+    const reader = await startRun(undefined, "replay");
+    const prompt = "a".repeat(16 * 1024 * 1024 - 64);
+    const results = await Promise.all(
+      Array.from({ length: 12 }, () => send(reader.url, { prompt })),
+    );
+    // The budget holds 128 MiB, 8 of these bodies. The bytes count when
+    // they come, so parts of more bodies can fill it.
+    const busy = results.filter((result) => result.status === 503);
+    expect(busy.length).toBeGreaterThanOrEqual(4);
+    for (const result of results) expect([412, 503]).toContain(result.status);
+    for (const result of busy) {
+      expect(result.body).toMatch(/too many large requests/);
+      expect(result.retryAfter).toBe("1");
+    }
+    // The run goes on, and the bodies gave their bytes back.
+    await expect(reader.stats()).resolves.toBeDefined();
+    const again = await Promise.all(
+      Array.from({ length: 4 }, () => send(reader.url, { prompt })),
+    );
+    expect(again.map((result) => result.status)).toEqual([412, 412, 412, 412]);
+
+    // A client that declares large bodies and then stops holds only the
+    // bytes that it sent.
+    const stalled = new AbortController();
+    const stalls = Array.from({ length: 9 }, () => {
+      const agent = new ProxyAgent({ uri: reader.url, proxyTunnel: true });
+      agents.push(agent);
+      return request(`${origin}/v1/messages`, {
+        method: "POST",
+        dispatcher: agent,
+        headers: { "content-length": String(16 * 1024 * 1024 - 64) },
+        body: stalledBody(),
+        signal: stalled.signal,
+      }).catch(() => undefined);
+    });
+    // Give the stalled requests the time to reach the service.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect((await send(reader.url, { prompt })).status).toBe(412);
+    stalled.abort();
+    await Promise.all(stalls);
   });
 
   it("fails a request with millions of values before it fills the memory", async () => {

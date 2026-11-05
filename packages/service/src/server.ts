@@ -164,13 +164,53 @@ function authorityOf(origin: URL): string {
 }
 
 /**
- * Read a whole body. A body over `maxBytes` fails with HTTP 413. Only
+ * The bytes of request bodies that the requests of many targets can hold
+ * at one time (`ProxyTarget.bodyBudget`). `used` counts the bodies of the
+ * requests that did not finish.
+ */
+export interface BodyBudget {
+  max: number;
+  used: number;
+}
+
+/** The bytes that one request holds of its `BodyBudget`. */
+interface Held {
+  budget: BodyBudget | undefined;
+  bytes: number;
+}
+
+/** Hold `bytes` more of the budget. Returns `false` when they do not fit. */
+function hold(held: Held, bytes: number): boolean {
+  const { budget } = held;
+  if (!budget) return true;
+  if (budget.used + bytes > budget.max) return false;
+  budget.used += bytes;
+  held.bytes += bytes;
+  return true;
+}
+
+/** Give back all bytes that a request holds. */
+function release(held: Held): void {
+  if (held.budget) held.budget.used -= held.bytes;
+  held.bytes = 0;
+}
+
+const busyError = () =>
+  httpError(
+    503,
+    "the service has too many large requests at this time. Send the request again later.",
+  );
+
+/**
+ * Read a whole body. A body over `maxBytes` fails with HTTP 413. A body
+ * that does not fit in the budget of `held` fails with HTTP 503. Only
  * request bodies have a limit: the client sends them, and a large upstream
  * response is not the fault of the client.
  */
 function readBody(
   stream: http.IncomingMessage,
   maxBytes = Infinity,
+  held: Held = { budget: undefined, bytes: 0 },
 ): Promise<Buffer> {
   const declared = Number(stream.headers["content-length"]);
   if (declared > maxBytes) {
@@ -178,15 +218,26 @@ function readBody(
     stream.resume();
     return Promise.reject(httpError(413, `body is over ${maxBytes} bytes`));
   }
+  // Hold the bytes when they come, not the declared length. So a client
+  // that declares a large body and then sends nothing holds nothing.
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
+    let failed = false;
     stream.on("data", (chunk: Buffer) => {
+      if (failed) return;
       size += chunk.length;
-      if (size > maxBytes) {
-        // Read the rest without keeping it, so the client gets the 413.
+      const error =
+        size > maxBytes
+          ? httpError(413, `body is over ${maxBytes} bytes`)
+          : !hold(held, chunk.length)
+            ? busyError()
+            : undefined;
+      if (error) {
+        // Read the rest without keeping it, so the client gets the error.
+        failed = true;
         chunks.length = 0;
-        reject(httpError(413, `body is over ${maxBytes} bytes`));
+        reject(error);
         return;
       }
       chunks.push(chunk);
@@ -292,6 +343,7 @@ async function proxyRequest(
   incoming: http.IncomingMessage,
   outgoing: http.ServerResponse,
   tunnelOrigin: string | undefined,
+  held: Held,
 ): Promise<void> {
   const url = new URL(
     tunnelOrigin ? `${tunnelOrigin}${incoming.url}` : (incoming.url ?? ""),
@@ -308,7 +360,7 @@ async function proxyRequest(
     method: incoming.method ?? "GET",
     url,
     headers: incoming.headers,
-    body: await readBody(incoming, maxBodyBytes),
+    body: await readBody(incoming, maxBodyBytes, held),
   };
   const rule = recorder.ruleFor(request);
 
@@ -432,6 +484,12 @@ export interface ProxyTarget {
   closed?: boolean;
   /** A request body over this size gets HTTP 413. Default: 64 MiB. */
   maxBodyBytes?: number;
+  /**
+   * The budget that the request bodies of this target take from, until
+   * each request finishes. A body that does not fit gets HTTP 503, and the
+   * run goes on. Targets can share one budget.
+   */
+  bodyBudget?: BodyBudget;
   /** The time of the last proxied request, from `Date.now()`. */
   lastUsed?: number;
   /** Gets a span for each proxied request. */
@@ -568,11 +626,21 @@ function serveProxied(
         attributes: { "roach.origin": origin, "http.request.method": method },
       },
       async () => {
+        const held: Held = { budget: target.bodyBudget, bytes: 0 };
         try {
-          await proxyRequest(target, session, incoming, outgoing, tunnelOrigin);
+          await proxyRequest(
+            target,
+            session,
+            incoming,
+            outgoing,
+            tunnelOrigin,
+            held,
+          );
         } catch (error) {
           // In the span, so that the Sentry event is in the trace.
           answerError(target, origin, error, outgoing);
+        } finally {
+          release(held);
         }
         telemetry.annotate({
           "http.response.status_code": outgoing.statusCode,
@@ -598,7 +666,11 @@ function answerError(
       ? reportInternal("Request", error, target.telemetry.capture(error))
       : (error as Error).message;
   if (!outgoing.headersSent) {
-    outgoing.writeHead(status ?? 502, { "content-type": "text/plain" });
+    outgoing.writeHead(status ?? 502, {
+      "content-type": "text/plain",
+      // Clients of model APIs send a 503 again, after this time in s.
+      ...(status === 503 ? { "retry-after": "1" } : {}),
+    });
   }
   outgoing.end(`Roach error: ${text}\n`);
 }

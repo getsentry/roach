@@ -697,6 +697,12 @@ To see how well the cache works:
 - A proxied request body over 64 MiB gets HTTP 413, and over 16 MiB for a
   run without the token. A control API body over 1 MiB gets HTTP 413
   before the service parses it.
+- The requests of all runs without the token can hold 128 MiB of bodies
+  at one time. A request holds its body until it finishes, also while its
+  key waits for the key worker. A request whose body does not fit gets
+  HTTP 503 with `Retry-After: 1`, and the run goes on. The clients of
+  model APIs send a 503 again. A client that does not gets the 503, and
+  its test fails. Runs with the token have no such limit.
 - Keys and the redaction of misses have time limits. See
   [Changing values](#changing-values).
 - A `CONNECT` tunnel that sends no byte for 10 s after the `200` closes. A
@@ -826,9 +832,11 @@ turn on the PROXY header, apply in this order. Run the commands in
    terraform apply -var-file=roach.tfvars
    ```
 
-No step fails requests. From step 3 to step 4, the service sees the
-addresses of the load balancer, so all clients share the limit of runs
-for each client.
+No step fails requests with HTTP 400. But step 1 and step 3 each reset
+the VM, and a reset ends the open runs, so their CI jobs fail (see
+[Deploy](#deploy)). Do step 3 when few runs are open. From step 3 to
+step 4, the service sees the addresses of the load balancer, so all
+clients share the limit of runs for each client.
 
 The load balancer writes its header before the first byte of the client,
 so a client cannot put its own header first. A client can send its own

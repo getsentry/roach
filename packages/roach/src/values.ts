@@ -213,9 +213,11 @@ export function extractValues(
 
 /**
  * Whether `value` can be in `known` or in a template (`templateValues()`).
- * V8 does not run a pattern with a literal of over 32,767 characters on a
- * text that can hold it. Such a value in `known` would fail each later
- * request of its session that could repeat it, so to leave it out changes
+ * V8 cannot run a pattern with a literal of over 32,767 characters on
+ * any text, also on a text of 5 characters. (A literal with a character
+ * over U+00FF fails only on a text with such a character, and only such a
+ * text can hold it.) Such a value in `known` failed each later request of
+ * its session, so those requests had no key, and to leave it out changes
  * no key.
  */
 export const canBeKnown = (value: string): boolean => value.length <= 32_767;
