@@ -6,6 +6,7 @@
  */
 import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
+import { gzipSync } from "node:zlib";
 import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -21,6 +22,11 @@ const TOKEN = "write-token";
 const TENANT = "acme/alpha";
 const API_KEY = "sk-live-request-key-456";
 const MINTED = "minted-access-token-0123456789";
+const TOOL_PASSWORD = "tool-input-password-123";
+const GITHUB_TOKEN = "ghs_0123456789abcdefghijABCDEFGHIJ012345";
+const JWT = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhcHAifQ.c2lnbmF0dXJl";
+const SLACK_TOKEN = "xoxb-123-456-abcdef";
+const FRAGMENT_TOKEN = "fragtok";
 /** Bytes that are not valid UTF-8, around the echo of the API key. */
 const BINARY_HEAD = Buffer.from([0x00, 0xff, 0xfe, 0x80]);
 const BINARY_TAIL = Buffer.from([0xc3, 0x28, 0x00, 0x01]);
@@ -83,6 +89,35 @@ async function stored(dir: string): Promise<Map<string, string>> {
   );
 }
 
+/**
+ * Two turns of a model that calls a tool. The second request repeats the
+ * tool call of the first response. Returns where each response came from.
+ */
+async function toolLoop(run: RemoteRoach) {
+  const user = { role: "user", content: "log in" };
+  const first = await send(
+    run,
+    "/v1/tools",
+    JSON.stringify({ messages: [user] }),
+  );
+  const reply = JSON.parse(first.body.toString()) as { content: unknown };
+  const second = await send(
+    run,
+    "/v1/tools",
+    JSON.stringify({
+      messages: [
+        user,
+        { role: "assistant", content: reply.content },
+        {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "toolu_1" }],
+        },
+      ],
+    }),
+  );
+  return [first.source, second.source];
+}
+
 /** The one recording of the rule. */
 async function onlyRecording(): Promise<{ text: string; file: Recording }> {
   const files = [...(await stored("api")).values()];
@@ -126,6 +161,67 @@ beforeEach(async () => {
           "content-type": "application/x-www-form-urlencoded",
         });
         outgoing.end(`access_token=${MINTED}&scope=repo&token_type=bearer`);
+      } else if (pathname === "/v1/tools") {
+        // A model that calls a tool with a password, then answers.
+        const { messages } = JSON.parse(Buffer.concat(chunks).toString()) as {
+          messages: unknown[];
+        };
+        outgoing.writeHead(200, { "content-type": "application/json" });
+        outgoing.end(
+          JSON.stringify(
+            messages.length === 1
+              ? {
+                  role: "assistant",
+                  content: [
+                    {
+                      type: "tool_use",
+                      id: "toolu_1",
+                      name: "login",
+                      input: { user: "me", password: TOOL_PASSWORD },
+                    },
+                  ],
+                }
+              : { role: "assistant", content: [{ type: "text", text: "in" }] },
+          ),
+        );
+      } else if (pathname === "/v1/app-token") {
+        // A GitHub App installation token, and log probabilities.
+        outgoing.writeHead(200, { "content-type": "application/json" });
+        outgoing.end(
+          JSON.stringify({
+            token: GITHUB_TOKEN,
+            expires_at: "2026-01-01T00:00:00Z",
+            jwt: { token: JWT },
+            slack: { token: SLACK_TOKEN },
+            logprobs: [{ token: "Hello", logprob: -0.1 }, { token: "a" }],
+          }),
+        );
+      } else if (pathname === "/v1/untyped") {
+        // JSON without a content type, so the recording keeps it as base64.
+        outgoing.end(
+          JSON.stringify({
+            access_token: MINTED,
+            redirect: `https://app.test/cb#access_token=${FRAGMENT_TOKEN}&expires_in=60`,
+          }),
+        );
+      } else if (pathname === "/v1/redirect") {
+        outgoing.writeHead(302, {
+          location: `/cb?state=s&code_key=abc#access_token=${FRAGMENT_TOKEN}&expires_in=60`,
+        });
+        outgoing.end();
+      } else if (pathname === "/v1/gzip") {
+        // The proxy asks for `identity`, but this upstream compresses.
+        outgoing.writeHead(200, {
+          "content-type": "application/json",
+          "content-encoding": "gzip",
+        });
+        outgoing.end(gzipSync(JSON.stringify({ access_token: MINTED })));
+      } else if (pathname === "/v1/bad-gzip") {
+        outgoing.writeHead(200, {
+          "content-type": "application/json",
+          "content-encoding": "gzip",
+        });
+        outgoing.end(`{"access_token":"${MINTED}"}`);
       } else if (pathname === "/v1/note") {
         // A later response that shows the minted token in plain text.
         outgoing.writeHead(200, { "content-type": "text/plain" });
@@ -273,6 +369,98 @@ describe("redaction", () => {
         expect(sample).not.toContain(secret);
       }
     }
+  });
+
+  it("keeps a credential field of a model response, so the next turn replays", async () => {
+    // The next request of the model repeats the input of the tool call. A
+    // redacted input there would change its key, so it would miss on
+    // replay.
+    await expect(toolLoop(await start("auto"))).resolves.toEqual([
+      "live",
+      "live",
+    ]);
+    const replay = await start("replay");
+    await expect(toolLoop(replay)).resolves.toEqual(["replayed", "replayed"]);
+    expect((await replay.stats()).misses).toEqual([]);
+    // The request samples do not show the password. No key uses them.
+    for (const sample of (await stored("_requests/api")).values()) {
+      expect(sample).not.toContain(TOOL_PASSWORD);
+    }
+  });
+
+  it("redacts a bare token field only when its value has a credential prefix", async () => {
+    const run = await start("auto");
+    const live = await send(run, "/v1/app-token", "{}");
+    expect(JSON.parse(live.body.toString())).toMatchObject({
+      token: GITHUB_TOKEN,
+    });
+
+    const { text } = await onlyRecording();
+    for (const secret of [GITHUB_TOKEN, JWT, SLACK_TOKEN]) {
+      expect(text).not.toContain(secret);
+    }
+    const replay = await start("replay");
+    const replayed = await send(replay, "/v1/app-token", "{}");
+    expect(JSON.parse(replayed.body.toString())).toEqual({
+      token: "<<redacted>>",
+      expires_at: "2026-01-01T00:00:00Z",
+      jwt: { token: "<<redacted>>" },
+      slack: { token: "<<redacted>>" },
+      // Text tokens of a model do not change.
+      logprobs: [{ token: "Hello", logprob: -0.1 }, { token: "a" }],
+    });
+  });
+
+  it("redacts a minted credential in a JSON body without a JSON content type", async () => {
+    const run = await start("auto");
+    const live = await send(run, "/v1/untyped", "{}");
+    expect(JSON.parse(live.body.toString())).toMatchObject({
+      access_token: MINTED,
+    });
+    const { file } = await onlyRecording();
+    expect(file.response.bodyEncoding).toBe("base64");
+    expect(
+      JSON.parse(Buffer.from(file.response.body, "base64").toString()),
+    ).toEqual({
+      access_token: "<<redacted>>",
+      redirect: "https://app.test/cb#access_token=<<redacted>>&expires_in=60",
+    });
+  });
+
+  it("redacts the credential parameters of a stored location header", async () => {
+    const run = await start("auto");
+    await send(run, "/v1/redirect", "{}");
+    const { file } = await onlyRecording();
+    // A relative URL stays relative.
+    expect(file.response.headers.location).toBe(
+      "/cb?state=s&code_key=<<redacted>>#access_token=<<redacted>>&expires_in=60",
+    );
+  });
+
+  it("decodes a compressed response before it redacts and records it", async () => {
+    const run = await start("auto");
+    const live = await send(run, "/v1/gzip", "{}");
+    expect(JSON.parse(live.body.toString())).toEqual({ access_token: MINTED });
+    const { text, file } = await onlyRecording();
+    expect(text).not.toContain(MINTED);
+    expect(file.response).toMatchObject({
+      bodyEncoding: "utf8",
+      body: '{"access_token":"<<redacted>>"}',
+    });
+    const replay = await start("replay");
+    const replayed = await send(replay, "/v1/gzip", "{}");
+    expect(JSON.parse(replayed.body.toString())).toEqual({
+      access_token: "<<redacted>>",
+    });
+
+    // A body that does not decode is not recorded. The client gets it as
+    // it came.
+    const bad = await send(run, "/v1/bad-gzip", "{}");
+    expect(bad).toEqual({
+      body: Buffer.from(`{"access_token":"${MINTED}"}`),
+      source: "live",
+    });
+    expect((await stored("api")).size).toBe(1);
   });
 
   it("keeps the keys of requests with credentials", async () => {

@@ -22,15 +22,17 @@
  * always gets the change and its text. Only a run with the write token gets
  * the change in its stats, and never its text.
  *
- * The recorder never writes a known credential (`secrets.ts`). It redacts
- * a body that is not text as bytes, before it encodes it. It also redacts
- * the credentials that the upstream mints, such as `access_token` in a
- * response body. The live client gets these, so the run can use them. A
- * replay gives `<<redacted>>` in their place. The recorder reports spans
+ * The recorder never writes a known credential (`secrets.ts`). It decodes
+ * a compressed body first, and it redacts a body that is not text as
+ * bytes, before it encodes it. It also redacts the credentials that the
+ * upstream mints, such as `access_token` in a response body. The live
+ * client gets these, so the run can use them. A replay gives
+ * `<<redacted>>` in their place. The recorder reports spans
  * and metrics through the `Telemetry` hooks of `service.ts`.
  */
 import { randomBytes } from "node:crypto";
 import type { IncomingHttpHeaders } from "node:http";
+import { brotliDecompressSync, gunzipSync, inflateSync } from "node:zlib";
 import { firstChange, sampleKey, toSample } from "./misses.ts";
 import { keyRequest, type KeyedRequest } from "./request-key.ts";
 import { createSecrets, redactUrl } from "./secrets.ts";
@@ -156,6 +158,49 @@ const TEXT_CONTENT_TYPE = /^text\/|json|xml|x-www-form-urlencoded/i;
 /** Response headers that a recording keeps. Other headers change each run. */
 const RECORDED_HEADERS = ["content-type", "location"];
 const NULL_BODY_STATUSES = new Set([101, 204, 205, 304]);
+/** The largest body that the recorder decodes from a content encoding. */
+const MAX_DECODED_BYTES = 256 * 1024 * 1024;
+/** Decoders of the content encodings that the recorder can read. */
+const DECODERS: Record<
+  string,
+  (body: Buffer, options: { maxOutputLength: number }) => Buffer
+> = {
+  gzip: gunzipSync,
+  "x-gzip": gunzipSync,
+  deflate: inflateSync,
+  br: brotliDecompressSync,
+};
+
+/**
+ * The body of a response without its content encoding. The proxy asks for
+ * `identity`, but an upstream can encode the body all the same, and the
+ * recorder must decode it to find credentials in it. An empty body, such
+ * as of a 304, stays empty. Throws when it does not know an encoding, or
+ * when the body is not valid.
+ */
+function decodeBody({ headers, body }: ProxyResponse): Buffer {
+  if (body.length === 0) return body;
+  const encodings = (headers["content-encoding"] ?? "")
+    .split(",")
+    .map((encoding) => encoding.trim().toLowerCase())
+    .filter((encoding) => encoding !== "" && encoding !== "identity");
+  return encodings.reduceRight((bytes, encoding) => {
+    const decoder = DECODERS[encoding];
+    if (!decoder) throw new Error(`unknown content encoding ${encoding}`);
+    return decoder(bytes, { maxOutputLength: MAX_DECODED_BYTES });
+  }, body);
+}
+
+/** The text of `body` when it is valid UTF-8 JSON, or `undefined`. */
+function jsonText(body: Buffer): string | undefined {
+  try {
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(body);
+    JSON.parse(text);
+    return text;
+  } catch {
+    return undefined;
+  }
+}
 
 /** Statuses that are never recorded, because they are temporary. */
 const isTemporaryStatus = (status: number) => status === 429 || status >= 500;
@@ -208,7 +253,7 @@ function toRecording(
   }
   return {
     session,
-    request: { method: request.method, url: redactUrl(request.url) },
+    request: { method: request.method, url: redactUrl(request.url.href) },
     response: { status: response.status, headers, body, bodyEncoding },
   };
 }
@@ -256,6 +301,38 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
     [...sessions.values()].filter((s) => s.passed === undefined);
   const { telemetry } = config;
   const secrets = createSecrets(config.secrets);
+  /**
+   * A recording as the store keeps it. Only the stored recording loses the
+   * credentials that the upstream minted (`secrets.redactFields`), because
+   * the client needs them for its next live requests. A body that is not
+   * text gets this too when it is UTF-8 JSON, whatever its content type
+   * says. The `location` header loses the values of its credential
+   * parameters. The minted values are known from then on, so the recording
+   * is redacted again.
+   */
+  const toStored = (recording: Recording): Recording => {
+    const { response } = recording;
+    const headers = { ...response.headers };
+    if (headers.location) headers.location = redactUrl(headers.location);
+    let { body } = response;
+    if (response.bodyEncoding === "utf8") {
+      body = secrets.redactFields(body);
+    } else {
+      const text = jsonText(Buffer.from(body, "base64"));
+      if (text !== undefined) {
+        const redacted = Buffer.from(secrets.redactFields(text));
+        body = secrets.redactBytes(redacted).toString("base64");
+      }
+    }
+    return JSON.parse(
+      secrets.redact(
+        JSON.stringify({
+          ...recording,
+          response: { ...response, headers, body },
+        }),
+      ),
+    ) as Recording;
+  };
   const refused: NonNullable<RecordingStats["refused"]> = {};
   const stats: RecordingStats = {
     counts: Object.fromEntries(
@@ -509,7 +586,7 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
         }
       }
 
-      const live = await telemetry.span(
+      const upstream = await telemetry.span(
         {
           op: "roach.upstream",
           name: `${request.method} ${origin}`,
@@ -524,32 +601,34 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
       // Count it only when it went out. A refused address counts as
       // refused (`server.ts`).
       counts.live += 1;
+      let live: ProxyResponse;
+      try {
+        live = { ...upstream, body: decodeBody(upstream) };
+      } catch (error) {
+        // The recorder cannot find credentials in a body that it cannot
+        // read, so it does not record it. The client gets it as it came.
+        process.stderr.write(
+          `[roach] The ${rule.name} response was not recorded, because its body could not be decoded (${(error as Error).message}): ${key}\n`,
+        );
+        report("live");
+        const headers: IncomingHttpHeaders = {};
+        for (const name of ["content-type", "content-encoding"]) {
+          if (upstream.headers[name]) headers[name] = upstream.headers[name];
+        }
+        return { ...upstream, headers, source: "live" };
+      }
       // The client gets the known credentials redacted too, so a live run
       // and a replay give the same body.
-      const redact = (from: Recording) =>
-        JSON.parse(secrets.redact(JSON.stringify(from))) as Recording;
-      const recording = redact(
-        toRecording(request, keyed, owner?.name, live, (body) =>
-          secrets.redactBytes(body),
+      const recording = JSON.parse(
+        secrets.redact(
+          JSON.stringify(
+            toRecording(request, keyed, owner?.name, live, secrets.redactBytes),
+          ),
         ),
-      );
+      ) as Recording;
       if (!isTemporaryStatus(recording.response.status)) {
-        // Only the stored recording loses the credentials that the upstream
-        // minted. The client needs them for its next live requests. Their
-        // values are known from now on, so redact the recording again.
-        const { response } = recording;
-        const stored =
-          response.bodyEncoding === "utf8"
-            ? redact({
-                ...recording,
-                response: {
-                  ...response,
-                  body: secrets.redactFields(response.body),
-                },
-              })
-            : recording;
         await record(owner, key, {
-          recording: stored,
+          recording: toStored(recording),
           samples: [[sample, toSample(key, redactedText())]],
         });
       }
