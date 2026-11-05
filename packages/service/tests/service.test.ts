@@ -32,7 +32,7 @@ import {
 import { describeRecordingMisses } from "@sentry/roach/report";
 import { keyInWorker } from "../src/key-worker.ts";
 import { keyRequest } from "../src/request-key.ts";
-import { clientGroup } from "../src/server.ts";
+import { clientGroup } from "../src/clients.ts";
 import { startRoachService, type RoachService } from "../src/service.ts";
 import type { RemoteRun, RunConfig } from "@sentry/roach/types";
 import { VALUE_PATTERNS } from "@sentry/roach/values";

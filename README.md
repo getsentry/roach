@@ -761,7 +761,11 @@ To see how well the cache works:
   whose body does not come in 300 s too. This is also true in a tunnel
   and with `proxyProtocol`.
 - A `CONNECT` tunnel that sends no byte for 10 s after the `200` closes. A
-  tunnel that sends and gets no byte for 10 minutes closes.
+  tunnel that sends and gets no byte for 10 minutes while a request waits
+  for its response closes. Between two requests, a tunnel closes after
+  about 5 s without a new request (the `keepAliveTimeout` of Node), and
+  the client opens a new one. A gap: in a tunnel without TLS, Node removes
+  the 10-minute limit after the first request.
 - The credentials that a run learns and the values that the sessions of
   a run without the token remember have limits. See [Config](#config) and
   [Changing values](#changing-values).
@@ -1040,9 +1044,16 @@ In `packages/service/src/`:
 - `cli.ts`: the command line, which the image runs.
 - `server.ts`: sockets, HTTPS interception, the allow list, and the control
   API.
+- `bodies.ts`: request bodies, their size limits, and the budget that the
+  bodies of runs without the token share.
+- `clients.ts`: the PROXY protocol header and the address of a client.
+- `run-config.ts`: the check of the run config of a client, with its
+  limits.
 - `errors.ts`: the log line and the client text of an unexpected error.
 - `addresses.ts`: the public addresses that the proxy can send requests to.
 - `recorder.ts`: modes, sessions, replay, and misses.
+- `recording-file.ts`: a recording file from a live response, the response
+  of a replay, and the decoding of compressed bodies.
 - `request-key.ts`: the key of a request.
 - `key-worker.ts`: the worker process that makes the keys of runs without
   the token and redacts the text of their misses, with a time limit and a
@@ -1055,4 +1066,6 @@ In `packages/service/src/`:
 - `streams.ts`: merges the deltas of a recorded model stream.
 - `usage.ts`: the token usage of a model response, for Sentry.
 - `secrets.ts`: redaction of credentials.
+- `json-strings.ts`: the one-pass scan of the JSON strings of a body, for
+  `secrets.ts`.
 - `certificates.ts`: the certificate authority for HTTPS.
