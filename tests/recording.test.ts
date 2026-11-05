@@ -26,7 +26,8 @@ import {
 import { startRemoteRun, type RemoteRoach } from "../src/client.ts";
 import { startRoachService, type RoachService } from "../service/service.ts";
 import { describeRecordingMisses } from "../src/report.ts";
-import type { RecordingMode } from "../src/types.ts";
+import { keyRequest } from "../src/request-key.ts";
+import type { RecordingMode, RecordingRule } from "../src/types.ts";
 import { VALUE_PATTERNS } from "../src/values.ts";
 
 const TOKEN = "write-token";
@@ -44,9 +45,13 @@ let service: RoachService;
 const runs: RemoteRoach[] = [];
 let agent: ProxyAgent | undefined;
 
-/** Start a run with the write token. Later requests go through it. */
+/**
+ * Start a run with the write token. Later requests go through it. `url` is
+ * `match.url` of its rule.
+ */
 async function start(
   mode: RecordingMode,
+  url: string | string[] = `${origin}/v1/`,
   secrets: string[] = [],
 ): Promise<RemoteRoach> {
   const run = await startRemoteRun(
@@ -59,7 +64,7 @@ async function start(
       rules: [
         {
           name: "model",
-          match: { method: "POST", url: `${origin}/v1/` },
+          match: { method: "POST", url },
           values: {
             uuid: VALUE_PATTERNS.uuid,
             time: VALUE_PATTERNS.isoTime,
@@ -312,7 +317,7 @@ describe("recording", () => {
       model: "m",
       messages: [`Token ${secret}.`, `Finding ${finding} is new.`],
     });
-    const recording = await start("auto", [secret]);
+    const recording = await start("auto", `${origin}/v1/`, [secret]);
     await session(recording, [{ model: "first" }, requestBody("ABC-123")]);
     await recording.close();
     const samples = path.join(directory, TENANT, "_requests", "model");
@@ -323,7 +328,7 @@ describe("recording", () => {
       expect(text).not.toContain(secret);
     }
 
-    const running = await start("replay", [secret]);
+    const running = await start("replay", `${origin}/v1/`, [secret]);
     const replay = await session(running, [
       { model: "first" },
       requestBody("XYZ-789"),
@@ -493,6 +498,59 @@ describe("recording", () => {
       written: 2,
       discarded: 1,
     });
+  });
+
+  it("keeps the keys of a rule when its url becomes a list", async () => {
+    // Recordings are keyed by a hash of the rule name and the request
+    // (`request-key.ts`). A rule with one url gives the same key as on
+    // 0.2.0, and a list with that url gives the same keys too.
+    const rule: RecordingRule = {
+      name: "model",
+      match: { method: "POST", url: "https://api.anthropic.com/v1/" },
+      keyHeaders: ["anthropic-version"],
+      values: { uuid: VALUE_PATTERNS.uuid },
+    };
+    const keyOf = (match: RecordingRule["match"]) =>
+      keyRequest(
+        { ...rule, match },
+        {
+          method: "POST",
+          url: "https://api.anthropic.com/v1/messages",
+          headers: { "anthropic-version": "2023-06-01" },
+          body: JSON.stringify({
+            model: "m",
+            id: "0b6f5c1e-3f7a-4d6e-9a54-1c2b3d4e5f60",
+            prompt: "hi",
+          }),
+        },
+      ).key;
+    // The key of this request and rule on 0.2.0.
+    const before =
+      "05971aff5d3bd6afbb86028db646a20eb60b26e0f21b85e46d3a339b8aaa5d10";
+    expect(keyOf(rule.match)).toBe(before);
+    expect(
+      keyOf({
+        method: "POST",
+        url: ["https://openrouter.ai/api/v1/", "https://api.anthropic.com/v1/"],
+      }),
+    ).toBe(before);
+
+    // Through the proxy: a run with a list replays what a run with one url
+    // recorded, and a URL outside the list goes through.
+    await session(await start("auto"), [{ model: "m" }]);
+    const recorded = await files();
+    const listed = await start("replay", [
+      "https://other.test/",
+      `${origin}/v1/`,
+    ]);
+    expect([...(await session(listed, [{ model: "m" }]))]).toEqual([
+      { body: "data: 1\n\n", source: "replayed" },
+    ]);
+    await expect(files()).resolves.toEqual(recorded);
+    const narrow = await start("auto", [`${origin}/v2/`]);
+    expect([...(await session(narrow, [{ model: "m" }]))]).toEqual([
+      { body: "data: 2\n\n", source: "passthrough" },
+    ]);
   });
 
   it("records again in record mode", async () => {

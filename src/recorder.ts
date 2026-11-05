@@ -142,7 +142,10 @@ function matches(
   { method, url, headers }: ProxyRequest,
 ): boolean {
   if (match.method && match.method !== method) return false;
-  if (match.url && !url.href.startsWith(match.url)) return false;
+  const prefixes = typeof match.url === "string" ? [match.url] : match.url;
+  if (prefixes && !prefixes.some((prefix) => url.href.startsWith(prefix))) {
+    return false;
+  }
   return Object.entries(match.headers ?? {}).every(
     ([name, value]) => headers[name] === value,
   );

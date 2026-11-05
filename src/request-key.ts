@@ -1,10 +1,11 @@
 /**
  * The key of a recorded request.
  *
- * The key is the hash of the rule, the method, the URL, the key headers,
- * and the body. A JSON body has sorted object keys, so key order does not
- * matter. Each changing value of the rule is `<<name>>` in the key
- * (`values.ts`).
+ * The key is the hash of the rule name, the method, the URL, the key
+ * headers, and the body. It does not use `match` of the rule, so a change
+ * to its URL prefixes keeps the keys. A JSON body has sorted object keys,
+ * so key order does not matter. Each changing value of the rule is
+ * `<<name>>` in the key (`values.ts`).
  *
  * The patterns of `values` come from the client, and all runs share one
  * process. A slow pattern would block every run, so a key has a time limit

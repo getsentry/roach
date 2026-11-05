@@ -4,7 +4,14 @@ import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { ProxyAgent, request } from "undici";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  onTestFinished,
+} from "vitest";
 import {
   connectRoach,
   startRemoteRun,
@@ -270,6 +277,15 @@ describe("roach service", () => {
         rules: [{ name: "../escape", match: {} }],
       }),
     ).rejects.toThrow(/rule name/);
+    for (const url of [[], [42], 42]) {
+      await expect(
+        startRun("write-token", "auto", {
+          rules: [
+            { name: "model", match: { url: url as unknown as string[] } },
+          ],
+        }),
+      ).rejects.toThrow(/match.url of rule model must be a string or a list/);
+    }
     await expect(
       startRun("write-token", "auto", {
         rules: [{ name: "model", match: {}, values: { broken: "(" } }],
@@ -434,6 +450,30 @@ describe("roach service", () => {
     expect(text).not.toContain("sk-live-request-key-456");
     expect(text).not.toContain("service-secret-value-123");
     expect(text).not.toContain("run-secret-value-789");
+  });
+
+  it("names an old service when it returns no session URL", async () => {
+    // A service before 0.2.0 answers `POST /session` with 204 and no body.
+    const old = createServer((incoming, outgoing) => {
+      incoming.resume();
+      outgoing.writeHead(204).end();
+    });
+    await new Promise<void>((resolve) => old.listen(0, "127.0.0.1", resolve));
+    onTestFinished(
+      () => new Promise<void>((resolve) => old.close(() => resolve())),
+    );
+    const address = old.address();
+    if (!address || typeof address === "string") throw new Error("No port");
+    const oldUrl = `http://127.0.0.1:${address.port}`;
+
+    await expect(
+      connectRoach({
+        controlUrl: `${oldUrl}/__roach/runs/old`,
+        token: "run-token",
+      }).startSession("test"),
+    ).rejects.toThrow(
+      `Roach service at ${oldUrl} is older than this client: it returned no session URL. Deploy the service at 0.2.0 or later.`,
+    );
   });
 
   it("does not redact the session affinity header", async () => {
