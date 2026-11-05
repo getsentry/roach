@@ -10,6 +10,8 @@
  *   VM. Another one plays Sentry.
  * - Each CI job runs the GitHub Action (`packages/roach/src/action.ts`). Its command sends
  *   HTTPS through the service with only the proxy variables of its run.
+ * - The GCS server can fail, so the test sees what the client, the log,
+ *   and Sentry get from an unexpected error.
  */
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -31,6 +33,8 @@ const TOKEN = "roach-write-token";
 const TENANT = "getsentry/junior";
 const BUCKET = "roach-recordings";
 const GCS_TOKEN = "vm-access-token";
+/** The body of a failed GCS call. Only Sentry may get it. */
+const GCS_FAILURE = "gcs-failure-body-text";
 /** A credential in the query of each model request, as some APIs take it. */
 const QUERY_KEY = "query-api-key-0123456789";
 
@@ -47,6 +51,17 @@ interface TelemetryItem {
 }
 const metrics: TelemetryItem[] = [];
 const spans: TelemetryItem[] = [];
+/** An error event that the service sent to Sentry. */
+interface ErrorEvent {
+  event_id: string;
+  tags?: Record<string, string>;
+  exception: { values: Array<{ type: string; value: string }> };
+}
+const events: ErrorEvent[] = [];
+/** The GCS calls that fail with HTTP 503. */
+let failGcs: "read" | "write" | undefined;
+/** What the service wrote to stderr. */
+let serviceLog = "";
 const upstreamHeaders: IncomingHttpHeaders[] = [];
 let liveRequests = 0;
 let upstreamOrigin: string;
@@ -72,8 +87,8 @@ async function listen(server: net.Server, host = "127.0.0.1") {
 }
 
 /**
- * Keep the metrics and the spans of a Sentry envelope. Both are lists of
- * items with typed attributes.
+ * Keep the metrics, the spans, and the error events of a Sentry envelope.
+ * Metrics and spans are lists of items with typed attributes.
  */
 function readEnvelope(envelope: string) {
   envelopes.push(envelope);
@@ -81,6 +96,7 @@ function readEnvelope(envelope: string) {
   const [, ...lines] = envelope.split("\n").filter(Boolean);
   for (let index = 0; index + 1 < lines.length; index += 2) {
     const { type } = JSON.parse(lines[index]!) as { type: string };
+    if (type === "event") events.push(JSON.parse(lines[index + 1]!));
     const list = { trace_metric: metrics, span: spans }[type];
     if (!list) continue;
     const { items } = JSON.parse(lines[index + 1]!) as {
@@ -140,11 +156,11 @@ const MODEL_USAGE = {
 /** The metrics of one request of the `model` rule. */
 function requestMetrics(mode: string, result: string) {
   const attributes = {
-    tenant: TENANT,
-    mode,
-    rule: "model",
-    origin: upstreamOrigin,
-    result,
+    "roach.tenant": TENANT,
+    "roach.mode": mode,
+    "roach.rule": "model",
+    "roach.origin": upstreamOrigin,
+    "roach.result": result,
   };
   return [
     { name: "roach.request", value: 1, attributes },
@@ -158,19 +174,23 @@ function requestMetrics(mode: string, result: string) {
 
 /**
  * Run one CI job: the action (`packages/roach/src/action.ts`) with a command that sends
- * one HTTPS request with plain `fetch`. Returns the exit code of the
- * action, what the command saw, and the job summary.
+ * one HTTPS request with plain `fetch`. With `refused`, the command then
+ * calls an origin that is not in `allow`. Returns the exit code and the
+ * stderr of the action, what the command saw, and the job summary.
  */
 async function ciJob(job: {
   token?: string;
   runId: string;
   prompt: string;
+  refused?: string;
   /** The `page` query parameter of the request. Defaults to 1. */
   page?: number;
 }): Promise<{
   exitCode: number;
+  stderr: string;
   response: { status: number; source: string | null; body: string };
   token: string | null;
+  actions: string[];
   trusted: string;
   summary: string;
 }> {
@@ -187,9 +207,12 @@ const response = await fetch(${JSON.stringify(`${upstreamOrigin}/v1/messages?key
   method: "POST",
   body: JSON.stringify({ model: "anthropic/claude-test", prompt: ${JSON.stringify(job.prompt)} }),
 });
+const body = await response.text();
+${job.refused ? `await fetch(${JSON.stringify(job.refused)}).catch(() => {});` : ""}
 console.log(JSON.stringify({
-  response: { status: response.status, source: response.headers.get("x-roach"), body: await response.text() },
+  response: { status: response.status, source: response.headers.get("x-roach"), body },
   token: process.env.INPUT_TOKEN ?? null,
+  actions: Object.keys(process.env).filter((name) => name.startsWith("ACTIONS_")),
   trusted: readFileSync(process.env.NODE_EXTRA_CA_CERTS, "utf8"),
 }));
 `,
@@ -212,20 +235,31 @@ console.log(JSON.stringify({
         GITHUB_RUN_ID: job.runId,
         GITHUB_RUN_ATTEMPT: "1",
         GITHUB_JOB: "test",
+        GITHUB_REF: "refs/heads/main",
         GITHUB_STEP_SUMMARY: summary,
+        // The tokens of the runner. The command must not get them.
+        ACTIONS_RUNTIME_TOKEN: "runner-runtime-token",
+        ACTIONS_ID_TOKEN_REQUEST_TOKEN: "runner-oidc-token",
+        ACTIONS_ID_TOKEN_REQUEST_URL: "https://token.actions.example/oidc",
         INPUT_RUN: "node job.mjs > result.json",
         INPUT_URL: frontUrl,
         INPUT_TOKEN: job.token ?? "",
       }),
-      stdio: ["ignore", "ignore", "inherit"],
+      stdio: ["ignore", "ignore", "pipe"],
     },
   );
+  let stderr = "";
+  action.stderr.on("data", (chunk: Buffer) => {
+    stderr += chunk.toString();
+    process.stderr.write(chunk);
+  });
   const [exitCode] = (await once(action, "exit")) as [number];
   const result = JSON.parse(
     await readFile(path.join(workspace, "result.json"), "utf8"),
   );
   return {
     exitCode,
+    stderr,
     ...result,
     summary: await readFile(summary, "utf8"),
   };
@@ -309,6 +343,12 @@ beforeAll(async () => {
     }
     const upload = `/upload/storage/v1/b/${BUCKET}/o`;
     const read = `/storage/v1/b/${BUCKET}/o/`;
+    const failing = failGcs && { read, write: upload }[failGcs];
+    if (failing && url.pathname.startsWith(failing)) {
+      incoming.resume();
+      outgoing.writeHead(503).end(GCS_FAILURE);
+      return;
+    }
     if (incoming.method === "POST" && url.pathname === upload) {
       let body = "";
       incoming.on("data", (chunk: Buffer) => (body += chunk.toString()));
@@ -388,9 +428,13 @@ beforeAll(async () => {
         // The service trusts the upstream, as it trusts public APIs.
         NODE_EXTRA_CA_CERTS: hostCertFile,
       }),
-      stdio: ["ignore", "pipe", "inherit"],
+      stdio: ["ignore", "pipe", "pipe"],
     },
   );
+  service.stderr!.on("data", (chunk: Buffer) => {
+    serviceLog += chunk.toString();
+    process.stderr.write(chunk);
+  });
   const [line] = (await once(service.stdout!, "data")) as [Buffer];
   const { url } = JSON.parse(line.toString()) as { url: string };
   if (url !== frontUrl) throw new Error(`The service printed ${url}`);
@@ -411,7 +455,13 @@ afterAll(async () => {
 
 describe("deployed roach", () => {
   it("records with the token, replays for a fork, and counts in Sentry", async () => {
-    const writer = await ciJob({ token: TOKEN, runId: "writer", prompt: "hi" });
+    const refusedOrigin = "127.0.0.3:8443";
+    const writer = await ciJob({
+      token: TOKEN,
+      runId: "writer",
+      prompt: "hi",
+      refused: `https://${refusedOrigin}/`,
+    });
     expect(writer.exitCode).toBe(0);
     expect(writer.response).toEqual({
       status: 200,
@@ -419,8 +469,9 @@ describe("deployed roach", () => {
       body: modelStream(1),
     });
     expect(writer.summary).toContain("1 recordings new or changed");
-    // The command never sees the write token.
+    // The command never sees the write token or the tokens of the runner.
     expect(writer.token).toBeNull();
+    expect(writer.actions).toEqual([]);
     // It trusts the authority of the service, which a restart keeps, and
     // still trusts the certificates that the job trusted.
     expect(writer.trusted).toContain(caCert.trim());
@@ -456,14 +507,95 @@ describe("deployed roach", () => {
     expect(miss.summary).not.toContain(String.raw`\"prompt\":\"hi\"`);
     expect(liveRequests).toBe(1);
 
+    // A failed GCS read gives a client without the token only the id of
+    // the Sentry event, never the body of the GCS response.
+    failGcs = "read";
+    const brokenRead = await ciJob({ runId: "broken-read", prompt: "hi" });
+    expect(brokenRead.response.status).toBe(502);
+    const readEvent =
+      /^Roach error: internal error, Sentry event ([0-9a-f]{32})\n$/.exec(
+        brokenRead.response.body,
+      )?.[1];
+    expect(readEvent).toBeDefined();
+
+    // A failed GCS write at the end of a session fails the control call
+    // the same way.
+    failGcs = "write";
+    const brokenWrite = await ciJob({
+      token: TOKEN,
+      runId: "broken-write",
+      prompt: "new",
+    });
+    failGcs = undefined;
+    expect(brokenWrite.response.source).toBe("live");
+    expect(brokenWrite.exitCode).not.toBe(0);
+    const writeEvent =
+      /HTTP 500: \{"error":"internal error, Sentry event ([0-9a-f]{32})"\}/.exec(
+        brokenWrite.stderr,
+      )?.[1];
+    expect(writeEvent).toBeDefined();
+    expect(liveRequests).toBe(2);
+    for (const text of [
+      brokenRead.response.body,
+      brokenRead.stderr,
+      brokenRead.summary,
+      brokenWrite.stderr,
+      brokenWrite.summary,
+    ]) {
+      expect(text).not.toContain(GCS_FAILURE);
+    }
+
     // The service sends its metrics when it stops.
     service.kill("SIGTERM");
     expect(await once(service, "exit")).toEqual([0, null]);
     const [key] = objects.keys();
     const relativeKey = key!.slice(`${TENANT}/`.length);
 
-    // Metrics have only attributes with few values: no key and no run.
-    const labels = ["tenant", "mode", "rule", "origin", "result", "key", "run"];
+    // The log has the class and the status of an error, not its message.
+    expect(serviceLog).toContain(
+      `[roach] Request failed: GcsError HTTP 503, Sentry event ${readEvent}`,
+    );
+    expect(serviceLog).toContain(
+      `[roach] Control failed: GcsError HTTP 503, Sentry event ${writeEvent}`,
+    );
+    expect(serviceLog).not.toContain(GCS_FAILURE);
+
+    // Sentry gets each unexpected error with its message, and no event for
+    // a miss or a refused request.
+    expect(
+      events.map(({ event_id, tags, exception }) => {
+        const { type, value } = exception.values.at(-1)!;
+        return { event_id, run: tags?.["roach.run.id"], type, value };
+      }),
+    ).toEqual([
+      {
+        event_id: readEvent,
+        run: "broken-read-1",
+        type: "GcsError",
+        value: expect.stringContaining(`HTTP 503: ${GCS_FAILURE}`),
+      },
+      {
+        event_id: writeEvent,
+        run: undefined,
+        type: "GcsError",
+        value: expect.stringContaining(`HTTP 503: ${GCS_FAILURE}`),
+      },
+    ]);
+
+    // Metrics have only attributes with few values: no key, no run, no
+    // session, and no CI job.
+    const labels = [
+      "roach.tenant",
+      "roach.mode",
+      "roach.rule",
+      "roach.origin",
+      "roach.result",
+      "roach.reason",
+      "roach.key",
+      "roach.run.id",
+      "roach.session",
+      "roach.ci.run_id",
+    ];
     expect(
       metrics.map(({ name, value, attributes }) => ({
         name,
@@ -476,25 +608,39 @@ describe("deployed roach", () => {
       })),
     ).toEqual([
       ...requestMetrics("auto", "live"),
+      // The client picks an origin that is not in `allow`, so the metric
+      // does not name it.
+      {
+        name: "roach.request",
+        value: 1,
+        attributes: {
+          "roach.tenant": TENANT,
+          "roach.mode": "auto",
+          "roach.origin": "other",
+          "roach.result": "refused",
+          "roach.reason": "notAllowed",
+        },
+      },
       {
         name: "roach.recording.write",
         value: 1,
         attributes: {
-          tenant: TENANT,
-          mode: "auto",
-          rule: "model",
-          result: "written",
+          "roach.tenant": TENANT,
+          "roach.mode": "auto",
+          "roach.rule": "model",
+          "roach.result": "written",
         },
       },
       ...requestMetrics("replay", "replayed"),
       ...requestMetrics("replay", "missed"),
+      ...requestMetrics("auto", "live"),
     ]);
 
-    // Only the spans of Roach: 4 for each run, 2 for the live request, and
-    // 3 for request samples: one write, and one read for the first miss of
-    // each run that misses.
+    // Only the spans of Roach: 5 for each run, 2 for each live request, 1
+    // for the refused request, and 4 for request samples: one write, and
+    // one read for the first miss of each of the 3 runs that miss.
     const ops = spans.map(({ attributes }) => attributes["sentry.op"]);
-    expect(ops).toHaveLength(17);
+    expect(ops).toHaveLength(34);
     expect(new Set(ops)).toEqual(
       new Set([
         "roach.run.start",
@@ -503,39 +649,62 @@ describe("deployed roach", () => {
         "roach.store.read",
         "roach.upstream",
         "roach.store.write",
+        "roach.run.end",
       ]),
     );
-    const span = (op: string, run: string) =>
+    const span = (op: string, run: string, match: object = {}) =>
       spans.find(
         ({ attributes }) =>
-          attributes["sentry.op"] === op && attributes.run === run,
+          attributes["sentry.op"] === op &&
+          attributes["roach.run.id"] === run &&
+          Object.entries(match).every(
+            ([name, value]) => attributes[name] === value,
+          ),
       )?.attributes;
     expect(span("roach.run.start", "writer-1")).toMatchObject({
-      tenant: TENANT,
-      mode: "auto",
-      write: true,
+      "roach.tenant": TENANT,
+      "roach.mode": "auto",
+      "roach.write": true,
+      "roach.ci.run_id": "writer",
+      "roach.ci.job": "test",
+      "roach.ci.repo": TENANT,
+      "roach.ci.ref": "refs/heads/main",
     });
-    expect(span("roach.request", "writer-1")).toMatchObject({
-      tenant: TENANT,
-      mode: "auto",
-      rule: "model",
-      origin: upstreamOrigin,
-      result: "live",
+    expect(
+      span("roach.request", "writer-1", { "roach.result": "live" }),
+    ).toMatchObject({
+      "roach.tenant": TENANT,
+      "roach.mode": "auto",
+      "roach.rule": "model",
+      "roach.origin": upstreamOrigin,
+      "roach.session": "test",
+      "roach.ci.run_id": "writer",
       "http.response.status_code": 200,
       ...MODEL_USAGE,
     });
+    // The span of a refused request names its origin.
+    expect(
+      span("roach.request", "writer-1", { "roach.result": "refused" }),
+    ).toMatchObject({
+      "roach.reason": "notAllowed",
+      "roach.origin": refusedOrigin,
+      "http.request.method": "CONNECT",
+    });
     // A replay reports the usage of its recording: the call that it saved.
     expect(span("roach.request", "fork-1")).toMatchObject({
-      result: "replayed",
+      "roach.result": "replayed",
       ...MODEL_USAGE,
     });
     expect(span("roach.request", "miss-1")).toMatchObject({
-      result: "missed",
+      "roach.result": "missed",
       "http.response.status_code": 412,
     });
     expect(span("roach.request", "miss-1")).not.toHaveProperty(
       "gen_ai.operation.name",
     );
+    expect(span("roach.request", "broken-read-1")).toMatchObject({
+      "http.response.status_code": 502,
+    });
     // The first miss of each run looks for a request sample. The writer
     // found none. The run without the token found the writer's, and Sentry
     // gets the redacted change, which its summary does not show. The change
@@ -557,22 +726,38 @@ describe("deployed roach", () => {
         "/v1/messages?key=<<redacted>>&page=2\n",
       ),
     });
-    expect(span("roach.key", "writer-1")).toMatchObject({ key: relativeKey });
+    expect(span("roach.key", "writer-1")).toMatchObject({
+      "roach.key": relativeKey,
+    });
     expect(span("roach.store.read", "writer-1")).toMatchObject({
-      key: relativeKey,
-      result: "miss",
+      "roach.key": relativeKey,
+      "roach.result": "missed",
     });
     expect(span("roach.store.read", "fork-1")).toMatchObject({
-      key: relativeKey,
-      result: "hit",
+      "roach.key": relativeKey,
+      "roach.result": "replayed",
     });
     expect(span("roach.upstream", "writer-1")).toMatchObject({
-      origin: upstreamOrigin,
+      "roach.origin": upstreamOrigin,
       "http.response.status_code": 200,
     });
     expect(span("roach.store.write", "writer-1")).toMatchObject({
-      recordings: 1,
-      written: 1,
+      "roach.recordings": 1,
+      "roach.written": 1,
+    });
+    // The end of a run has its totals.
+    expect(span("roach.run.end", "writer-1")).toMatchObject({
+      "roach.replayed": 0,
+      "roach.live": 1,
+      "roach.missed": 0,
+      "roach.passthrough": 0,
+      "roach.refused": 1,
+      "roach.written": 1,
+      "roach.dropped": 0,
+      "roach.run.duration_ms": expect.any(Number),
+    });
+    expect(span("roach.run.end", "miss-1")).toMatchObject({
+      "roach.missed": 1,
     });
 
     // Neither Sentry nor the store gets a credential. Only the text of the

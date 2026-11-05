@@ -26,9 +26,10 @@
  * - The recordings of a tenant are under `<tenant>/`, in a directory or a
  *   GCS bucket (`gcs.ts`). Tenants never share recordings, because a key
  *   does not include credentials.
- * - With `sentryDsn`, the service sends spans and metrics to Sentry. See
- *   "Sentry" in `README.md`. Metrics have only attributes with few values,
- *   so the key and the run are only on spans.
+ * - With `sentryDsn`, the service sends spans, metrics, and unexpected
+ *   errors to Sentry. See "Sentry" in `README.md`. Metrics have only
+ *   attributes with few values, so the key, the run, the session, and the
+ *   CI job are only on spans.
  */
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import type http from "node:http";
@@ -38,8 +39,14 @@ import {
   createCertificateAuthority,
   type CertificateAuthorityPem,
 } from "./certificates.ts";
+import { reportInternal } from "./errors.ts";
 import { createGcsStore } from "./gcs.ts";
-import { createRecorder, type Telemetry, type WorkLimit } from "./recorder.ts";
+import {
+  createRecorder,
+  type Attributes,
+  type Telemetry,
+  type WorkLimit,
+} from "./recorder.ts";
 import { createFileStore } from "./recordings.ts";
 import {
   clientAddress,
@@ -58,6 +65,7 @@ import {
   type RecordingMode,
   type RecordingStats,
   type RemoteRun,
+  type RunCi,
   type RunConfig,
 } from "@sentry/roach/types";
 import { invalidValuePatterns } from "@sentry/roach/values";
@@ -177,6 +185,14 @@ const MAX_RULES = 64;
 const MAX_RULE_VALUES = 32;
 const MAX_RULE_URLS = 32;
 const MAX_PATTERN_LENGTH = 2048;
+/** The span attribute of each field of `RunConfig.ci`. */
+const CI_ATTRIBUTES: Record<keyof RunCi, string> = {
+  runId: "roach.ci.run_id",
+  job: "roach.ci.job",
+  repo: "roach.ci.repo",
+  ref: "roach.ci.ref",
+};
+const MAX_CI_VALUE = 256;
 /** Enough for the API keys and OIDC tokens of a CI job. */
 const MAX_RUN_SECRETS = 32;
 const MAX_SECRET_LENGTH = 16 * 1024;
@@ -259,6 +275,21 @@ function invalidRunConfig(config: Partial<RunConfig>): string | undefined {
       return `secrets must be a list of at most ${MAX_RUN_SECRETS} strings of at most ${MAX_SECRET_LENGTH} characters`;
     }
   }
+  if (config.ci !== undefined) {
+    // A newer client can send more fields. The service ignores them.
+    const ci = config.ci as Record<string, unknown> | null;
+    if (
+      typeof ci !== "object" ||
+      ci === null ||
+      !Object.keys(CI_ATTRIBUTES).every(
+        (field) =>
+          ci[field] === undefined ||
+          (typeof ci[field] === "string" && ci[field].length <= MAX_CI_VALUE),
+      )
+    ) {
+      return `ci must be an object of strings of at most ${MAX_CI_VALUE} characters`;
+    }
+  }
   if (!Array.isArray(config.rules) || config.rules.length > MAX_RULES) {
     return `rules must be a list of at most ${MAX_RULES} rules`;
   }
@@ -325,18 +356,59 @@ function invalidRunConfig(config: Partial<RunConfig>): string | undefined {
   return undefined;
 }
 
+/** The span attributes of the CI job of a run. */
+function ciAttributes(ci: RunCi | undefined): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(CI_ATTRIBUTES).flatMap(([field, name]) => {
+      const value = ci?.[field as keyof RunCi];
+      return value ? [[name, value]] : [];
+    }),
+  );
+}
+
 /**
- * The telemetry of one run, in Sentry. Metrics get `labels`. Spans also get
- * the name of the run.
+ * Send an unexpected error to Sentry, with `tags`. Returns the id of its
+ * event, or `undefined` without a DSN.
+ */
+function capture(
+  error: unknown,
+  tags?: Record<string, string>,
+): string | undefined {
+  if (!Sentry.getClient()) return undefined;
+  return Sentry.captureException(error, tags ? { tags } : undefined);
+}
+
+const sum = (values: number[]) => values.reduce((a, b) => a + b, 0);
+
+/** The totals of a run, for the `roach.run.end` span. */
+function runTotals(stats: RecordingStats, ms: number): Attributes {
+  const counts = Object.values(stats.counts);
+  return {
+    "roach.replayed": sum(counts.map((count) => count.replayed)),
+    "roach.live": sum(counts.map((count) => count.live)),
+    "roach.missed": sum(counts.map((count) => count.missed)),
+    "roach.passthrough": sum(Object.values(stats.passthrough)),
+    "roach.refused": sum(
+      Object.values(stats.refused ?? {}).flatMap(Object.values),
+    ),
+    "roach.written": stats.written,
+    "roach.dropped": stats.discarded,
+    "roach.run.duration_ms": ms,
+  };
+}
+
+/**
+ * The telemetry of one run, in Sentry. Metrics get `labels`. Spans and
+ * errors get `spanLabels`, which also name the run and its CI job.
  */
 function runTelemetry(
-  labels: { tenant: string; mode: RecordingMode },
-  run: string,
+  labels: Attributes,
+  spanLabels: Record<string, string>,
 ): Telemetry {
   return {
     span: ({ op, name = op, attributes }, fn) =>
       Sentry.startSpan(
-        { op, name, attributes: { ...labels, run, ...attributes } },
+        { op, name, attributes: { ...spanLabels, ...attributes } },
         fn,
       ),
     annotate: (attributes) => {
@@ -353,6 +425,7 @@ function runTelemetry(
         attributes: { ...labels, ...attributes },
       });
     },
+    capture: (error) => capture(error, spanLabels),
   };
 }
 
@@ -362,7 +435,7 @@ function runTelemetry(
  */
 function runStore(
   base: RecordingStore,
-  labels: { tenant: string; mode: RecordingMode; run: string },
+  labels: Attributes,
   canWrite: boolean,
 ): RecordingStore {
   const span = <T>(
@@ -376,9 +449,9 @@ function runStore(
     );
   return {
     read: (key) =>
-      span("roach.store.read", { key }, async (current) => {
+      span("roach.store.read", { "roach.key": key }, async (current) => {
         const recording = await base.read(key);
-        current.setAttribute("result", recording ? "hit" : "miss");
+        current.setAttribute("roach.result", recording ? "replayed" : "missed");
         return recording;
       }),
     async write(recordings) {
@@ -386,10 +459,10 @@ function runStore(
       if (!canWrite) throw new Error("This run cannot write recordings");
       return span(
         "roach.store.write",
-        { recordings: recordings.length },
+        { "roach.recordings": recordings.length },
         async (current) => {
           const written = await base.write(recordings);
-          current.setAttribute("written", written);
+          current.setAttribute("roach.written", written);
           return written;
         },
       );
@@ -417,6 +490,10 @@ export async function startRoachService(
       // credentials, such as the `secrets` of a run. And the proxy must not
       // add trace headers to the requests that it sends.
       tracePropagationTargets: [],
+      // The HTTP integration names an error event after the path of the
+      // request, which can hold a credential. The trace of the event has
+      // the span of the request.
+      beforeSend: ({ transaction: _path, ...event }) => event,
       integrations: (defaults) => [
         ...defaults.filter(
           ({ name }) => !["Http", "NodeFetch", "RequestData"].includes(name),
@@ -438,12 +515,15 @@ export async function startRoachService(
       : createFileStore(path.join(config.directory!, tenant));
   let publicUrl = config.publicUrl?.replace(/\/$/, "");
 
-  const endRun = async (run: Run): Promise<RecordingStats> => {
-    runs.delete(run.id);
-    run.closed = true;
-    await run.recorder.close();
-    return run.recorder.stats();
-  };
+  const endRun = (run: Run): Promise<RecordingStats> =>
+    run.telemetry.span({ op: "roach.run.end" }, async () => {
+      runs.delete(run.id);
+      run.closed = true;
+      await run.recorder.close();
+      const stats = run.recorder.stats();
+      run.telemetry.annotate(runTotals(stats, Date.now() - run.started));
+      return stats;
+    });
 
   const createRun = (
     runConfig: RunConfig,
@@ -451,20 +531,18 @@ export async function startRoachService(
     client: string,
   ): RemoteRun => {
     const id = randomBytes(8).toString("hex");
-    const telemetry = runTelemetry(
-      { tenant: runConfig.tenant, mode: runConfig.mode },
-      runConfig.name ?? id,
-    );
+    const labels = {
+      "roach.tenant": runConfig.tenant,
+      "roach.mode": runConfig.mode,
+    };
+    const spanLabels = {
+      ...labels,
+      "roach.run.id": runConfig.name ?? id,
+      ...ciAttributes(runConfig.ci),
+    };
+    const telemetry = runTelemetry(labels, spanLabels);
     const token = randomBytes(24).toString("hex");
-    const store = runStore(
-      storeOf(runConfig.tenant),
-      {
-        tenant: runConfig.tenant,
-        mode: runConfig.mode,
-        run: runConfig.name ?? id,
-      },
-      canWrite,
-    );
+    const store = runStore(storeOf(runConfig.tenant), spanLabels, canWrite);
     const run: Run = {
       id,
       token,
@@ -492,9 +570,7 @@ export async function startRoachService(
           endRun: (reason) => {
             process.stderr.write(`[roach] Run ${id} ended: ${reason}\n`);
             endRun(run).catch((error: unknown) => {
-              process.stderr.write(
-                `[roach] Run ${id} did not end: ${String(error)}\n`,
-              );
+              reportInternal(`Run ${id} end`, error, telemetry.capture(error));
             });
           },
           telemetry,
@@ -586,11 +662,16 @@ export async function startRoachService(
         {
           op: "roach.run.start",
           name: "roach.run.start",
-          attributes: { tenant, mode: valid.mode, write: canWrite },
+          attributes: {
+            "roach.tenant": tenant,
+            "roach.mode": valid.mode,
+            "roach.write": canWrite,
+            ...ciAttributes(valid.ci),
+          },
         },
         (span) => {
           const created = createRun(valid, canWrite, client);
-          span.setAttribute("run", valid.name ?? created.id);
+          span.setAttribute("roach.run.id", valid.name ?? created.id);
           return created;
         },
       );
@@ -606,7 +687,9 @@ export async function startRoachService(
       !run ||
       !sameToken(incoming.headers.authorization, `Bearer ${run.token}`)
     ) {
-      // The same answer for a run that does not exist, so ids stay secret.
+      // The same answer for a wrong token and for a run that does not
+      // exist. The id is not a secret: the log and Sentry have it. Only the
+      // token gives access.
       outgoing.writeHead(404).end();
       return;
     }
@@ -633,6 +716,7 @@ export async function startRoachService(
     authority,
     targetFor,
     control,
+    capture,
     proxyProtocol: config.proxyProtocol === true,
   });
   publicUrl ??= `http://${host.includes(":") ? `[${host}]` : host}:${listening.port}`;
@@ -649,8 +733,10 @@ export async function startRoachService(
         );
         // A failed close must not stop the service for other runs.
         endRun(run).catch((error: unknown) => {
-          process.stderr.write(
-            `[roach] Run ${run.id} did not end: ${String(error)}\n`,
+          reportInternal(
+            `Run ${run.id} end`,
+            error,
+            run.telemetry.capture(error),
           );
         });
       }

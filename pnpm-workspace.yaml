@@ -3,11 +3,14 @@
 # service: only it depends on `@sentry/node`. The root holds only the tools.
 packages:
   - packages/*
-# One version of each tool that more than one package uses.
+# One version of each tool that more than one package uses, and of each
+# tool that must have the same version as one of them.
 catalog:
   "@types/node": ^24.19.1
+  # Must be the same version as vitest.
+  "@vitest/coverage-v8": ^5.1.0
   typescript: ^7.0.2
-  vitest: ^5.0.3
+  vitest: ^5.1.0
 # Install only versions that are at least one day old, so a bad release
 # has time to be pulled before it reaches us.
 minimumReleaseAge: 1440
