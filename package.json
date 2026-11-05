@@ -20,7 +20,7 @@
   "devDependencies": {
     "@sentry/dotagents": "^3.4.0",
     "@types/node": "catalog:",
-    "@vitest/coverage-v8": "^5.0.5",
+    "@vitest/coverage-v8": "catalog:",
     "knip": "^6.44.1",
     "lint-staged": "^17.6.0",
     "oxfmt": "^0.75.0",
