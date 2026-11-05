@@ -25,6 +25,18 @@ const TRIES = 3;
 const TOKEN_MARGIN_MS = 60_000;
 
 const isTemporary = (status: number) => status === 429 || status >= 500;
+
+/**
+ * The error of a failed call. Its message has the response body, so only
+ * Sentry gets it (`errors.ts`). The log gets `responseStatus`.
+ */
+const callError = async (what: string, response: Response) =>
+  Object.assign(
+    new Error(
+      `${what} failed with HTTP ${response.status}: ${await response.text()}`,
+    ),
+    { name: "GcsError", responseStatus: response.status },
+  );
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** `fetch`, with a timeout and retries of temporary failures. */
@@ -56,9 +68,7 @@ function createTokenSource(metadataHost: string): () => Promise<string> {
       { headers: { "metadata-flavor": "Google" } },
     );
     if (!response.ok) {
-      throw new Error(
-        `GCE metadata token failed with HTTP ${response.status}: ${await response.text()}`,
-      );
+      throw await callError("GCE metadata token", response);
     }
     const body = (await response.json()) as {
       access_token: string;
@@ -110,9 +120,7 @@ export function createGcsStore(bucket: string, prefix: string): RecordingStore {
       },
     );
     if (!response.ok) {
-      throw new Error(
-        `GCS write of ${key} failed with HTTP ${response.status}: ${await response.text()}`,
-      );
+      throw await callError(`GCS write of ${key}`, response);
     }
     await response.body?.cancel();
   };
@@ -129,9 +137,7 @@ export function createGcsStore(bucket: string, prefix: string): RecordingStore {
         return undefined;
       }
       if (!response.ok) {
-        throw new Error(
-          `GCS read of ${key} failed with HTTP ${response.status}: ${await response.text()}`,
-        );
+        throw await callError(`GCS read of ${key}`, response);
       }
       return (await response.json()) as StoredFile;
     },

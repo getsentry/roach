@@ -1,6 +1,13 @@
 import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { ProxyAgent, request } from "undici";
@@ -431,6 +438,73 @@ describe("roach service", () => {
       await guarded.close();
     }
     expect(liveRequests).toBe(1);
+  });
+
+  it("gives the client no text of an unexpected error", async () => {
+    // A file where the store needs a directory makes each read and write
+    // fail with an error that names the path.
+    const blocked = async () => {
+      await mkdir(path.join(directory, "acme/alpha"), { recursive: true });
+      await writeFile(path.join(directory, "acme/alpha/model"), "");
+    };
+    const unblocked = () => rm(path.join(directory, "acme/alpha/model"));
+
+    // A failed read in a run without the token.
+    await blocked();
+    const reader = await startRun(undefined, "replay");
+    const read = await send(reader.url, { prompt: "hi" });
+    expect(read).toMatchObject({
+      status: 502,
+      body: "Roach error: internal error\n",
+    });
+
+    // A failed write at the end of a session.
+    await unblocked();
+    const writer = await startRun("write-token", "auto");
+    const session = await writer.startSession("test");
+    expect(await send(session.url, { prompt: "hi" })).toMatchObject({
+      source: "live",
+    });
+    await blocked();
+    const ended = session.end(true);
+    await expect(ended).rejects.toThrow('HTTP 500: {"error":"internal error"}');
+    await expect(ended).rejects.not.toThrow(directory);
+
+    // A failed live request.
+    const closed = createServer();
+    await new Promise<void>((resolve) =>
+      closed.listen(0, "127.0.0.1", resolve),
+    );
+    const { port } = closed.address() as { port: number };
+    await new Promise<void>((resolve) => closed.close(() => resolve()));
+    const down = `http://127.0.0.1:${port}`;
+    const live = await startRun("write-token", "auto", {
+      allow: [down],
+      rules: [{ name: "model", match: { method: "POST" } }],
+    });
+    const agent = new ProxyAgent({ uri: live.url, proxyTunnel: true });
+    agents.push(agent);
+    const failed = await request(`${down}/v1/messages`, {
+      method: "POST",
+      body: "{}",
+      dispatcher: agent,
+    });
+    expect(failed.statusCode).toBe(502);
+    expect(await failed.body.text()).toBe("Roach error: internal error\n");
+
+    // An error that is the fault of the client keeps its message.
+    const notOpen = await fetch(`${writer.controlUrl}/session/end`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${writer.token}` },
+      body: JSON.stringify({ name: "not-a-session", passed: true }),
+    });
+    expect(notOpen.status).toBe(409);
+    expect(await notOpen.json()).toEqual({
+      error: 'Session "not-a-session" is not open',
+    });
+    await expect(
+      startRun("write-token", "auto", { ci: { ref: "x".repeat(257) } }),
+    ).rejects.toThrow(/ci must be an object of strings/);
   });
 
   it("redacts request credentials and the secrets of the service and the run", async () => {

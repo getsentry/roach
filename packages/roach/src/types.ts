@@ -138,6 +138,20 @@ export interface RunConfig {
    * config, keeps them only in memory, and forgets them when the run ends.
    */
   secrets?: string[];
+  /**
+   * The CI job of the run, for Sentry. `runConfigOf()` takes it from
+   * `GITHUB_RUN_ID`, `GITHUB_JOB`, `GITHUB_REPOSITORY`, and `GITHUB_REF`.
+   * An older service ignores it.
+   */
+  ci?: RunCi;
+}
+
+/** The CI job of a run. Each field is a string of at most 256 characters. */
+export interface RunCi {
+  runId?: string;
+  job?: string;
+  repo?: string;
+  ref?: string;
 }
 
 /** A run that the service created. */

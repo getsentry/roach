@@ -6,7 +6,12 @@
  */
 import { access, readFile } from "node:fs/promises";
 import path from "node:path";
-import type { RecordingMode, RecordingRule, RunConfig } from "./types.ts";
+import type {
+  RecordingMode,
+  RecordingRule,
+  RunCi,
+  RunConfig,
+} from "./types.ts";
 import { VALUE_PATTERNS } from "./values.ts";
 
 /** The Roach service of Sentry. See "Deploy" in `README.md`. */
@@ -42,6 +47,14 @@ export interface RoachFile {
 }
 
 const MODES = new Set<string>(["auto", "off", "record", "replay"]);
+
+/** The variable of each field of `RunConfig.ci`. */
+const CI_VARIABLES: Record<keyof RunCi, string> = {
+  runId: "GITHUB_RUN_ID",
+  job: "GITHUB_JOB",
+  repo: "GITHUB_REPOSITORY",
+  ref: "GITHUB_REF",
+};
 
 /** A variable of `env`, or `undefined` when it is not set or is blank. */
 export function readEnv(
@@ -137,5 +150,12 @@ export function runConfigOf(
   if (runId) {
     config.name = `${runId}-${readEnv("GITHUB_RUN_ATTEMPT", env) ?? "1"}`;
   }
+  const ci = Object.fromEntries(
+    Object.entries(CI_VARIABLES).flatMap(([field, name]) => {
+      const value = readEnv(name, env);
+      return value ? [[field, value]] : [];
+    }),
+  );
+  if (Object.keys(ci).length > 0) config.ci = ci;
   return config;
 }
