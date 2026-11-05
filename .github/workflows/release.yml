@@ -46,6 +46,9 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
+      - name: Drop floating tags
+        run: .github/scripts/drop-floating-tags.sh
+
       - name: Prepare release
         uses: getsentry/craft@3f2abdc5703191d12ef2cc013f792f1bd220f44d # v2
         env:
