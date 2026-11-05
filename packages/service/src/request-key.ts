@@ -14,6 +14,7 @@
  */
 import { createHash } from "node:crypto";
 import type { IncomingHttpHeaders } from "node:http";
+import { httpError } from "./errors.ts";
 import { parseJson } from "./json-strings.ts";
 import { THINKING_BLOCK_TYPES } from "./streams.ts";
 import type { RecordingRule } from "@sentry/roach/types";
@@ -152,15 +153,41 @@ function normalizeJson(
   };
 }
 
+/**
+ * A JSON body nested deeper than this gets HTTP 400. The key walks a body
+ * with recursion, and a few thousand levels fill the call stack. Model
+ * request bodies nest far less than this.
+ */
+const MAX_JSON_DEPTH = 64;
+
+/** Whether `json` has arrays or objects nested deeper than `limit`. */
+function nestedDeeperThan(json: unknown, limit: number): boolean {
+  // A loop, not recursion, so a deep body cannot fill the call stack here.
+  const values = [json];
+  const depths = [0];
+  while (values.length > 0) {
+    const value = values.pop();
+    const depth = depths.pop()!;
+    if (value === null || typeof value !== "object") continue;
+    if (depth >= limit) return true;
+    for (const item of Object.values(value)) {
+      values.push(item);
+      depths.push(depth + 1);
+    }
+  }
+  return false;
+}
+
 const sha256 = (text: string) =>
   createHash("sha256").update(text).digest("hex");
 /**
  * The key and the changing values of a request. `known` holds the values
  * of earlier requests in the same session (`@sentry/roach/values`). It
  * throws an error with HTTP status 400 when it takes longer than
- * `timeLimitMs`, by default `keyTimeLimit()` of the body, or when the
- * request has more than `maxValues` changing values. The limits never
- * change a key: a request gets its key, or it fails.
+ * `timeLimitMs`, by default `keyTimeLimit()` of the body, when the
+ * request has more than `maxValues` changing values, or when its JSON body
+ * is nested deeper than `MAX_JSON_DEPTH`. The limits never change a key:
+ * a request gets its key, or it fails.
  */
 export function keyRequest(
   rule: RecordingRule,
@@ -187,6 +214,13 @@ function keyRequestNow(
     ]),
   );
   const json = parseJson(request.body);
+  if (json !== undefined && nestedDeeperThan(json, MAX_JSON_DEPTH)) {
+    // It is the fault of the client, so it does not go to Sentry.
+    throw httpError(
+      400,
+      `the JSON body is nested over ${MAX_JSON_DEPTH} levels deep`,
+    );
+  }
   const { text, values } =
     json === undefined
       ? extractValues(request.body, rule.values, known, maxValues)

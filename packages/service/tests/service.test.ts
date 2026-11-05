@@ -91,6 +91,21 @@ function stalledBody(): Readable {
   return body;
 }
 
+/** A JSON body of `levels` nested arrays. */
+const nested = (levels: number) => `${"[".repeat(levels)}${"]".repeat(levels)}`;
+
+/** Send `body` as it is to the upstream through the proxy at `proxyUrl`. */
+async function sendText(proxyUrl: string, body: string) {
+  const agent = new ProxyAgent({ uri: proxyUrl, proxyTunnel: true });
+  agents.push(agent);
+  const response = await request(`${origin}/v1/messages`, {
+    body,
+    dispatcher: agent,
+    method: "POST",
+  });
+  return { status: response.statusCode, body: await response.body.text() };
+}
+
 /** Wait `ms` of real time, also when `setTimeout` is fake. */
 async function realWait(ms: number) {
   const end = performance.now() + ms;
@@ -830,6 +845,34 @@ describe("limits of the service", () => {
     // A run with the token has no limit.
     const writer = await startRun("write-token", "auto", { rules });
     expect((await send(writer.url, { prompt })).status).toBe(200);
+  });
+
+  it("fails a request whose JSON body is nested too deep for its key", async () => {
+    // The key walks a JSON body with recursion. Before, a body of a few
+    // thousand levels filled the stack: the client got HTTP 502, and Sentry
+    // got an error.
+    const log = vi.spyOn(process.stderr, "write");
+    onTestFinished(() => log.mockRestore());
+    // A run without the token makes the key in the key worker, and a run
+    // with the token in this process.
+    const reader = await startRun(undefined, "replay");
+    const writer = await startRun("write-token", "auto");
+    for (const run of [reader, writer]) {
+      for (const levels of [65, 100_000]) {
+        const deep = await sendText(run.url, nested(levels));
+        expect(deep.status).toBe(400);
+        expect(deep.body).toMatch(/nested over 64 levels deep/);
+      }
+    }
+    expect(liveRequests).toBe(0);
+    expect(log.mock.calls.map(([text]) => String(text)).join("")).not.toMatch(
+      /Request failed/,
+    );
+    // 64 levels still get a key, and the runs go on.
+    expect((await sendText(reader.url, nested(64))).status).toBe(412);
+    expect((await sendText(writer.url, nested(64))).status).toBe(200);
+    expect((await send(reader.url, { prompt: "hi" })).status).toBe(412);
+    expect((await send(writer.url, { prompt: "hi" })).status).toBe(200);
   });
 
   it("answers 503 when the bodies of runs without a token fill the budget", async () => {
