@@ -1,22 +1,34 @@
 /**
- * The JSON reads of the redaction of credentials (`secrets.ts`).
+ * The JSON reads of the service.
  *
- * `scanStrings()` reads JSON text in one pass and gives each string with
- * its depth, whether it is a field name, and its escapes. `decodeString()`
- * decodes one string. `parseJson()` parses a whole body.
+ * `parseJson()` parses a whole body, for the key (`request-key.ts`) and
+ * the token usage (`usage.ts`). `parseJsonSkipBom()` also skips a byte
+ * order mark at the start, for the redaction of credentials
+ * (`secrets.ts`). The key does not skip it, so that no key changes.
+ * `scanStrings()` reads JSON text in one pass and gives each
+ * string with its depth, whether it is a field name, and its escapes.
+ * `decodeString()` decodes one string.
  */
+
+/** The parsed value of a JSON text, or `undefined` when it is not JSON. */
+export const parseJson = (text: string): unknown => {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+};
 
 /**
  * The parsed value of a JSON text, or `undefined` when it is not JSON. A
  * byte order mark at the start does not count.
  */
-export const parseJson = (text: string): unknown => {
-  try {
-    return JSON.parse(text.startsWith("\uFEFF") ? text.slice(1) : text);
-  } catch {
-    return undefined;
-  }
-};
+export const parseJsonSkipBom = (text: string): unknown =>
+  parseJson(text.startsWith("\uFEFF") ? text.slice(1) : text);
+
+/** Tells whether a parsed JSON value is an object that is not an array. */
+export const isObject = (json: unknown): json is Record<string, unknown> =>
+  json !== null && typeof json === "object" && !Array.isArray(json);
 
 const QUOTE = 0x22;
 

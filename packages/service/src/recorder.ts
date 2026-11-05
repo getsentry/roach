@@ -32,7 +32,7 @@
  */
 import { randomBytes } from "node:crypto";
 import type { IncomingHttpHeaders } from "node:http";
-import { reportInternal } from "./errors.ts";
+import { httpError, reportInternal } from "./errors.ts";
 import { firstChange, sampleKey, toSample, withheldSample } from "./misses.ts";
 import {
   keyInWorker,
@@ -296,11 +296,9 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
       knownTotal.chars + chars > maxKnown.chars
     ) {
       if (!closed) config.endRun("its sessions have too many changing values");
-      throw Object.assign(
-        new Error(
-          `the sessions of this run have over ${maxKnown.values} changing values or ${maxKnown.chars} characters of them. This run has ended.`,
-        ),
-        { status: 400 },
+      throw httpError(
+        400,
+        `the sessions of this run have over ${maxKnown.values} changing values or ${maxKnown.chars} characters of them. This run has ended.`,
       );
     }
     for (const [value, name] of added) session.known.set(value, name);
@@ -784,9 +782,9 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
         await finish(same, false);
       }
       if (open().length >= MAX_OPEN_SESSIONS) {
-        throw Object.assign(
-          new Error(`A run can have ${MAX_OPEN_SESSIONS} open sessions`),
-          { status: 429 },
+        throw httpError(
+          429,
+          `A run can have ${MAX_OPEN_SESSIONS} open sessions`,
         );
       }
       const ended = [...sessions.values()].filter(
@@ -818,9 +816,7 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
     async endSession(name: string, passed: boolean): Promise<number> {
       const ended = open().find((other) => other.name === name);
       if (!ended) {
-        throw Object.assign(new Error(`Session "${name}" is not open`), {
-          status: 409,
-        });
+        throw httpError(409, `Session "${name}" is not open`);
       }
       return finish(ended, passed);
     },
