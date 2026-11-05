@@ -3,7 +3,8 @@
 Use this file to answer questions about Roach from its Sentry data. Examples:
 "how many requests replayed?", "why does this run miss?", and "how much time
 do recordings save?". "Sentry" in `README.md` lists the metrics and spans.
-The code in `service/service.ts` and `src/recorder.ts` is authoritative.
+The code in `packages/service/src/service.ts` and
+`packages/service/src/recorder.ts` is authoritative.
 
 ## Where To Query
 

@@ -16,12 +16,12 @@ import {
   it,
   onTestFinished,
 } from "vitest";
-import { startRemoteRun, type RemoteRoach } from "../src/client.ts";
-import { describeRecordingStats } from "../src/report.ts";
-import { startRoachService, type RoachService } from "../service/service.ts";
+import { startRemoteRun, type RemoteRoach } from "@sentry/roach/client";
+import { describeRecordingStats } from "@sentry/roach/report";
+import { startRoachService, type RoachService } from "../src/service.ts";
 import { keyRequest } from "../src/request-key.ts";
-import type { RecordingMode, RecordingRule } from "../src/types.ts";
-import { VALUE_PATTERNS } from "../src/values.ts";
+import type { RecordingMode, RecordingRule } from "@sentry/roach/types";
+import { VALUE_PATTERNS } from "@sentry/roach/values";
 
 const TOKEN = "write-token";
 const TENANT = "acme/alpha";

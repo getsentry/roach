@@ -2,13 +2,14 @@
   "$schema": "https://unpkg.com/knip@6/schema.json",
   "ignoreBinaries": ["openssl"],
   "workspaces": {
-    ".": {
-      "project": ["src/**/*.ts", "tests/**/*.ts"],
-      "entry": ["src/action.ts"]
+    ".": {},
+    "packages/roach": {
+      "entry": ["src/action.ts"],
+      "project": ["src/**/*.ts", "tests/**/*.ts"]
     },
-    "service": {
-      "project": ["*.ts"],
-      "entry": ["cli.ts"]
+    "packages/service": {
+      "entry": ["src/cli.ts"],
+      "project": ["src/**/*.ts", "tests/**/*.ts"]
     }
   }
 }

@@ -9,7 +9,7 @@
  *
  * A session groups the requests of one test. Many sessions can be open at
  * once, such as one for each test worker. A request names its session in
- * its proxy URL (`service/service.ts`). A request that names no session
+ * its proxy URL (`service.ts`). A request that names no session
  * belongs to the open session when only one is open. The recorder keeps
  * the new recordings of a session in memory until the session ends. A passed
  * session writes them, and a failed session drops them, so a bad sample is
@@ -17,7 +17,7 @@
  * result of that session. A request outside a session is written at once.
  *
  * The recorder never writes a known credential (`secrets.ts`). It reports
- * spans and metrics through the `Telemetry` hooks of `service/service.ts`.
+ * spans and metrics through the `Telemetry` hooks of `service.ts`.
  */
 import { randomBytes } from "node:crypto";
 import type { IncomingHttpHeaders } from "node:http";
@@ -41,8 +41,12 @@ import type {
   RecordingRule,
   RecordingStats,
   RefusalReason,
-} from "./types.ts";
-import { fillValues, templateValues, type RequestValues } from "./values.ts";
+} from "@sentry/roach/types";
+import {
+  fillValues,
+  templateValues,
+  type RequestValues,
+} from "@sentry/roach/values";
 
 /** A request with its whole body. */
 export interface ProxyRequest {
@@ -66,7 +70,7 @@ export type ResponseSource = "live" | "missed" | "replayed";
 type Attributes = Record<string, string | number | boolean>;
 
 /**
- * Hooks that report spans and metrics. `service/service.ts` gives hooks
+ * Hooks that report spans and metrics. `service.ts` gives hooks
  * that send them to Sentry, so this file and `server.ts` do not load the
  * SDK. An attribute must never hold a credential, a body, or the path or
  * query of a URL.
@@ -95,7 +99,8 @@ interface Session {
   missed: number;
   /**
    * Changing values of the requests so far, with their names. A later
-   * request can repeat one where no pattern finds it (`values.ts`).
+   * request can repeat one where no pattern finds it
+   * (`@sentry/roach/values`).
    */
   known: Map<string, string>;
   /** Set when the session ends. */
