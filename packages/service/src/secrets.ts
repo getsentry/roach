@@ -232,32 +232,107 @@ export function redactUrl(
   return result;
 }
 
-/** Create the secret list of one proxy run, with the values of `initial`. */
-export function createSecrets(initial: string[] = []) {
+/**
+ * Add `value` and its parts to `into`, such as the token of
+ * `Bearer <token>` or each value of a cookie header.
+ */
+function add(value: string, into: Set<string>): void {
+  for (const part of [value, ...value.split(/[\s;,=]+/)]) {
+    if (part.length < MIN_LENGTH) continue;
+    into.add(part);
+    // The recorder redacts JSON text, which escapes `"`, `\`, and control
+    // characters.
+    into.add(JSON.stringify(part).slice(1, -1));
+  }
+}
+
+/**
+ * The most values that one run learns from its requests and its own
+ * `secrets`, and their total length in characters. The values of
+ * `initial` do not count.
+ */
+export interface LearnLimit {
+  values: number;
+  length: number;
+}
+
+/** `text` with each of `values` replaced. Give longer values first. */
+function redactWith(values: string[], text: string): string {
+  let result = text;
+  for (const value of values) result = result.replaceAll(value, REDACTED);
+  return result;
+}
+
+/** A request as its redacted text needs it (`redactRequestWith`). */
+export interface RequestToRedact {
+  href: string;
+  body: string;
+  contentType: string | string[] | undefined;
+}
+
+/**
+ * The text of `request`, such as the text that its key hashes, with each
+ * of `values` replaced. Give longer values first. It also replaces the
+ * value of each credential field (`CREDENTIAL_FIELDS`) at any depth of a
+ * JSON body, or of an `application/x-www-form-urlencoded` body. These
+ * values do not join the known credentials. In the first copy of the URL,
+ * the value of each credential query parameter is replaced at any length.
+ */
+export function redactRequestWith(
+  values: string[],
+  text: string,
+  request: RequestToRedact,
+): string {
+  const href = redactUrl(request.href);
+  const result = text.replace(request.href, () => href);
+  if (isForm(request.contentType)) {
+    return redactWith(values, redactForm(result, isCredentialField));
+  }
+  const json = parseJson(request.body);
+  return redactWith(
+    values,
+    replaceStrings(result, credentialValues(json, isCredentialField, true)),
+  );
+}
+
+/**
+ * Create the secret list of one proxy run, with the values of `initial`.
+ * A request that would make the run learn more than `limit` fails with
+ * HTTP 431 and learns nothing. So the proxy never forgets a credential
+ * that it saw, and it never sends or records such a request.
+ */
+export function createSecrets(initial: string[], limit: LearnLimit) {
   const values = new Set<string>();
-  // Keep the whole value and its parts, such as the token of
-  // `Bearer <token>` or each value of a cookie header.
-  const add = (value: string) => {
-    for (const part of [value, ...value.split(/[\s;,=]+/)]) {
-      if (part.length < MIN_LENGTH) continue;
-      values.add(part);
-      // The recorder redacts JSON text, which escapes `"`, `\`, and
-      // control characters.
-      values.add(JSON.stringify(part).slice(1, -1));
-    }
-  };
-  initial.forEach(add);
+  let learned = { values: 0, length: 0 };
+  initial.forEach((value) => add(value, values));
   // Redact longer values first, so no part of one stays visible.
   const longestFirst = () =>
     [...values].toSorted((a, b) => b.length - a.length);
 
   /** `text` with each known credential replaced. */
-  const redact = (text: string): string => {
-    let result = text;
-    for (const value of longestFirst()) {
-      result = result.replaceAll(value, REDACTED);
+  const redact = (text: string): string => redactWith(longestFirst(), text);
+
+  /**
+   * Add the values in `seen` that are new. When they make the run go past
+   * `limit`, it throws an error with `status` and adds nothing.
+   */
+  const admit = (seen: Set<string>, status: number): void => {
+    const next = { ...learned };
+    for (const part of seen) {
+      if (values.has(part)) continue;
+      next.values += 1;
+      next.length += part.length;
     }
-    return result;
+    if (next.values > limit.values || next.length > limit.length) {
+      throw Object.assign(
+        new Error(
+          `this run cannot learn more credentials (${limit.values} values or ${limit.length} characters, with the parts of each value). Start a new run.`,
+        ),
+        { status },
+      );
+    }
+    learned = next;
+    for (const part of seen) values.add(part);
   };
 
   /**
@@ -287,25 +362,43 @@ export function createSecrets(initial: string[] = []) {
     /**
      * Learn the credentials in the headers of a request, and in the query
      * of its `url`. A query value is learned as it is sent and decoded.
+     * Past the limit, it throws an error with HTTP status 431.
      */
     learn(headers: IncomingHttpHeaders, url?: URL): void {
+      const seen = new Set<string>();
       for (const [name, value] of Object.entries(headers)) {
         if (!CREDENTIAL_HEADER.test(name) || value === undefined) continue;
         if (NOT_CREDENTIAL_HEADERS.has(name)) continue;
-        for (const item of Array.isArray(value) ? value : [value]) add(item);
+        for (const item of Array.isArray(value) ? value : [value]) {
+          add(item, seen);
+        }
       }
       for (const { name, value } of url
         ? paramParts(url.search.slice(1))
         : []) {
         if (!CREDENTIAL_HEADER.test(decode(name))) continue;
-        add(value);
-        add(decode(value));
+        add(value, seen);
+        add(decode(value), seen);
       }
+      admit(seen, 431);
+    },
+
+    /**
+     * Add the `secrets` of a run. Each value and each of its parts count
+     * toward the limit. Past it, it throws an error with HTTP status 400.
+     */
+    addRunSecrets(secrets: string[]): void {
+      const seen = new Set<string>();
+      for (const value of secrets) add(value, seen);
+      admit(seen, 400);
     },
 
     redact,
 
     redactBytes,
+
+    /** The known credentials, longer values first (`redactRequestWith`). */
+    list: longestFirst,
 
     /**
      * The text of a response body with the value of each minted credential
@@ -317,17 +410,19 @@ export function createSecrets(initial: string[] = []) {
      * In an `application/x-www-form-urlencoded` body, the form fields
      * count. Other text does not change. The values join the known
      * credentials, so later recordings of the run do not show them either.
+     * They do not count toward the limit, because only a run that records
+     * gets them, from an upstream that `allow` names.
      */
     redactFields(text: string, contentType?: string): string {
       if (isForm(contentType)) {
         return redactForm(text, (name, value) => {
           if (!isMinted(name, value)) return false;
-          add(value);
+          add(value, values);
           return true;
         });
       }
       const minted = credentialValues(parseJson(text), isMinted, false);
-      minted.forEach(add);
+      for (const value of minted) add(value, values);
       return replaceStrings(text, minted);
     },
 
@@ -337,37 +432,30 @@ export function createSecrets(initial: string[] = []) {
      * replaced (`MINTED_FIELDS`, and a bare `token` with a credential
      * prefix), such as `#access_token=`. Other parameters do not change,
      * so a replay can follow the redirect. The values join the known
-     * credentials.
+     * credentials, as in `redactFields`.
      */
     redactLocation(href: string): string {
       return redactUrl(href, (name, value) => {
         if (!isMinted(name, value)) return false;
-        add(value);
+        add(value, values);
         return true;
       });
     },
 
     /**
      * The text of `request`, such as the text that its key hashes, with
-     * each known credential and the value of each credential field
-     * (`CREDENTIAL_FIELDS`) at any depth of a JSON body replaced, or of an
-     * `application/x-www-form-urlencoded` body. In the first copy of the
-     * URL, the value of each credential query parameter is replaced at any
-     * length. These values do not join the known credentials.
+     * each known credential and each credential field replaced
+     * (`redactRequestWith`).
      */
     redactRequest(
       text: string,
       request: { url: URL; headers: IncomingHttpHeaders; body: Buffer },
     ): string {
-      const href = redactUrl(request.url.href);
-      const result = text.replace(request.url.href, () => href);
-      if (isForm(request.headers["content-type"])) {
-        return redact(redactForm(result, isCredentialField));
-      }
-      const json = parseJson(request.body.toString("utf8"));
-      return redact(
-        replaceStrings(result, credentialValues(json, isCredentialField, true)),
-      );
+      return redactRequestWith(longestFirst(), text, {
+        href: request.url.href,
+        body: request.body.toString("utf8"),
+        contentType: request.headers["content-type"],
+      });
     },
   };
 }

@@ -36,8 +36,14 @@ import { promisify } from "node:util";
 import { brotliDecompress, gunzip, inflate } from "node:zlib";
 import { reportInternal } from "./errors.ts";
 import { firstChange, sampleKey, toSample } from "./misses.ts";
-import { keyRequest, type KeyedRequest } from "./request-key.ts";
-import { createSecrets, redactUrl } from "./secrets.ts";
+import {
+  keyInWorker,
+  redactInWorker,
+  type JobError,
+  type JobOptions,
+} from "./key-worker.ts";
+import { keyTimeLimit, type KeyedRequest } from "./request-key.ts";
+import { createSecrets, redactUrl, type LearnLimit } from "./secrets.ts";
 import {
   recordingKey,
   RULE_NAME,
@@ -142,6 +148,8 @@ interface Session extends Places {
    * (`@sentry/roach/values`).
    */
   known: Map<string, string>;
+  /** The total length of the values in `known`. */
+  knownLength: number;
   /** Set when the session ends. */
   passed?: boolean;
 }
@@ -162,6 +170,12 @@ const METRIC_OTHER_ORIGIN = "other";
 const MAX_ENDED_SESSIONS = 1000;
 /** Open sessions of a run, such as one for each test worker. */
 const MAX_OPEN_SESSIONS = 64;
+/**
+ * The values that a session remembers (`known`), and their total length.
+ * A session does not remember later values, so a later request that
+ * repeats one has it in its key as it is.
+ */
+const MAX_KNOWN = { values: 1000, length: 32 * 1024 };
 /** Content types that a recording keeps as text. Other bodies are base64. */
 const TEXT_CONTENT_TYPE = /^text\/|json|xml|x-www-form-urlencoded/i;
 /** Response headers that a recording keeps. Other headers change each run. */
@@ -297,6 +311,20 @@ export interface RecorderConfig {
   /** Credentials to redact, in addition to the ones that it learns. */
   secrets?: string[];
   /**
+   * The `secrets` of the run config. They count toward `learnLimit`, so
+   * too many of them throw an error with HTTP status 400.
+   */
+  runSecrets?: string[];
+  /** The credentials that the recorder can learn from requests. */
+  learnLimit: LearnLimit;
+  /** The time that the run can use in the key worker (`key-worker.ts`). */
+  workLimit: WorkLimit;
+  /**
+   * End the run, because it went past `workLimit`. The recorder then
+   * starts no more jobs of the run.
+   */
+  endRun(reason: string): void;
+  /**
    * Add the first change from a request sample to the first miss of each
    * session in the stats (`misses.ts`). Only a run with the write token may
    * set it: a change shows a part of a recorded request, so a public run
@@ -305,6 +333,22 @@ export interface RecorderConfig {
    */
   explainMisses?: boolean;
   telemetry: Telemetry;
+}
+
+/** The time that a run can use in the key worker (`key-worker.ts`). */
+export interface WorkLimit {
+  /**
+   * The most time of one job, in ms. A key also has the time limit of its
+   * body (`keyTimeLimit()`).
+   */
+  maxJobMs: number;
+  /** The time of all jobs of the run, in ms. Past it, the run ends. */
+  totalMs: number;
+  /**
+   * Set for a run without a token. A key that goes past its time limit
+   * ends the run. The jobs of the run go after the jobs of other runs.
+   */
+  untrusted: boolean;
 }
 
 /** Create the recorder of one run, with the store of its recordings. */
@@ -319,7 +363,24 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
   const open = () =>
     [...sessions.values()].filter((s) => s.passed === undefined);
   const { telemetry } = config;
-  const secrets = createSecrets(config.secrets);
+  const secrets = createSecrets(config.secrets ?? [], config.learnLimit);
+  secrets.addRunSecrets(config.runSecrets ?? []);
+  const { workLimit } = config;
+  let closed = false;
+  let workMs = 0;
+  /** The options of a job of `bytes` bytes in the key worker. */
+  const jobOptions = (bytes: number): JobOptions => ({
+    timeLimitMs: Math.min(workLimit.maxJobMs, keyTimeLimit(bytes)),
+    first: !workLimit.untrusted,
+    skip: () => closed,
+  });
+  /** Count the time of a job. Past `workLimit.totalMs`, end the run. */
+  const countWork = (ms: number) => {
+    workMs += ms;
+    if (workMs > workLimit.totalMs && !closed) {
+      config.endRun(`it used over ${workLimit.totalMs} ms in the key worker`);
+    }
+  };
   /**
    * A recording as the store keeps it. Only the stored recording loses the
    * credentials that the upstream minted (`secrets.redactFields`), because
@@ -445,7 +506,7 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
     key: string,
     owner: Session | undefined,
     sample: string,
-    text: () => string,
+    text: () => Promise<string | undefined>,
   ) => {
     const where = owner ? ` in "${owner.name}"` : "";
     process.stderr.write(`[roach] No ${rule.name} recording${where}: ${key}\n`);
@@ -460,7 +521,9 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
     const recorded = (await store.read(sample).catch(() => undefined)) as
       | RequestSample
       | undefined;
-    const change = recorded && firstChange(recorded, text());
+    // The redacted text has a time limit. Past it, the change is left out.
+    const redacted = recorded && (await text());
+    const change = redacted && firstChange(recorded, redacted);
     telemetry.annotate({ "miss.sample": recorded ? "found" : "none" });
     if (!change) return;
     telemetry.annotate({
@@ -502,13 +565,16 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
       return config.rules.find((rule) => matches(rule, request));
     },
 
-    /** Count a request that no rule records, and learn its credentials. */
-    countPassthrough(
-      origin: string,
-      headers: IncomingHttpHeaders,
-      sessionId?: string,
-    ): void {
+    /**
+     * Learn the credentials of a request that no rule records, before it
+     * goes out. It throws when the run cannot learn more.
+     */
+    learn(headers: IncomingHttpHeaders): void {
       secrets.learn(headers);
+    },
+
+    /** Count a request that no rule records. */
+    countPassthrough(origin: string, sessionId?: string): void {
       stats.passthrough[origin] = (stats.passthrough[origin] ?? 0) + 1;
       const owner = sessionOf(sessionId);
       telemetry.annotate({
@@ -561,10 +627,10 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
         "roach.rule": rule.name,
         ...(owner ? { "roach.session": owner.name } : {}),
       });
-      const { keyed, key } = telemetry.span(
+      const { keyed, key } = await telemetry.span(
         { op: "roach.key", attributes: { "roach.rule": rule.name } },
-        () => {
-          const result = keyRequest(
+        async () => {
+          const result = await keyInWorker(
             rule,
             {
               method: request.method,
@@ -573,17 +639,51 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
               body: request.body.toString("utf8"),
             },
             owner?.known,
-          );
-          const name = recordingKey(rule.name, result.key);
+            jobOptions(request.body.length),
+          ).catch((error: JobError) => {
+            countWork(error.ms);
+            if (error.timedOut && workLimit.untrusted && !closed) {
+              config.endRun("a key went past its time limit");
+              error.message += " This run has ended.";
+            }
+            throw error;
+          });
+          countWork(result.ms);
+          const name = recordingKey(rule.name, result.value.key);
           telemetry.annotate({ "roach.key": name });
-          return { keyed: result, key: name };
+          return { keyed: result.value, key: name };
         },
       );
-      const redactedText = () => secrets.redactRequest(keyed.text, request);
-      if (owner) {
+      /** The redacted text of the key, or `undefined` past the time limit. */
+      const redactedText = () =>
+        redactInWorker(
+          secrets.list(),
+          keyed.text,
+          {
+            href: request.url.href,
+            body: request.body.toString("utf8"),
+            contentType: request.headers["content-type"],
+          },
+          jobOptions(keyed.text.length),
+        ).then(
+          (result) => {
+            countWork(result.ms);
+            return result.value;
+          },
+          (error: JobError) => {
+            countWork(error.ms);
+            return undefined;
+          },
+        );
+      // An ended session has no use for more values.
+      if (owner && owner.passed === undefined) {
         for (const [name, list] of keyed.values) {
           for (const value of list) {
-            if (!owner.known.has(value)) owner.known.set(value, name);
+            if (owner.known.has(value)) continue;
+            if (owner.known.size >= MAX_KNOWN.values) continue;
+            if (owner.knownLength + value.length > MAX_KNOWN.length) continue;
+            owner.known.set(value, name);
+            owner.knownLength += value.length;
           }
         }
       }
@@ -681,7 +781,9 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
       if (!isTemporaryStatus(recording.response.status)) {
         await record(owner, key, {
           recording: toStored(recording),
-          samples: [[sample, toSample(key, redactedText())]],
+          samples: [
+            [sample, toSample(key, secrets.redactRequest(keyed.text, request))],
+          ],
         });
       }
       const response = fromRecording(recording, keyed.values);
@@ -722,6 +824,7 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
         recorded: new Map(),
         missed: 0,
         known: new Map(),
+        knownLength: 0,
         sent: new Map(),
         explained: false,
       });
@@ -747,8 +850,9 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
       return stats;
     },
 
-    /** Fail the open sessions. */
+    /** Fail the open sessions, and start no more jobs of the run. */
     async close(): Promise<void> {
+      closed = true;
       for (const session of open()) await finish(session, false);
     },
   };

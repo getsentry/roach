@@ -128,6 +128,54 @@ async function session(running: RemoteRoach, bodies: unknown[], passed = true) {
   return Object.assign(responses, { missed });
 }
 
+/**
+ * Requests of one session: 600 `git push` ranges with 1,200 commit ids
+ * that the pattern finds, from `first` on. Then two requests that quote
+ * the first and the last id alone, where only the memory of the session
+ * finds them.
+ */
+function pushRequests(first: number) {
+  const ids = Array.from({ length: 1200 }, (_, i) => (first + i).toString(16));
+  return [
+    {
+      messages: Array.from(
+        { length: 600 },
+        (_, i) => `${ids[2 * i]}..${ids[2 * i + 1]}  main -> main`,
+      ),
+    },
+    { messages: [`Pushed \`${ids[0]}\`.`] },
+    { messages: [`Pushed \`${ids[1199]}\`.`] },
+  ];
+}
+
+/**
+ * A model request of 6 M characters, with a screenshot and the time. Its
+ * sorted text has `messages` before `system`, so the time is near the end.
+ */
+const screenshotRequest = (time: string) => ({
+  model: "claude-sonnet-4-5",
+  max_tokens: 1024,
+  system: `You help with the tests of Roach. The time is ${time}.`,
+  messages: [
+    {
+      role: "user",
+      content: [
+        {
+          type: "image",
+          source: {
+            type: "base64",
+            media_type: "image/png",
+            data: "iVBORw0KGgoAAAANSUhEUgAAAoAAAAHgCAYAAAA10dzkAAAgAElEQVR4nO3d".repeat(
+              100_000,
+            ),
+          },
+        },
+        { type: "text", text: "What does the screen show?" },
+      ],
+    },
+  ],
+});
+
 async function files(): Promise<string[]> {
   return readdir(path.join(directory, TENANT, "model")).catch(() => []);
 }
@@ -597,6 +645,104 @@ describe("recording", () => {
     const narrow = await start("auto", [`${origin}/v2/`]);
     expect([...(await session(narrow, [{ model: "m" }]))]).toEqual([
       { body: "data: 2\n\n", source: "passthrough" },
+    ]);
+  });
+
+  it("keeps the keys of earlier versions", () => {
+    // These keys come from an earlier version of the service. A change to
+    // how the service makes keys must not change them, or recordings stop
+    // replaying.
+    const rule: RecordingRule = {
+      name: "model",
+      match: {},
+      values: {
+        uuid: VALUE_PATTERNS.uuid,
+        time: VALUE_PATTERNS.isoTime,
+        commit: VALUE_PATTERNS.gitCommit,
+      },
+    };
+    const keyOf = (
+      body: string,
+      known?: Map<string, string>,
+      url = "https://api.anthropic.com/v1/messages",
+    ) =>
+      keyRequest(rule, { method: "POST", url, headers: {}, body }, known).key;
+    const json = JSON.stringify({
+      model: "m",
+      messages: [
+        {
+          role: "user",
+          content:
+            "Archive memory 0b6f5c1e-3f7a-4d6e-9a54-1c2b3d4e5f60 at 2026-10-07T10:00:00Z",
+        },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "thinking",
+              thinking: "id 11111111-2222-4333-8444-555555555555",
+              signature: "sig",
+            },
+            {
+              type: "text",
+              text: "Pushed a5fd79f..a73e959, then quoted a73e959",
+            },
+          ],
+        },
+      ],
+    });
+    expect(keyOf(json, new Map([["a73e959", "commit"]]))).toBe(
+      "cf9fe9ecb2071fa3c332539ffb007b5d3c289d5eb883901e68a74e72424c08b8",
+    );
+    expect(
+      keyOf(
+        "plain 0b6f5c1e-3f7a-4d6e-9a54-1c2b3d4e5f60 text",
+        undefined,
+        "https://example.test/upload",
+      ),
+    ).toBe("390e57a543cc07f89643b17e75b8d295efd06e79af800884a2fe346d50c55f56");
+    // A body of 3 MiB, with 50,000 values.
+    const large = JSON.stringify({
+      model: "m",
+      lines: Array.from(
+        { length: 50_000 },
+        (_, i) =>
+          `line ${i} of the log, id 0b6f5c1e-3f7a-4d6e-9a54-${String(i).padStart(12, "0")}`,
+      ),
+    });
+    expect(keyOf(large)).toBe(
+      "0158550d2794ddc225cb9d383c62a599f06592d4626ecf13276ff6ab53d44118",
+    );
+    // A model request of 6 M characters (`screenshotRequest()`).
+    for (const time of ["2026-10-07T10:00:00Z", "2026-10-08T11:30:00Z"]) {
+      expect(keyOf(JSON.stringify(screenshotRequest(time)))).toBe(
+        "aaa37cd328518ec0b0146d6de0d863d6cfbb0cf468e0facf8db5b1536e8d499d",
+      );
+    }
+  });
+
+  it("replays a large request with a new time", async () => {
+    const running = await start("auto");
+    await session(running, [screenshotRequest("2026-10-07T10:00:00Z")]);
+
+    const replay = await session(running, [
+      screenshotRequest("2026-10-08T11:30:00Z"),
+    ]);
+
+    expect(replay.map(({ source }) => source)).toEqual(["replayed"]);
+  });
+
+  it("remembers at most 1,000 values in a session", async () => {
+    const running = await start("auto");
+    await session(running, pushRequests(0xa000000));
+
+    const replay = await session(running, pushRequests(0xb000000));
+
+    // The 1,200th id is past the limit, so its request has a new key.
+    expect(replay.map(({ source }) => source)).toEqual([
+      "replayed",
+      "replayed",
+      "live",
     ]);
   });
 

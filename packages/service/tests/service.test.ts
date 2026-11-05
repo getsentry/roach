@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
+import { once } from "node:events";
 import { createServer, type Server } from "node:http";
+import { connect } from "node:net";
 import {
   mkdir,
   mkdtemp,
@@ -18,6 +20,7 @@ import {
   expect,
   it,
   onTestFinished,
+  vi,
 } from "vitest";
 import {
   connectRoach,
@@ -26,7 +29,7 @@ import {
 } from "@sentry/roach/client";
 import { describeRecordingMisses } from "@sentry/roach/report";
 import { startRoachService, type RoachService } from "../src/service.ts";
-import type { RunConfig } from "@sentry/roach/types";
+import type { RemoteRun, RunConfig } from "@sentry/roach/types";
 import { VALUE_PATTERNS } from "@sentry/roach/values";
 
 let upstream: Server;
@@ -343,9 +346,10 @@ describe("roach service", () => {
     expect(tooLarge.status).toBe(413);
 
     // Anyone can start a run without a token, so the service has a cap on
-    // them. Another tenant name does not get around it.
+    // them for each client address. Another tenant name does not get
+    // around it. The cap of all clients is in "limits of the service".
     const open = await Promise.all(
-      Array.from({ length: 100 }, () => startRun(undefined, "replay")),
+      Array.from({ length: 10 }, () => startRun(undefined, "replay")),
     );
     await expect(startRun(undefined, "replay")).rejects.toThrow(/429/);
     await expect(
@@ -399,14 +403,21 @@ describe("roach service", () => {
 
     // A deployed service sends requests only to public addresses. A run
     // names its own origins, so it must not reach the metadata server or
-    // the network of the service, by IP address or by host name.
+    // the network of the service, by IP address or by host name. An IPv6
+    // address with an IPv4 address in it is refused too, also with a
+    // public one.
     const port = new URL(origin).port;
     const guarded = await startRoachService({
       directory,
       writeTokenHash: hash("write-token"),
     });
     try {
-      for (const target of [origin, `http://localhost:${port}`]) {
+      for (const target of [
+        origin,
+        `http://localhost:${port}`,
+        "http://[::ffff:808:808]",
+        "http://[::ffff:0:7f00:1]",
+      ]) {
         const run = await startRemoteRun(
           { url: guarded.url, token: "write-token" },
           {
@@ -588,5 +599,367 @@ describe("roach service", () => {
     );
     expect(text).toContain("conversation-id-0123456789");
     expect(text).not.toContain("sk-live-request-key-456");
+  });
+});
+
+/**
+ * A header value with `parts` parts that can each be a credential. The
+ * proxy learns the whole value and each part.
+ */
+const credential = (n: number, parts: number) =>
+  Array.from({ length: parts }, (_, i) => `cred-${n}-part-${i}`).join(" ");
+
+/**
+ * The times in ms that the service takes to answer `GET /ca.pem`, one call
+ * after the other until `pending` settles. The service runs in the test
+ * process, so a call is always open when its event loop stops.
+ */
+async function caWaitsUntil(pending: Promise<unknown>): Promise<number[]> {
+  const state = { done: false };
+  void pending.finally(() => (state.done = true)).catch(() => {});
+  const waits: number[] = [];
+  while (!state.done) {
+    const started = performance.now();
+    const response = await fetch(`${service.url}/__roach/ca.pem`);
+    await response.text();
+    waits.push(performance.now() - started);
+  }
+  return waits;
+}
+
+/** Move the fake clock `n` minutes. */
+const minutes = (n: number) => vi.advanceTimersByTimeAsync(n * 60 * 1000);
+
+/**
+ * Send one request on a new connection to `url`. With `client`, the
+ * connection starts with a PROXY header for that address, as from the load
+ * balancer. Returns status 0 when the service closes it without an answer.
+ */
+async function rawRequest(
+  url: string,
+  client: string | undefined,
+  method: string,
+  pathname: string,
+  body?: unknown,
+  headers: Record<string, string> = {},
+): Promise<{ status: number; body: string }> {
+  const { hostname, port } = new URL(url);
+  const socket = connect(Number(port), hostname);
+  await once(socket, "connect");
+  const text = body === undefined ? "" : JSON.stringify(body);
+  const lines = [
+    `${method} ${pathname} HTTP/1.1`,
+    "host: roach",
+    "connection: close",
+    `content-length: ${Buffer.byteLength(text)}`,
+    ...Object.entries(headers).map(([name, value]) => `${name}: ${value}`),
+  ];
+  const proxyHeader = client
+    ? `PROXY TCP4 ${client} 10.0.0.2 51234 443\r\n`
+    : "";
+  const chunks: Buffer[] = [];
+  socket.on("data", (chunk: Buffer) => chunks.push(chunk));
+  socket.write(`${proxyHeader}${lines.join("\r\n")}\r\n\r\n${text}`);
+  await once(socket, "close");
+  const reply = Buffer.concat(chunks).toString();
+  const end = reply.indexOf("\r\n\r\n");
+  let rest = reply.slice(end + 4);
+  if (/transfer-encoding: chunked/i.test(reply.slice(0, end))) {
+    let decoded = "";
+    for (;;) {
+      const line = rest.indexOf("\r\n");
+      const size = Number.parseInt(rest.slice(0, line), 16);
+      if (!size) break;
+      decoded += rest.slice(line + 2, line + 2 + size);
+      rest = rest.slice(line + 4 + size);
+    }
+    rest = decoded;
+  }
+  return {
+    status: Number(/^HTTP\/1\.1 (\d{3})/.exec(reply)?.[1] ?? 0),
+    body: rest,
+  };
+}
+
+describe("limits of the service", () => {
+  it("keeps answering while a run without a token sends slow patterns", async () => {
+    // Anyone can start this run. The pattern backtracks a lot on a body of
+    // `a`, so each key goes past its time limit.
+    const run = await startRun(undefined, "replay", {
+      rules: [
+        {
+          name: "model",
+          match: { method: "POST", url: `${origin}/v1/` },
+          values: { slow: "a*a*b" },
+        },
+      ],
+    });
+    const prompt = "a".repeat(4 * 1024 * 1024);
+    const sent = Promise.allSettled(
+      Array.from({ length: 20 }, () => send(run.url, { prompt })),
+    );
+    const waits = await caWaitsUntil(sent);
+    // The keys are made in a worker, so the service answers at once.
+    expect(Math.max(...waits)).toBeLessThan(500);
+    // The first key that goes past its time limit ends the run. The other
+    // requests do not start their keys.
+    const results = await sent;
+    const bodies = results.map((result) =>
+      result.status === "fulfilled"
+        ? `${result.value.status} ${result.value.body}`
+        : String(result.reason),
+    );
+    expect(
+      bodies.filter((body) => /^400 .*This run has ended/s.test(body)),
+    ).toHaveLength(1);
+    expect(bodies.filter((body) => /^(410|400) /.test(body))).toHaveLength(
+      results.filter((result) => result.status === "fulfilled").length,
+    );
+    await expect(run.stats()).rejects.toThrow(/404/);
+  });
+
+  it("refuses a large body from a run without a token", async () => {
+    const reader = await startRun(undefined, "replay");
+    const large = await send(reader.url, {
+      prompt: "x".repeat(16 * 1024 * 1024),
+    });
+    expect(large.status).toBe(413);
+    const allowed = await send(reader.url, {
+      prompt: "x".repeat(15 * 1024 * 1024),
+    });
+    expect(allowed.status).toBe(412);
+  });
+
+  it("counts the parts of run secrets, and limits the redaction of a miss", async () => {
+    // Each part of a secret is a value to redact. Too many parts are
+    // refused when the run starts.
+    await expect(
+      startRun(undefined, "replay", {
+        secrets: Array.from({ length: 32 }, (_, n) => credential(n, 40)),
+      }),
+    ).rejects.toThrow(/400.*cannot learn more credentials/);
+
+    // A recorded sample, so that the first miss of the session compares
+    // its redacted text with it.
+    await sendInSession(await startRun("write-token", "auto"), "hi");
+    const reader = await startRun(undefined, "replay", {
+      secrets: Array.from({ length: 24 }, (_, n) => credential(n, 40)),
+    });
+    const opened = await reader.startSession("public test name");
+    const started = Date.now();
+    // Text that looks like the secrets makes each search slow.
+    const missed = send(opened.url, {
+      prompt: "cred-1-part-".repeat(1024 * 1024),
+    });
+    const waits = await caWaitsUntil(missed);
+    expect((await missed).status).toBe(412);
+    // The redaction is in the worker, and it stops after 5 s.
+    expect(Math.max(...waits)).toBeLessThan(500);
+    expect(Date.now() - started).toBeLessThan(10_000);
+    await opened.end(true);
+  });
+
+  it("refuses a large control body before it parses it", async () => {
+    const runsUrl = `${service.url}/__roach/runs`;
+    // A valid start of a run config, so a parse would give HTTP 400.
+    const body = JSON.stringify({
+      tenant: "acme/alpha",
+      mode: "replay",
+      pad: "x".repeat(1024 * 1024),
+    });
+    const sized = await fetch(runsUrl, { method: "POST", body });
+    expect(sized.status).toBe(413);
+    // A body without a length stops at the limit too.
+    const streamed = await fetch(runsUrl, {
+      method: "POST",
+      body: new Blob([body]).stream(),
+      duplex: "half",
+    });
+    expect(streamed.status).toBe(413);
+  });
+
+  it("refuses a request with a new credential past the limit of the run", async () => {
+    // A run without a token learns at most 1,024 values: 201 for each of
+    // these requests.
+    const reader = await startRun(undefined, "replay");
+    for (let n = 0; n < 5; n += 1) {
+      const response = await send(
+        reader.url,
+        { prompt: "hi" },
+        { "x-api-key": credential(n, 200) },
+      );
+      expect(response.status).toBe(412);
+    }
+    const refused = await send(
+      reader.url,
+      { prompt: "hi" },
+      { "x-api-key": credential(5, 200) },
+    );
+    expect(refused.status).toBe(431);
+    expect(refused.body).toMatch(/cannot learn more credentials/);
+    // A credential that the run knows does not count again.
+    const known = await send(
+      reader.url,
+      { prompt: "hi" },
+      { "x-api-key": credential(0, 200) },
+    );
+    expect(known.status).toBe(412);
+    expect((await reader.stats()).counts.model?.missed).toBe(6);
+
+    // A run with the token learns at most 16,384 values: 601 for each of
+    // these requests. A request that no rule records learns them before
+    // it goes out, so the proxy never sends a credential that it forgot.
+    const writer = await startRun("write-token", "auto");
+    const agent = new ProxyAgent({ uri: writer.url, proxyTunnel: true });
+    agents.push(agent);
+    const passthrough = async (n: number) => {
+      const response = await request(`${origin}/other`, {
+        dispatcher: agent,
+        headers: { "x-api-key": credential(n, 600) },
+      });
+      await response.body.dump();
+      return response.statusCode;
+    };
+    for (let n = 0; n < 27; n += 1) expect(await passthrough(n)).toBe(200);
+    expect(await passthrough(27)).toBe(431);
+    expect(liveRequests).toBe(27);
+  });
+
+  it("ends a run without a token after 60 minutes without traffic, or after 2 hours", async () => {
+    // The sweep of the service runs each minute and reads the clock.
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
+    const local = await startRoachService({
+      directory,
+      privateNetworks: true,
+      writeTokenHash: hash("write-token"),
+    });
+    onTestFinished(async () => {
+      await local.close();
+      vi.useRealTimers();
+    });
+    const start = (token: string | undefined) =>
+      startRemoteRun(
+        { url: local.url, token },
+        {
+          tenant: "acme/alpha",
+          mode: token ? "auto" : "replay",
+          allow: [origin],
+          rules: [
+            { name: "model", match: { method: "POST", url: `${origin}/v1/` } },
+          ],
+        },
+      );
+    const idle = await start(undefined);
+    const busy = await start(undefined);
+    const writer = await start("write-token");
+
+    await minutes(50);
+    expect(await send(busy.url, { prompt: "hi" })).toMatchObject({
+      status: 412,
+    });
+    await minutes(11);
+    await expect(idle.stats()).rejects.toThrow(/404/);
+    await expect(busy.stats()).resolves.toMatchObject({ written: 0 });
+
+    // A call each 50 minutes does not keep it open for more than 2 hours.
+    await minutes(50);
+    await expect(busy.stats()).resolves.toMatchObject({ written: 0 });
+    await minutes(10);
+    await expect(busy.stats()).rejects.toThrow(/404/);
+    // A run with the token has only the limit of 6 hours.
+    await expect(writer.stats()).resolves.toMatchObject({ written: 0 });
+  });
+
+  it("closes a tunnel that sends no byte after the 200", async () => {
+    const run = await startRun(undefined, "replay");
+    const proxy = new URL(run.url);
+    const authority = new URL(origin).host;
+    const socket = connect(Number(proxy.port), proxy.hostname);
+    onTestFinished(() => {
+      socket.destroy();
+      vi.useRealTimers();
+    });
+    await once(socket, "connect");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const credentials = Buffer.from(
+      `${proxy.username}:${proxy.password}`,
+    ).toString("base64");
+    socket.write(
+      `CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\nProxy-Authorization: Basic ${credentials}\r\n\r\n`,
+    );
+    const [reply] = (await once(socket, "data")) as [Buffer];
+    expect(reply.toString()).toMatch(/^HTTP\/1.1 200/);
+    const closed = once(socket, "close");
+
+    await vi.advanceTimersByTimeAsync(9000);
+    expect(socket.readyState).toBe("open");
+    await vi.advanceTimersByTimeAsync(2000);
+    vi.useRealTimers();
+
+    await expect(
+      Promise.race([
+        closed.then(() => "closed"),
+        new Promise((resolve) => setTimeout(() => resolve("open"), 2000)),
+      ]),
+    ).resolves.toBe("closed");
+  });
+  it("limits the runs without a token of each client", async () => {
+    // Behind the load balancer, each connection starts with a PROXY
+    // header. It gives the address of the client.
+    const local = await startRoachService({
+      directory,
+      privateNetworks: true,
+      writeTokenHash: hash("write-token"),
+      proxyProtocol: true,
+    });
+    onTestFinished(() => local.close());
+    const config = {
+      tenant: "acme/alpha",
+      mode: "replay",
+      allow: [origin],
+      rules: [{ name: "model", match: {} }],
+    };
+    const startFrom = (client: string) =>
+      rawRequest(local.url, client, "POST", "/__roach/runs", config);
+
+    const first = await startFrom("203.0.113.1");
+    expect(first.status).toBe(201);
+    for (let n = 1; n < 10; n += 1) {
+      expect((await startFrom("203.0.113.1")).status).toBe(201);
+    }
+    const eleventh = await startFrom("203.0.113.1");
+    expect(eleventh).toMatchObject({ status: 429 });
+    expect(eleventh.body).toMatch(/Your address has 10 open runs/);
+    // Other clients have their own limit, and the service has 100 places.
+    for (let client = 2; client <= 10; client += 1) {
+      for (let n = 0; n < 10; n += 1) {
+        expect((await startFrom(`203.0.113.${client}`)).status).toBe(201);
+      }
+    }
+    const full = await startFrom("203.0.113.11");
+    expect(full).toMatchObject({ status: 429 });
+    expect(full.body).toMatch(/The service has 100 open runs/);
+    // An ended run frees its place.
+    const { controlUrl, token } = JSON.parse(first.body) as RemoteRun;
+    const ended = await rawRequest(
+      local.url,
+      "203.0.113.1",
+      "DELETE",
+      new URL(controlUrl).pathname,
+      undefined,
+      { authorization: `Bearer ${token}` },
+    );
+    expect(ended.status).toBe(200);
+    expect((await startFrom("203.0.113.1")).status).toBe(201);
+
+    // A connection without the header gets no answer.
+    const bare = await rawRequest(
+      local.url,
+      undefined,
+      "POST",
+      "/__roach/runs",
+      config,
+    );
+    expect(bare.status).toBe(0);
   });
 });

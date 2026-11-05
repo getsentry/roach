@@ -8,8 +8,9 @@
  * `<<name>>` in the key (`@sentry/roach/values`).
  *
  * The patterns of `values` come from the client, and all runs share one
- * process. A slow pattern would block every run, so a key has a time limit
- * (`KEY_TIME_LIMIT`).
+ * process. A slow pattern would block every run. So the service makes keys
+ * in a worker thread (`key-worker.ts`), and a key has a time limit
+ * (`keyTimeLimit()`).
  */
 import { createHash } from "node:crypto";
 import type { IncomingHttpHeaders } from "node:http";
@@ -28,10 +29,16 @@ const KEY_VERSION = "http-v1";
 
 /**
  * The time that the key of one request can take: 1 s, and 0.5 s for each
- * MiB of the body. The built-in patterns take less than 0.1 s for each
+ * MiB of the body. The built-in patterns take about 60 to 110 ms for each
  * MiB. A key that takes longer fails its request, and other runs go on.
  */
 const KEY_TIME_LIMIT = { baseMs: 1000, msPerMiB: 500 };
+
+/** The time limit of the key of a body of `bytes` bytes, in ms. */
+export function keyTimeLimit(bytes: number): number {
+  const mib = bytes / (1024 * 1024);
+  return Math.ceil(KEY_TIME_LIMIT.baseMs + KEY_TIME_LIMIT.msPerMiB * mib);
+}
 
 /** The parts of a request that make its key. */
 interface RequestToKey {
@@ -128,18 +135,16 @@ const sha256 = (text: string) =>
 /**
  * The key and the changing values of a request. `known` holds the values
  * of earlier requests in the same session (`@sentry/roach/values`). It
- * throws an error with HTTP status 400 when it takes too long.
+ * throws an error with HTTP status 400 when it takes longer than
+ * `timeLimitMs`, by default `keyTimeLimit()` of the body.
  */
 export function keyRequest(
   rule: RecordingRule,
   request: RequestToKey,
   known?: KnownValues,
+  timeLimitMs = keyTimeLimit(Buffer.byteLength(request.body)),
 ): KeyedRequest {
-  const mib = Buffer.byteLength(request.body) / (1024 * 1024);
-  return withTimeLimit(
-    Math.ceil(KEY_TIME_LIMIT.baseMs + KEY_TIME_LIMIT.msPerMiB * mib),
-    () => keyRequestNow(rule, request, known),
-  );
+  return withTimeLimit(timeLimitMs, () => keyRequestNow(rule, request, known));
 }
 
 function keyRequestNow(
