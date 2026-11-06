@@ -968,7 +968,8 @@ manager accepts it, Craft:
 
 - copies the image `ghcr.io/getsentry/roach:<sha>` to `:<version>`.
 - makes the GitHub release `v<version>`, with the changelog, and moves the
-  `v<major>` tag. Repositories use the action as `getsentry/roach@v<major>`.
+  `v<major>` tag. When the changelog has more than 5 entries, Craft adds a
+  short AI summary above them. Repositories use the action as `getsentry/roach@v<major>`.
 - publishes `@sentry/roach` to npm: the tarball that the `package` job of
   `CI` uploads for the release commit. Craft publishes only
   `sentry-roach-<version>.tgz`, and CI makes sure that it has `LICENSE` and

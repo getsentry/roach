@@ -1,6 +1,10 @@
 minVersion: "3.9.0"
 changelog:
   policy: auto
+  # Add a short AI summary above the entries of each release. The Release
+  # workflow gives Craft the workflow token for it.
+  aiSummary:
+    levels: [release]
 # Write the version only to `@sentry/roach` (packages/roach/package.json).
 # See the script for why Craft does not do it on its own.
 preReleaseCommand: sh .github/scripts/bump-version.sh
