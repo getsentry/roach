@@ -6,7 +6,7 @@ packages:
 # One version of each tool that more than one package uses, and of each
 # tool that must have the same version as one of them.
 catalog:
-  "@types/node": ^24.19.1
+  "@types/node": ^26.6.6
   # Must be the same version as vitest.
   "@vitest/coverage-v8": ^5.1.0
   typescript: ^7.0.2
