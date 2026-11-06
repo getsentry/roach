@@ -5,15 +5,21 @@ name: Release
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: Version bump type
+      bump:
+        description: Version bump type (ignored when version is set). auto picks it from the commits; pre cuts a prerelease of that version.
         required: true
         type: choice
-        default: minor
+        default: auto
         options:
-          - minor
+          - auto
+          - pre
           - patch
+          - minor
           - major
+      version:
+        description: Exact version override (for example, 0.212.0)
+        required: false
+        type: string
       force:
         description: Force release (bypass blockers)
         required: false
@@ -22,6 +28,8 @@ on:
 
 permissions:
   contents: read
+  # Craft writes AI changelog summaries with the workflow token.
+  copilot-requests: write
 
 jobs:
   release:
@@ -50,9 +58,10 @@ jobs:
         run: .github/scripts/drop-floating-tags.sh
 
       - name: Prepare release
-        uses: getsentry/craft@2e29b0819113d334c15da3d8cac2138cb9dc111a # 3.9.0
+        uses: getsentry/craft@68615816cdad571fdc24b7d35f45238c835affc2 # 3.11.0
         env:
           GITHUB_TOKEN: ${{ steps.token.outputs.token }}
         with:
-          version: ${{ inputs.version }}
+          version: ${{ inputs.version || inputs.bump }}
           force: ${{ inputs.force && 'true' || 'false' }}
+          llm_api_key: ${{ github.token }}
