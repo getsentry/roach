@@ -958,14 +958,18 @@ does not exist does.
 
 ## Release
 
-Run the `Release` workflow, and choose `minor`, `patch`, or `major`. Craft
-(`.craft.yml`) makes a `release/<version>` branch and asks for approval in
+Run the `Release` workflow. Choose a `bump`: `auto` (the default), `pre`,
+`patch`, `minor`, or `major`. `auto` picks the bump from the commits. `pre`
+makes a prerelease of the version that `auto` picks. To release an exact
+version, type it in `version`. Craft (`.craft.yml`) makes a
+`release/<version>` branch and asks for approval in
 [getsentry/publish](https://github.com/getsentry/publish). When a release
 manager accepts it, Craft:
 
 - copies the image `ghcr.io/getsentry/roach:<sha>` to `:<version>`.
 - makes the GitHub release `v<version>`, with the changelog, and moves the
-  `v<major>` tag. Repositories use the action as `getsentry/roach@v<major>`.
+  `v<major>` tag. When the changelog has more than 5 entries, Craft adds a
+  short AI summary above them. Repositories use the action as `getsentry/roach@v<major>`.
 - publishes `@sentry/roach` to npm: the tarball that the `package` job of
   `CI` uploads for the release commit. Craft publishes only
   `sentry-roach-<version>.tgz`, and CI makes sure that it has `LICENSE` and
