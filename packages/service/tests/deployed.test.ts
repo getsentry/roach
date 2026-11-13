@@ -30,6 +30,7 @@ import type { RoachServiceConfig } from "../src/service.ts";
 const execFileAsync = promisify(execFile);
 const ROOT = path.join(import.meta.dirname, "..");
 const TOKEN = "roach-write-token";
+const READ_TOKEN = "roach-read-token";
 const TENANT = "getsentry/junior";
 const BUCKET = "roach-recordings";
 const GCS_TOKEN = "vm-access-token";
@@ -179,6 +180,7 @@ function requestMetrics(mode: string, result: string) {
  * stderr of the action, what the command saw, and the job summary.
  */
 async function ciJob(job: {
+  /** The write token. Every job has the read token. */
   token?: string;
   runId: string;
   prompt: string;
@@ -211,7 +213,7 @@ const body = await response.text();
 ${job.refused ? `await fetch(${JSON.stringify(job.refused)}).catch(() => {});` : ""}
 console.log(JSON.stringify({
   response: { status: response.status, source: response.headers.get("x-roach"), body },
-  token: process.env.INPUT_TOKEN ?? null,
+  token: process.env.INPUT_TOKEN ?? process.env["INPUT_READ-TOKEN"] ?? null,
   actions: Object.keys(process.env).filter((name) => name.startsWith("ACTIONS_")),
   trusted: readFileSync(process.env.NODE_EXTRA_CA_CERTS, "utf8"),
 }));
@@ -244,6 +246,7 @@ console.log(JSON.stringify({
         INPUT_RUN: "node job.mjs > result.json",
         INPUT_URL: frontUrl,
         INPUT_TOKEN: job.token ?? "",
+        "INPUT_READ-TOKEN": READ_TOKEN,
       }),
       stdio: ["ignore", "ignore", "pipe"],
     },
@@ -406,6 +409,7 @@ beforeAll(async () => {
     // option, so runs reach only public addresses.
     privateNetworks: true,
     writeTokenHash: createHash("sha256").update(TOKEN).digest("hex"),
+    readTokenHash: createHash("sha256").update(READ_TOKEN).digest("hex"),
     ca: { cert: caCert, key: await readFile(caKeyFile, "utf8") },
     sentryDsn: `http://public@127.0.0.1:${sentryPort}/1`,
     proxyProtocol: true,
@@ -454,7 +458,7 @@ afterAll(async () => {
 });
 
 describe("deployed roach", () => {
-  it("records with the token, replays for a fork, and counts in Sentry", async () => {
+  it("records with the write token, replays with the read token, and counts in Sentry", async () => {
     const refusedOrigin = "127.0.0.3:8443";
     const writer = await ciJob({
       token: TOKEN,
@@ -469,7 +473,7 @@ describe("deployed roach", () => {
       body: modelStream(1),
     });
     expect(writer.summary).toContain("1 recordings new or changed");
-    // The command never sees the write token or the tokens of the runner.
+    // The command never sees the tokens of Roach or of the runner.
     expect(writer.token).toBeNull();
     expect(writer.actions).toEqual([]);
     // It trusts the authority of the service, which a restart keeps, and
@@ -486,10 +490,11 @@ describe("deployed roach", () => {
       ),
     ]);
 
-    // Without the token, the action only replays.
-    const fork = await ciJob({ runId: "fork", prompt: "hi" });
-    expect(fork.exitCode).toBe(0);
-    expect(fork.response).toEqual({
+    // With only the read token, the action only replays.
+    const reader = await ciJob({ runId: "reader", prompt: "hi" });
+    expect(reader.exitCode).toBe(0);
+    expect(reader.token).toBeNull();
+    expect(reader.response).toEqual({
       status: 200,
       source: "replayed",
       body: modelStream(1),
@@ -501,13 +506,13 @@ describe("deployed roach", () => {
     expect(miss.response.status).toBe(412);
     expect(miss.exitCode).toBe(1);
     expect(miss.summary).toMatch(/^- test: model\/[0-9a-f]{64}\.json$/m);
-    // A run without the token does not see what changed in its summary,
+    // A run with the read token does not see what changed in its summary,
     // because that shows a part of the recorded request. Sentry gets it.
     expect(miss.summary).not.toContain("Changed at character");
     expect(miss.summary).not.toContain(String.raw`\"prompt\":\"hi\"`);
     expect(liveRequests).toBe(1);
 
-    // A failed GCS read gives a client without the token only the id of
+    // A failed GCS read gives a client with the read token only the id of
     // the Sentry event, never the body of the GCS response.
     failGcs = "read";
     const brokenRead = await ciJob({ runId: "broken-read", prompt: "hi" });
@@ -691,7 +696,7 @@ describe("deployed roach", () => {
       "http.request.method": "CONNECT",
     });
     // A replay reports the usage of its recording: the call that it saved.
-    expect(span("roach.request", "fork-1")).toMatchObject({
+    expect(span("roach.request", "reader-1")).toMatchObject({
       "roach.result": "replayed",
       ...MODEL_USAGE,
     });
@@ -706,7 +711,7 @@ describe("deployed roach", () => {
       "http.response.status_code": 502,
     });
     // The first miss of each run looks for a request sample. The writer
-    // found none. The run without the token found the writer's, and Sentry
+    // found none. The run with the read token found the writer's, and Sentry
     // gets the redacted change, which its summary does not show. The change
     // is in the query, so the text shows the URL with its key redacted.
     expect(span("roach.request", "writer-1")).toMatchObject({
@@ -733,7 +738,7 @@ describe("deployed roach", () => {
       "roach.key": relativeKey,
       "roach.result": "missed",
     });
-    expect(span("roach.store.read", "fork-1")).toMatchObject({
+    expect(span("roach.store.read", "reader-1")).toMatchObject({
       "roach.key": relativeKey,
       "roach.result": "replayed",
     });

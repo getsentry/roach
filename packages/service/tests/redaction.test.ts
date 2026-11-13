@@ -16,7 +16,13 @@ import { ProxyAgent, request } from "undici";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { startRemoteRun, type RemoteRoach } from "@sentry/roach/client";
 import type { RoachService } from "../src/service.ts";
-import { budget, startTestService, startUpstream, TOKEN } from "./harness.ts";
+import {
+  budget,
+  READ_TOKEN,
+  startTestService,
+  startUpstream,
+  TOKEN,
+} from "./harness.ts";
 import { keyRequest } from "../src/request-key.ts";
 import type { Recording, RequestSample } from "../src/store.ts";
 import type { RecordingMode, RecordingRule } from "@sentry/roach/types";
@@ -1111,10 +1117,10 @@ describe("redaction", () => {
 
   it("learns a credential with `/` without more values toward the limit", async () => {
     // A SigV4 `Authorization` header has a new value with `/` on each
-    // request. A run without the token learns at most 1,024 values, and
+    // request. A run with the read token learns at most 1,024 values, and
     // this header has 401: the value and its 400 parts.
     const run = await startRemoteRun(
-      { url: service.url },
+      { url: service.url, token: READ_TOKEN },
       { tenant: TENANT, mode: "replay", allow: [origin], rules: [rule()] },
     );
     runs.push(run);

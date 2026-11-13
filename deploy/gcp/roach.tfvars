@@ -1,6 +1,6 @@
 # The production deployment of Roach for Sentry. Apply with:
 #   terraform init && terraform apply -var-file=roach.tfvars
-# This file holds no secrets. Terraform makes the CA key and the write token,
+# This file holds no secrets. Terraform makes the CA key and the tokens,
 # and keeps them only in the state bucket (see versions.tf).
 project = "roach-511216"
 # Point an A record of this name at the ip_address output.

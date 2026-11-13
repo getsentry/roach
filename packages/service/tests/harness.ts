@@ -24,6 +24,9 @@ export const budget = (ms: number) =>
 /** The write token of a test service. */
 export const TOKEN = "write-token";
 
+/** The read token of a test service. */
+export const READ_TOKEN = "read-token";
+
 /** The SHA-256 of a token in hex, as `writeTokenHash` keeps it. */
 const hash = (token: string) =>
   createHash("sha256").update(token).digest("hex");
@@ -47,8 +50,8 @@ export async function startUpstream(
 
 /**
  * Start a service in this process, with the recordings in a new directory.
- * It can reach the upstream on 127.0.0.1 (`privateNetworks`), and its write
- * token is `TOKEN`. `extra` adds to or replaces this config. The service
+ * It can reach the upstream on 127.0.0.1 (`privateNetworks`), its write
+ * token is `TOKEN`, and its read token is `READ_TOKEN`. `extra` adds to or replaces this config. The service
  * closes, and its directory goes, when the test finishes.
  */
 export async function startTestService(
@@ -59,6 +62,7 @@ export async function startTestService(
     directory,
     privateNetworks: true,
     writeTokenHash: hash(TOKEN),
+    readTokenHash: hash(READ_TOKEN),
     ...extra,
   });
   onTestFinished(async () => {

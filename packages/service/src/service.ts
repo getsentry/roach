@@ -7,12 +7,13 @@
  * run of a tenant, such as one CI job. It has its own mode, rules,
  * sessions, and stats.
  *
- * - Anyone can create a `replay` run of a tenant, so CI jobs of forks
- *   replay recordings without a secret. Such a run never writes.
+ * - Each run needs a token. A `replay` run needs the read token or the
+ *   write token. Such a run with the read token never writes.
  * - A run in another mode needs the write token, because it writes
- *   recordings. All tenants share one write token, and the service keeps
- *   only its SHA-256. The tenant name is a label, not proof of identity:
- *   a holder of the token can write the recordings of any tenant.
+ *   recordings. All tenants share one read token and one write token, and
+ *   the service keeps only their SHA-256. The tenant name is a label, not
+ *   proof of identity: a holder of a token can read, or write, the
+ *   recordings of any tenant.
  * - The service gives each run its own id and token. A proxied request
  *   names its run in `Proxy-Authorization`, as `Basic base64(<id>:<token>)`.
  *   The proxy URL of the run has them, so `HTTPS_PROXY` sends them.
@@ -21,7 +22,7 @@
  *   service. Two checks keep that safe for the other tenants. The proxy
  *   sends requests only to public addresses (`addresses.ts`), so a run
  *   cannot reach the metadata server or the VPC. The key of a request has
- *   a time limit, and the keys of runs without the token are made in a
+ *   a time limit, and the keys of runs with the read token are made in a
  *   worker process (`key-worker.ts`), so a slow pattern fails only its own
  *   request.
  * - The recordings of a tenant are under `<tenant>/`, in a directory or a
@@ -89,6 +90,11 @@ export interface RoachServiceConfig {
    * Give it only to CI jobs that you trust.
    */
   writeTokenHash: string;
+  /**
+   * The SHA-256 of the read token, in hex. All tenants share the token. A
+   * run with it can only replay. Give it to CI jobs that only replay.
+   */
+  readTokenHash: string;
   /** Credentials to redact in all recordings. */
   secrets?: string[];
   /**
@@ -136,56 +142,58 @@ const TRACES_SAMPLE_RATE = 1;
 /** A run that is open longer than this ends as failed, such as a dead job. */
 const RUN_TIMEOUT_MS = 6 * 60 * 60 * 1000;
 /**
- * Anyone can start a run without a token, so such runs have smaller
- * limits. One ends after 2 hours, or after 60 minutes without a proxied
- * request or a control call. The action starts the run before the command
- * of the job, so a long install or build step must not end it.
+ * The read token goes to more jobs than the write token, so runs with the
+ * read token have smaller limits. One ends after 2 hours, or after 60
+ * minutes without a proxied request or a control call. The action starts
+ * the run before the command of the job, so a long install or build step
+ * must not end it.
  */
-const PUBLIC_RUN_TIMEOUT_MS = 2 * 60 * 60 * 1000;
-const PUBLIC_RUN_IDLE_MS = 60 * 60 * 1000;
+const READ_RUN_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+const READ_RUN_IDLE_MS = 60 * 60 * 1000;
 /**
- * The open runs without a token that the service can have, for all tenants.
- * Anyone can start them with any tenant name, so the cap is not per tenant.
- * It keeps memory bounded. Runs with the token have no cap.
+ * The open runs with the read token that the service can have, for all
+ * tenants. They can have any tenant name, so the cap is not per tenant.
+ * It keeps memory bounded. Runs with the write token have no cap.
  */
-const MAX_PUBLIC_RUNS = 100;
+const MAX_READ_RUNS = 100;
 /**
- * The open runs without a token of one client address, or of one IPv6 /64,
- * so one client cannot take all places of `MAX_PUBLIC_RUNS`.
+ * The open runs with the read token of one client address, or of one IPv6
+ * /64, so one client cannot take all places of `MAX_READ_RUNS`.
  */
-const MAX_PUBLIC_RUNS_PER_CLIENT = 10;
-/** A proxied request body of a run without a token over this gets 413. */
-const PUBLIC_MAX_BODY_BYTES = 16 * 1024 * 1024;
+const MAX_READ_RUNS_PER_CLIENT = 10;
+/** A proxied request body of a run with the read token over this gets 413. */
+const READ_MAX_BODY_BYTES = 16 * 1024 * 1024;
 /**
- * The bytes of request bodies that all runs without a token can hold at
- * one time. A request holds its body until it finishes, also while its key
+ * The bytes of request bodies that all runs with the read token can hold
+ * at one time. A request holds its body until it finishes, also while its key
  * waits for the key worker. A body that does not fit gets HTTP 503, and
  * the run goes on. With 128 MiB, 30 or 60 parallel bodies of 16 MiB take
  * at most about 1.1 GB of RSS for the service and the key worker. Without
  * the budget, 60 took 3.4 GB. The largest model request in the 14 days
  * to 2026-11-05 was about 0.65 MB.
  */
-const PUBLIC_BODY_BUDGET_BYTES = 128 * 1024 * 1024;
+const READ_BODY_BUDGET_BYTES = 128 * 1024 * 1024;
 /**
- * The part of `PUBLIC_BODY_BUDGET_BYTES` that the runs of one client
+ * The part of `READ_BODY_BUDGET_BYTES` that the runs of one client
  * (`clientGroup()` of the client that started the run) can hold, so that
  * one client cannot take all of it. It takes 8 clients to fill the budget.
  * It is 1 body of 16 MiB, or about 25 of the largest model requests.
  */
-const PUBLIC_BODY_CLIENT_BYTES = 16 * 1024 * 1024;
+const READ_BODY_CLIENT_BYTES = 16 * 1024 * 1024;
 /**
- * A body of a run without a token that does not come in this time gets
+ * A body of a run with the read token that does not come in this time gets
  * HTTP 408, and gives its bytes back. So a client that sends a byte now
  * and then cannot hold its part of the budget. 16 MiB in 30 s is about
  * 4.5 Mbit/s.
  */
-const PUBLIC_BODY_READ_MS = 30_000;
+const READ_BODY_TIMEOUT_MS = 30_000;
 /**
- * The work of a run without a token (`WorkLimit`). A key has 1 s and 0.5 s
- * for each MiB of its body. One job in the key worker (`key-worker.ts`) has
- * at most 5 s, and all jobs 30 s. Past that, or when a key goes past its
- * time limit, the run ends. In the 14 days to 2026-11-05, the key time of
- * a run was at most 9.5 s (p99 9.1 s, about 1,000 keys).
+ * The work of a run with the read token (`WorkLimit`). A key has 1 s and
+ * 0.5 s for each MiB of its body. One job in the key worker
+ * (`key-worker.ts`) has at most 5 s, and all jobs 30 s. Past that, or when
+ * a key goes past its time limit, the run ends. In the 14 days to
+ * 2026-11-05, the key time of a run was at most 9.5 s (p99 9.1 s, about
+ * 1,000 keys).
  *
  * A request can have at most 100,000 changing values. The sessions of a
  * run can remember (`known`) at most 10,000 values with 256 Ki characters.
@@ -196,7 +204,7 @@ const PUBLIC_BODY_READ_MS = 30_000;
  * a session has about 500 values with 10 K characters, and the limits are
  * about 20 times that. The evals run one session at a time.
  */
-const PUBLIC_WORK_LIMIT: WorkLimit = {
+const READ_WORK_LIMIT: WorkLimit = {
   maxJobMs: 5000,
   maxValues: 100_000,
   maxKnown: { values: 10_000, chars: 256 * 1024 },
@@ -212,21 +220,28 @@ const WRITE_WORK_LIMIT: WorkLimit = {
 };
 /**
  * The credentials that a run learns from its requests (`secrets.ts`). A
- * run without a token gets a small limit, because anyone can start one.
- * A run with the token gets more, for credentials that change on each
- * request, such as AWS signatures.
+ * run with the read token gets a small limit, because more jobs have that
+ * token. A run with the write token gets more, for credentials that change
+ * on each request, such as AWS signatures.
  */
-const PUBLIC_LEARN_LIMIT = { values: 1024, length: 1024 * 1024 };
+const READ_LEARN_LIMIT = { values: 1024, length: 1024 * 1024 };
 const WRITE_LEARN_LIMIT = { values: 16 * 1024, length: 16 * 1024 * 1024 };
 const sha256 = (value: string) => createHash("sha256").update(value).digest();
 
-/** Check that `authorization` has the write token, in constant time. */
-function isWriteToken(
-  expected: Buffer,
+/**
+ * The access that `authorization` gives: `write` for the write token,
+ * `read` for the read token, or `undefined`. It compares in constant time.
+ */
+function accessOf(
+  hashes: { read: Buffer; write: Buffer },
   authorization: string | undefined,
-): boolean {
+): "read" | "write" | undefined {
   const token = /^Bearer (\S+)$/.exec(authorization ?? "")?.[1];
-  return token !== undefined && timingSafeEqual(expected, sha256(token));
+  if (token === undefined) return undefined;
+  const hash = sha256(token);
+  if (timingSafeEqual(hashes.write, hash)) return "write";
+  if (timingSafeEqual(hashes.read, hash)) return "read";
+  return undefined;
 }
 
 /**
@@ -371,10 +386,22 @@ export async function startRoachService(
   if ((config.directory === undefined) === (config.bucket === undefined)) {
     throw new Error("Roach service config must set directory or bucket");
   }
-  if (!/^[0-9a-f]{64}$/i.test(config.writeTokenHash ?? "")) {
-    throw new Error("Roach service config needs writeTokenHash, a SHA-256");
+  for (const name of ["writeTokenHash", "readTokenHash"] as const) {
+    if (!/^[0-9a-f]{64}$/i.test(config[name] ?? "")) {
+      throw new Error(`Roach service config needs ${name}, a SHA-256`);
+    }
   }
-  const writeTokenHash = Buffer.from(config.writeTokenHash, "hex");
+  if (
+    config.readTokenHash.toLowerCase() === config.writeTokenHash.toLowerCase()
+  ) {
+    throw new Error(
+      "Roach service config needs a read token that is not the write token",
+    );
+  }
+  const tokenHashes = {
+    read: Buffer.from(config.readTokenHash, "hex"),
+    write: Buffer.from(config.writeTokenHash, "hex"),
+  };
   if (config.sentryDsn) {
     Sentry.init({
       dsn: config.sentryDsn,
@@ -402,11 +429,11 @@ export async function startRoachService(
     });
   }
   const runs = new Map<string, Run>();
-  /** The request bodies of all runs without a token. */
-  const publicBodies: BodyBudget = {
-    max: PUBLIC_BODY_BUDGET_BYTES,
-    perClient: PUBLIC_BODY_CLIENT_BYTES,
-    readMs: PUBLIC_BODY_READ_MS,
+  /** The request bodies of all runs with the read token. */
+  const readBodies: BodyBudget = {
+    max: READ_BODY_BUDGET_BYTES,
+    perClient: READ_BODY_CLIENT_BYTES,
+    readMs: READ_BODY_TIMEOUT_MS,
     used: 0,
     clients: new Map(),
   };
@@ -453,14 +480,14 @@ export async function startRoachService(
       origins: parseOrigins(
         runConfig.allow.map((origin) => origin.replace(/\/$/, "")),
       ),
-      // A public run must not be an open proxy to the allowed origins.
+      // A read-only run must not be an open proxy to the allowed origins.
       replayOnly: !canWrite,
       ...(canWrite
         ? {}
         : {
             client,
-            maxBodyBytes: PUBLIC_MAX_BODY_BYTES,
-            bodyBudget: publicBodies,
+            maxBodyBytes: READ_MAX_BODY_BYTES,
+            bodyBudget: readBodies,
           }),
       privateNetworks: config.privateNetworks === true,
       // Each run learns only the credentials of its own requests.
@@ -470,11 +497,11 @@ export async function startRoachService(
           rules: runConfig.rules,
           secrets: config.secrets ?? [],
           runSecrets: runConfig.secrets ?? [],
-          // A change shows a part of a recorded request, and reads are
-          // public, so only a run with the write token gets it.
+          // A change shows a part of a recorded request, and more jobs have
+          // the read token, so only a run with the write token gets it.
           explainMisses: canWrite,
-          learnLimit: canWrite ? WRITE_LEARN_LIMIT : PUBLIC_LEARN_LIMIT,
-          workLimit: canWrite ? WRITE_WORK_LIMIT : PUBLIC_WORK_LIMIT,
+          learnLimit: canWrite ? WRITE_LEARN_LIMIT : READ_LEARN_LIMIT,
+          workLimit: canWrite ? WRITE_WORK_LIMIT : READ_WORK_LIMIT,
           endRun: (reason) => {
             process.stderr.write(`[roach] Run ${id} ended: ${reason}\n`);
             endRun(run).catch((error: unknown) => {
@@ -522,6 +549,14 @@ export async function startRoachService(
       return;
     }
     if (incoming.method === "POST" && pathname === `${CONTROL_PATH}/runs`) {
+      // Check the token first, so the service reads no body without one.
+      const access = accessOf(tokenHashes, incoming.headers.authorization);
+      if (access === undefined) {
+        sendJson(outgoing, 401, {
+          error: "A run needs the read token or the write token",
+        });
+        return;
+      }
       const runConfig = await readJson<Partial<RunConfig>>(incoming);
       const tenant = runConfig.tenant;
       if (typeof tenant !== "string" || !TENANT_NAME.test(tenant)) {
@@ -533,11 +568,8 @@ export async function startRoachService(
         sendJson(outgoing, 400, { error });
         return;
       }
-      const canWrite = isWriteToken(
-        writeTokenHash,
-        incoming.headers.authorization,
-      );
-      // Reads are public. Every other mode can write, so it needs the token.
+      const canWrite = access === "write";
+      // Every mode but replay can write, so it needs the write token.
       if (!canWrite && runConfig.mode !== "replay") {
         sendJson(outgoing, 401, {
           error: `${runConfig.mode} mode needs the write token`,
@@ -552,15 +584,15 @@ export async function startRoachService(
           if (other.replayOnly) open += 1;
           if (other.client === client) ofClient += 1;
         }
-        if (open >= MAX_PUBLIC_RUNS) {
+        if (open >= MAX_READ_RUNS) {
           sendJson(outgoing, 429, {
-            error: `The service has ${MAX_PUBLIC_RUNS} open runs without a token`,
+            error: `The service has ${MAX_READ_RUNS} open runs with the read token`,
           });
           return;
         }
-        if (ofClient >= MAX_PUBLIC_RUNS_PER_CLIENT) {
+        if (ofClient >= MAX_READ_RUNS_PER_CLIENT) {
           sendJson(outgoing, 429, {
-            error: `Your address has ${MAX_PUBLIC_RUNS_PER_CLIENT} open runs without a token. End one first.`,
+            error: `Your address has ${MAX_READ_RUNS_PER_CLIENT} open runs with the read token. End one first.`,
           });
           return;
         }
@@ -633,8 +665,8 @@ export async function startRoachService(
   const sweep = setInterval(() => {
     const now = Date.now();
     for (const run of runs.values()) {
-      const idle = run.replayOnly && now - run.lastUsed > PUBLIC_RUN_IDLE_MS;
-      const timeout = run.replayOnly ? PUBLIC_RUN_TIMEOUT_MS : RUN_TIMEOUT_MS;
+      const idle = run.replayOnly && now - run.lastUsed > READ_RUN_IDLE_MS;
+      const timeout = run.replayOnly ? READ_RUN_TIMEOUT_MS : RUN_TIMEOUT_MS;
       if (idle || now - run.started > timeout) {
         process.stderr.write(
           `[roach] Run ${run.id} timed out${idle ? " without traffic" : ""}\n`,

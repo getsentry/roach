@@ -208,9 +208,9 @@ export interface RecorderConfig {
   /**
    * Add the first change from a request sample to the first miss of each
    * session in the stats (`misses.ts`). Only a run with the write token may
-   * set it: a change shows a part of a recorded request, so a public run
-   * could read the requests of a tenant back. The span gets the change
-   * without it.
+   * set it: a change shows a part of a recorded request, so a run with the
+   * read token could read the requests of a tenant back. The span gets the
+   * change without it.
    */
   explainMisses?: boolean;
   telemetry: Telemetry;
@@ -237,10 +237,10 @@ export interface WorkLimit {
   /** The time of all jobs of the run, in ms. Past it, the run ends. */
   totalMs: number;
   /**
-   * Set for a run without a token. Its keys and the redaction of its
+   * Set for a run with the read token. Its keys and the redaction of its
    * misses run in the key worker, and a key that goes past its time limit
-   * ends the run. A run with the token does them on the main thread, as
-   * before the worker, so the memory limit of the worker fails none of
+   * ends the run. A run with the write token does them on the main thread,
+   * as before the worker, so the memory limit of the worker fails none of
    * its requests.
    */
   untrusted: boolean;

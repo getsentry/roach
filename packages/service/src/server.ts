@@ -203,7 +203,7 @@ async function proxyRequest(
   const rule = recorder.ruleFor(request);
 
   if (!rule && replayOnly) {
-    // Without this, anyone could send live traffic through a public run.
+    // Without this, a read-only run could send live traffic.
     recorder.countRefused("replayOnly", origin.origin);
     outgoing.writeHead(403, { "content-type": "text/plain" });
     outgoing.end(
@@ -330,7 +330,7 @@ export interface ProxyTarget {
   bodyBudget?: BodyBudget;
   /**
    * The client whose part of `bodyBudget` the requests take. The service
-   * sets it for a run without the token: the address group
+   * sets it for a run with the read token: the address group
    * (`clientGroup()`) of the client that started the run.
    */
   client?: string;

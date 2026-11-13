@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { createServer } from "node:http";
 import { connect } from "node:net";
@@ -24,8 +25,13 @@ import { describeRecordingMisses } from "@sentry/roach/report";
 import { keyInWorker } from "../src/key-worker.ts";
 import { keyRequest } from "../src/request-key.ts";
 import { clientGroup } from "../src/clients.ts";
-import type { RoachService } from "../src/service.ts";
-import { budget, startTestService, startUpstream } from "./harness.ts";
+import { startRoachService, type RoachService } from "../src/service.ts";
+import {
+  budget,
+  READ_TOKEN,
+  startTestService,
+  startUpstream,
+} from "./harness.ts";
 import type { RemoteRun, RunConfig } from "@sentry/roach/types";
 import { VALUE_PATTERNS } from "@sentry/roach/values";
 
@@ -35,6 +41,8 @@ let directory: string;
 let service: RoachService;
 const agents: ProxyAgent[] = [];
 const runs: RemoteRoach[] = [];
+/** The header that starts a run with the read token. */
+const READ_AUTH = { authorization: `Bearer ${READ_TOKEN}` };
 
 /**
  * Open a `CONNECT` tunnel to the upstream through the service at
@@ -172,14 +180,17 @@ const ids = (from: number, count: number) =>
 const zRuns = (from: number, count: number) =>
   Array.from({ length: count }, (_, n) => "z".repeat(30_000 + from + n));
 
-/** Start a run, with one recorded rule. Without `token`, it has no token. */
+/**
+ * Start a run, with one recorded rule. Without `token`, it sends no token,
+ * which the service refuses.
+ */
 async function startRun(
   token: string | undefined,
   mode: RunConfig["mode"],
   config: Partial<RunConfig> = {},
 ): Promise<RemoteRoach> {
   const run = await startRemoteRun(
-    { url: service.url, token },
+    { url: service.url, token: token as string },
     {
       tenant: "acme/alpha",
       mode,
@@ -260,15 +271,15 @@ afterEach(async () => {
 });
 
 describe("roach service", () => {
-  it("writes with the write token and replays for anyone", async () => {
+  it("writes with the write token and replays with the read token", async () => {
     const writer = await startRun("write-token", "auto");
     expect(await send(writer.url, { prompt: "hi" })).toMatchObject({
       source: "live",
     });
     expect(await writer.close()).toMatchObject({ written: 1 });
 
-    // A fork has no token. It can still replay the recordings of a tenant.
-    const reader = await startRun(undefined, "replay");
+    // The read token replays the recordings of a tenant.
+    const reader = await startRun(READ_TOKEN, "replay");
     expect(await send(reader.url, { prompt: "hi" })).toMatchObject({
       status: 200,
       source: "replayed",
@@ -277,7 +288,8 @@ describe("roach service", () => {
       status: 412,
       source: "missed",
     });
-    // A request that no rule records would go live, so a public run refuses it.
+    // A request that no rule records would go live, so a read-only run
+    // refuses it.
     const agent = new ProxyAgent({ uri: reader.url, proxyTunnel: true });
     agents.push(agent);
     const unmatched = await request(`${origin}/other`, { dispatcher: agent });
@@ -286,16 +298,20 @@ describe("roach service", () => {
     expect((await reader.stats()).refused).toEqual({
       replayOnly: { [origin]: 1 },
     });
-    // Without the token, no mode that can write.
+    // With the read token, no mode that can write.
     for (const mode of ["auto", "record", "off"] as const) {
-      await expect(startRun(undefined, mode)).rejects.toThrow(/401/);
+      await expect(startRun(READ_TOKEN, mode)).rejects.toThrow(/401/);
     }
-    // A wrong token does not count.
-    await expect(startRun("not-the-token", "auto")).rejects.toThrow(/401/);
+    // Without a token, or with a wrong one, no run at all.
+    for (const token of [undefined, "not-the-token"]) {
+      for (const mode of ["replay", "auto"] as const) {
+        await expect(startRun(token, mode)).rejects.toThrow(/401/);
+      }
+    }
 
     // Another tenant has its own recordings. The service has no list of
-    // tenants, so the write token works for a new one too.
-    const beta = await startRun(undefined, "replay", { tenant: "acme/beta" });
+    // tenants, so the tokens work for a new one too.
+    const beta = await startRun(READ_TOKEN, "replay", { tenant: "acme/beta" });
     expect(await send(beta.url, { prompt: "hi" })).toMatchObject({
       status: 412,
     });
@@ -312,14 +328,34 @@ describe("roach service", () => {
     expect(await recordings("other-org/new.repo")).toHaveLength(1);
   });
 
+  it("needs a read token that is not the write token", async () => {
+    const writeTokenHash = createHash("sha256")
+      .update("write-token")
+      .digest("hex");
+    await expect(
+      startRoachService({
+        directory,
+        writeTokenHash,
+        readTokenHash: undefined as unknown as string,
+      }),
+    ).rejects.toThrow(/needs readTokenHash/);
+    await expect(
+      startRoachService({
+        directory,
+        writeTokenHash,
+        readTokenHash: writeTokenHash.toUpperCase(),
+      }),
+    ).rejects.toThrow(/not the write token/);
+  });
+
   it("shows what changed in a miss only to a run with the write token", async () => {
-    // Reads are public. A change shows a part of the recorded request, so
-    // a run without the token could read back the prompts of a tenant.
+    // A change shows a part of the recorded request, so a run with the
+    // read token could read back the prompts of a tenant.
     const writer = await startRun("write-token", "auto");
     await sendInSession(writer, "the stored prompt");
     await writer.close();
 
-    const reader = await startRun(undefined, "replay");
+    const reader = await startRun(READ_TOKEN, "replay");
     expect(await sendInSession(reader, "\u0001")).toMatchObject({
       status: 412,
     });
@@ -451,31 +487,41 @@ describe("roach service", () => {
 
     // The control API answers a bad body with the fault of the client.
     const runsUrl = `${service.url}/__roach/runs`;
-    const notJson = await fetch(runsUrl, { method: "POST", body: "{" });
+    const headers = READ_AUTH;
+    const notJson = await fetch(runsUrl, {
+      method: "POST",
+      headers,
+      body: "{",
+    });
     expect(notJson.status).toBe(400);
-    const notObject = await fetch(runsUrl, { method: "POST", body: "null" });
+    const notObject = await fetch(runsUrl, {
+      method: "POST",
+      headers,
+      body: "null",
+    });
     expect(notObject.status).toBe(400);
     const tooLarge = await fetch(runsUrl, {
       method: "POST",
+      headers,
       body: "x".repeat(65 * 1024 * 1024),
     });
     expect(tooLarge.status).toBe(413);
 
-    // Anyone can start a run without a token, so the service has a cap on
-    // them for each client address. Another tenant name does not get
+    // More jobs have the read token, so the service has a cap on runs
+    // with it for each client address. Another tenant name does not get
     // around it. The cap of all clients is in "limits of the service".
     const open = await Promise.all(
-      Array.from({ length: 10 }, () => startRun(undefined, "replay")),
+      Array.from({ length: 10 }, () => startRun(READ_TOKEN, "replay")),
     );
-    await expect(startRun(undefined, "replay")).rejects.toThrow(/429/);
+    await expect(startRun(READ_TOKEN, "replay")).rejects.toThrow(/429/);
     await expect(
-      startRun(undefined, "replay", { tenant: "acme/beta" }),
+      startRun(READ_TOKEN, "replay", { tenant: "acme/beta" }),
     ).rejects.toThrow(/429/);
-    // Runs with the token have no cap.
+    // Runs with the write token have no cap.
     await startRun("write-token", "auto");
     // An ended run frees its place.
     await open[0]!.close();
-    await startRun(undefined, "replay");
+    await startRun(READ_TOKEN, "replay");
 
     // A body over the limit gets HTTP 413 and never goes live.
     const large = await send(run.url, { prompt: "x".repeat(65 * 1024 * 1024) });
@@ -571,9 +617,9 @@ describe("roach service", () => {
     };
     const unblocked = () => rm(path.join(directory, "acme/alpha/model"));
 
-    // A failed read in a run without the token.
+    // A failed read in a run with the read token.
     await blocked();
-    const reader = await startRun(undefined, "replay");
+    const reader = await startRun(READ_TOKEN, "replay");
     const read = await send(reader.url, { prompt: "hi" });
     expect(read).toMatchObject({
       status: 502,
@@ -788,10 +834,10 @@ async function rawRequest(
 }
 
 describe("limits of the service", () => {
-  it("keeps answering while a run without a token sends slow patterns", async () => {
+  it("keeps answering while a run with the read token sends slow patterns", async () => {
     // Anyone can start this run. The pattern backtracks a lot on a body of
     // `a`, so each key goes past its time limit.
-    const run = await startRun(undefined, "replay", {
+    const run = await startRun(READ_TOKEN, "replay", {
       rules: [
         {
           name: "model",
@@ -826,7 +872,7 @@ describe("limits of the service", () => {
     await expect(run.stats()).rejects.toThrow(/404/);
   });
 
-  it("fails a request with too many values from a run without a token", async () => {
+  it("fails a request with too many values from a run with the read token", async () => {
     const rules = [
       {
         name: "model",
@@ -835,7 +881,7 @@ describe("limits of the service", () => {
       },
     ];
     const prompt = "x ".repeat(150_000);
-    const reader = await startRun(undefined, "replay", { rules });
+    const reader = await startRun(READ_TOKEN, "replay", { rules });
     const tooMany = await send(reader.url, { prompt });
     expect(tooMany.status).toBe(400);
     expect(tooMany.body).toMatch(/too many changing values/);
@@ -853,9 +899,9 @@ describe("limits of the service", () => {
     // got an error.
     const log = vi.spyOn(process.stderr, "write");
     onTestFinished(() => log.mockRestore());
-    // A run without the token makes the key in the key worker, and a run
+    // A run with the read token makes the key in the key worker, and a run
     // with the token in this process.
-    const reader = await startRun(undefined, "replay");
+    const reader = await startRun(READ_TOKEN, "replay");
     const writer = await startRun("write-token", "auto");
     for (const run of [reader, writer]) {
       for (const levels of [65, 100_000]) {
@@ -875,10 +921,10 @@ describe("limits of the service", () => {
     expect((await send(writer.url, { prompt: "hi" })).status).toBe(200);
   });
 
-  it("answers 503 when the bodies of runs without a token fill the budget", async () => {
+  it("answers 503 when the bodies of runs with the read token fill the budget", async () => {
     // Each request holds its body until its key is done. Before the budget,
     // 30 parallel bodies of 16 MiB took about 1.9 GB.
-    const reader = await startRun(undefined, "replay");
+    const reader = await startRun(READ_TOKEN, "replay");
     const prompt = "a".repeat(16 * 1024 * 1024 - 64);
     const results = await Promise.all(
       Array.from({ length: 12 }, () => send(reader.url, { prompt })),
@@ -929,8 +975,16 @@ describe("limits of the service", () => {
     };
     const startFrom = async (client: string) =>
       JSON.parse(
-        (await rawRequest(local.url, client, "POST", "/__roach/runs", config))
-          .body,
+        (
+          await rawRequest(
+            local.url,
+            client,
+            "POST",
+            "/__roach/runs",
+            config,
+            READ_AUTH,
+          )
+        ).body,
       ) as RemoteRun;
     const attacker = await startFrom("203.0.113.1");
     const other = await startFrom("203.0.113.2");
@@ -983,7 +1037,7 @@ describe("limits of the service", () => {
         values: { v: "x" },
       },
     ];
-    const reader = await startRun(undefined, "replay", { rules });
+    const reader = await startRun(READ_TOKEN, "replay", { rules });
     for (const body of [
       { v: "x".repeat(8 * 1024 * 1024) },
       "x ".repeat(4 * 1024 * 1024),
@@ -999,7 +1053,7 @@ describe("limits of the service", () => {
     await expect(reader.stats()).resolves.toBeDefined();
   });
 
-  it("ends a run without a token whose sessions remember too many values", async () => {
+  it("ends a run with the read token whose sessions remember too many values", async () => {
     // The probe of the review: 64 sessions, each with one 15 MB request of
     // distinct values. Before the limit, the main heap grew past 1.2 GB.
     const rules = [
@@ -1013,7 +1067,7 @@ describe("limits of the service", () => {
     let peak = before;
     const sampler = setInterval(() => (peak = Math.max(peak, heap())), 20);
     onTestFinished(() => clearInterval(sampler));
-    const reader = await startRun(undefined, "replay", { rules });
+    const reader = await startRun(READ_TOKEN, "replay", { rules });
     const sessions = await Promise.all(
       Array.from({ length: 64 }, (_, n) => reader.startSession(`s${n}`)),
     );
@@ -1045,7 +1099,7 @@ describe("limits of the service", () => {
     expect(peak - before).toBeLessThan(300 * 1024 * 1024);
   });
 
-  it("counts the remembered values of all sessions of a run without a token", async () => {
+  it("counts the remembered values of all sessions of a run with the read token", async () => {
     const rules = [
       {
         name: "model",
@@ -1055,7 +1109,7 @@ describe("limits of the service", () => {
     ];
 
     // 6,000 and then 5,000 values of two open sessions are over 10,000.
-    const values = await startRun(undefined, "replay", { rules });
+    const values = await startRun(READ_TOKEN, "replay", { rules });
     const first = await values.startSession("first");
     const second = await values.startSession("second");
     expect((await send(first.url, { prompt: ids(0, 6000) })).status).toBe(412);
@@ -1065,7 +1119,7 @@ describe("limits of the service", () => {
     await expect(values.stats()).rejects.toThrow(/404/);
 
     // A session forgets its values when it ends.
-    const ended = await startRun(undefined, "replay", { rules });
+    const ended = await startRun(READ_TOKEN, "replay", { rules });
     const early = await ended.startSession("early");
     expect((await send(early.url, { prompt: ids(0, 6000) })).status).toBe(412);
     await early.end(true);
@@ -1079,7 +1133,7 @@ describe("limits of the service", () => {
     );
 
     // Nine values of about 30,000 characters are over 256 Ki characters.
-    const chars = await startRun(undefined, "replay", { rules });
+    const chars = await startRun(READ_TOKEN, "replay", { rules });
     const long = await chars.startSession("long");
     const eight = await send(long.url, { prompt: zRuns(0, 8).join(" ") });
     expect(eight.status).toBe(412);
@@ -1116,7 +1170,7 @@ describe("limits of the service", () => {
     ).toThrow(/too large/);
 
     for (const [token, mode, status] of [
-      [undefined, "replay", 412],
+      [READ_TOKEN, "replay", 412],
       ["write-token", "auto", 200],
     ] as const) {
       const run = await startRun(token, mode, { rules: [rule] });
@@ -1140,7 +1194,7 @@ describe("limits of the service", () => {
   });
 
   it("keys a 60 MiB body of small text blocks from a run with the token", async () => {
-    // The worker has a heap limit for runs without the token. A run with
+    // The worker has a heap limit for runs with the read token. A run with
     // the token makes its keys on the main thread, so a body that keyed
     // before the worker still keys.
     const writer = await startRun("write-token", "auto", {
@@ -1167,10 +1221,10 @@ describe("limits of the service", () => {
     expect(await writer.close()).toMatchObject({ written: 1 });
   }, 120_000);
 
-  it("ends a run without a token whose key fills the memory of the worker", async () => {
+  it("ends a run with the read token whose key fills the memory of the worker", async () => {
     // Each `{}` is an object for `JSON.parse()`, so the body needs more
     // memory than the worker has.
-    const reader = await startRun(undefined, "replay");
+    const reader = await startRun(READ_TOKEN, "replay");
     const body = Array.from({ length: 5_500_000 }, () => ({}));
     const sent = send(reader.url, body);
     const waits = await caWaitsUntil(sent);
@@ -1188,7 +1242,7 @@ describe("limits of the service", () => {
     expect(Math.max(...waits)).toBeLessThan(1000);
     await expect(reader.stats()).rejects.toThrow(/404/);
     // The next key gets a new worker.
-    const next = await startRun(undefined, "replay");
+    const next = await startRun(READ_TOKEN, "replay");
     expect((await send(next.url, { prompt: "hi" })).status).toBe(412);
   });
 
@@ -1268,8 +1322,8 @@ describe("limits of the service", () => {
     expect(keyWorkerPid()).not.toBe(stopped);
   });
 
-  it("refuses a large body from a run without a token", async () => {
-    const reader = await startRun(undefined, "replay");
+  it("refuses a large body from a run with the read token", async () => {
+    const reader = await startRun(READ_TOKEN, "replay");
     const large = await send(reader.url, {
       prompt: "x".repeat(16 * 1024 * 1024),
     });
@@ -1284,7 +1338,7 @@ describe("limits of the service", () => {
     // Each part of a secret is a value to redact. Too many parts are
     // refused when the run starts.
     await expect(
-      startRun(undefined, "replay", {
+      startRun(READ_TOKEN, "replay", {
         secrets: Array.from({ length: 32 }, (_, n) => credential(n, 40)),
       }),
     ).rejects.toThrow(/400.*cannot learn more credentials/);
@@ -1292,7 +1346,7 @@ describe("limits of the service", () => {
     // A recorded sample, so that the first miss of the session compares
     // its redacted text with it.
     await sendInSession(await startRun("write-token", "auto"), "hi");
-    const reader = await startRun(undefined, "replay", {
+    const reader = await startRun(READ_TOKEN, "replay", {
       secrets: Array.from({ length: 24 }, (_, n) => credential(n, 40)),
     });
     const opened = await reader.startSession("public test name");
@@ -1317,21 +1371,26 @@ describe("limits of the service", () => {
       mode: "replay",
       pad: "x".repeat(1024 * 1024),
     });
-    const sized = await fetch(runsUrl, { method: "POST", body });
+    const headers = READ_AUTH;
+    const sized = await fetch(runsUrl, { method: "POST", headers, body });
     expect(sized.status).toBe(413);
     // A body without a length stops at the limit too.
     const streamed = await fetch(runsUrl, {
       method: "POST",
+      headers,
       body: new Blob([body]).stream(),
       duplex: "half",
     });
     expect(streamed.status).toBe(413);
+    // Without a token, the service checks the token before the body.
+    const anonymous = await fetch(runsUrl, { method: "POST", body });
+    expect(anonymous.status).toBe(401);
   });
 
   it("refuses a request with a new credential past the limit of the run", async () => {
-    // A run without a token learns at most 1,024 values: 201 for each of
+    // A run with the read token learns at most 1,024 values: 201 for each of
     // these requests.
-    const reader = await startRun(undefined, "replay");
+    const reader = await startRun(READ_TOKEN, "replay");
     for (let n = 0; n < 5; n += 1) {
       const response = await send(
         reader.url,
@@ -1375,7 +1434,7 @@ describe("limits of the service", () => {
     expect(liveRequests).toBe(27);
   });
 
-  it("ends a run without a token after 60 minutes without traffic, or after 2 hours", async () => {
+  it("ends a run with the read token after 60 minutes without traffic, or after 2 hours", async () => {
     // The sweep of the service runs each minute and reads the clock.
     vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
     // The hooks run last first, so this runs after the service closes.
@@ -1383,20 +1442,20 @@ describe("limits of the service", () => {
       vi.useRealTimers();
     });
     const { service: local } = await startTestService();
-    const start = (token: string | undefined) =>
+    const start = (token: string) =>
       startRemoteRun(
         { url: local.url, token },
         {
           tenant: "acme/alpha",
-          mode: token ? "auto" : "replay",
+          mode: token === READ_TOKEN ? "replay" : "auto",
           allow: [origin],
           rules: [
             { name: "model", match: { method: "POST", url: `${origin}/v1/` } },
           ],
         },
       );
-    const idle = await start(undefined);
-    const busy = await start(undefined);
+    const idle = await start(READ_TOKEN);
+    const busy = await start(READ_TOKEN);
     const writer = await start("write-token");
 
     await minutes(50);
@@ -1417,7 +1476,7 @@ describe("limits of the service", () => {
   });
 
   it("closes a tunnel that sends no byte after the 200", async () => {
-    const run = await startRun(undefined, "replay");
+    const run = await startRun(READ_TOKEN, "replay");
     const proxy = new URL(run.url);
     const authority = new URL(origin).host;
     const socket = connect(Number(proxy.port), proxy.hostname);
@@ -1456,7 +1515,7 @@ describe("limits of the service", () => {
       // keep-alive time, and at the next request to the `timeout` of the
       // server. Before, that was 0, so a later request had no idle limit,
       // also after Node read all of it (`requestTimeout` stops there).
-      const run = await startRun(undefined, "replay");
+      const run = await startRun(READ_TOKEN, "replay");
       const host = new URL(origin).host;
       let socket: ReturnType<typeof connect>;
       let post: string;
@@ -1517,6 +1576,7 @@ describe("limits of the service", () => {
         allow: [origin],
         rules: [{ name: "model", match: {} }],
       },
+      READ_AUTH,
     );
     const run = JSON.parse(started.body) as RemoteRun;
     const direct = connect(Number(new URL(local.url).port), "127.0.0.1");
@@ -1541,7 +1601,7 @@ describe("limits of the service", () => {
   });
 
   it("does not send a request to Sentry when its client closes it", async () => {
-    const run = await startRun(undefined, "replay");
+    const run = await startRun(READ_TOKEN, "replay");
     const log = vi.spyOn(process.stderr, "write");
     onTestFinished(() => log.mockRestore());
     const tunnel = await openTunnel(service.url, run.url);
@@ -1574,7 +1634,7 @@ describe("limits of the service", () => {
     );
   });
 
-  it("limits the runs without a token of each client", async () => {
+  it("limits the runs with the read token of each client", async () => {
     // Behind the load balancer, each connection starts with a PROXY
     // header. It gives the address of the client.
     const { service: local } = await startTestService({ proxyProtocol: true });
@@ -1585,7 +1645,7 @@ describe("limits of the service", () => {
       rules: [{ name: "model", match: {} }],
     };
     const startFrom = (client: string) =>
-      rawRequest(local.url, client, "POST", "/__roach/runs", config);
+      rawRequest(local.url, client, "POST", "/__roach/runs", config, READ_AUTH);
 
     // A connection without the header, such as before the load balancer
     // sends it, has the address of its socket.
@@ -1595,6 +1655,7 @@ describe("limits of the service", () => {
       "POST",
       "/__roach/runs",
       config,
+      READ_AUTH,
     );
     expect(bare.status).toBe(201);
     // A header that is not valid closes the connection.
