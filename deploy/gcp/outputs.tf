@@ -19,6 +19,12 @@ output "write_token" {
   sensitive   = true
 }
 
+output "read_token" {
+  description = "The read token of all tenants. Keep it in one organization secret, ROACH_READ_TOKEN, for the repositories that replay."
+  value       = random_password.read_token.result
+  sensitive   = true
+}
+
 output "deploy_workload_identity_provider" {
   description = "Set it as the GCP_WORKLOAD_IDENTITY_PROVIDER variable of the repository, for the Deploy workflow."
   value       = google_iam_workload_identity_pool_provider.github.name

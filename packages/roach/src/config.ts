@@ -132,8 +132,8 @@ function resolveValue(rule: string, name: string, value: FileValue): string {
 
 /**
  * The run config of `file` in the environment `env`. Without the write
- * token (`canWrite`), the mode is `replay`, as for forks. `ROACH_MODE`
- * sets another mode.
+ * token (`canWrite`), the mode is `replay`. `ROACH_MODE` sets another
+ * mode.
  */
 export function runConfigOf(
   file: RoachFile,

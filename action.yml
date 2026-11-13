@@ -7,8 +7,13 @@ inputs:
     required: true
   token:
     description: >-
-      The write token of the service. Without it, the run can only replay,
-      as in jobs of forks. Give it only to workflows that you trust.
+      The write token of the service. Give it only to workflows that you
+      trust. Set this or read-token.
+    required: false
+  read-token:
+    description: >-
+      The read token of the service. With only this token, the run can only
+      replay. Set this or token.
     required: false
   url:
     description: The URL of the Roach service.

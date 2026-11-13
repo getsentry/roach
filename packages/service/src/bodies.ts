@@ -7,8 +7,8 @@ import type http from "node:http";
 import { httpError } from "./errors.ts";
 
 /**
- * A control API body over this size gets HTTP 413. Anyone can call
- * `POST /runs`, so the service reads no more before it checks the token.
+ * A control API body over this size gets HTTP 413. More jobs have the
+ * read token than the write token, so the service reads no more.
  */
 const MAX_CONTROL_BODY_BYTES = 1024 * 1024;
 

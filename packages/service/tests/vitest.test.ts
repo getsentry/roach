@@ -17,7 +17,12 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { RoachService } from "../src/service.ts";
-import { startTestService, startUpstream, TOKEN } from "./harness.ts";
+import {
+  READ_TOKEN,
+  startTestService,
+  startUpstream,
+  TOKEN,
+} from "./harness.ts";
 
 const TENANT = "acme/vitest";
 const ROOT = path.resolve(import.meta.dirname, "..");
@@ -153,7 +158,7 @@ afterEach(async () => {
 });
 
 describe("vitest", () => {
-  it("records each test in its own session, then replays without the token", async () => {
+  it("records each test in its own session, then replays with the read token", async () => {
     const recorded = await runVitest({ ROACH_TOKEN: TOKEN, FAIL: "1" });
     expect(recorded).toMatchObject({ code: 1 });
     expect(recorded.output).toContain("Roach (auto):");
@@ -167,7 +172,7 @@ describe("vitest", () => {
     ]);
     expect(liveRequests).toHaveLength(6);
 
-    const replayed = await runVitest({});
+    const replayed = await runVitest({ ROACH_READ_TOKEN: READ_TOKEN });
     expect(replayed).toMatchObject({ code: 0 });
     expect(replayed.output).toContain("Roach (replay):");
     expect(replayed.output).toContain("model 4 replayed, 0 live");
@@ -205,8 +210,15 @@ https.request = refuse;
     await expect(recordedSessions()).resolves.toHaveLength(4);
   });
 
-  it("fails a test whose request has no recording in replay mode", async () => {
+  it("needs a token, except in off mode", async () => {
     const result = await runVitest({});
+    expect(result.code).toBe(1);
+    expect(result.output).toContain("set ROACH_READ_TOKEN to replay");
+    expect(liveRequests).toHaveLength(0);
+  });
+
+  it("fails a test whose request has no recording in replay mode", async () => {
+    const result = await runVitest({ ROACH_READ_TOKEN: READ_TOKEN });
     expect(result.code).toBe(1);
     expect(result.output).toContain("had no recording in replay mode");
     expect(liveRequests).toHaveLength(0);

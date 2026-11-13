@@ -73,6 +73,14 @@ resource "random_password" "write_token" {
   special = false
 }
 
+# The read token. All tenants share it. A run needs it or the write token,
+# and a run with only the read token can only replay. To change it:
+#   terraform apply -replace=random_password.read_token
+resource "random_password" "read_token" {
+  length  = 48
+  special = false
+}
+
 # The service config (`RoachServiceConfig` in
 # packages/service/src/service.ts). The VM reads it at each start.
 resource "google_secret_manager_secret" "config" {
@@ -92,6 +100,7 @@ resource "google_secret_manager_secret_version" "config" {
       publicUrl      = "https://${var.domain}"
       bucket         = google_storage_bucket.recordings.name
       writeTokenHash = sha256(random_password.write_token.result)
+      readTokenHash  = sha256(random_password.read_token.result)
       # The load balancer writes the address of the client in a PROXY
       # header (proxy_header below). The service limits runs by it.
       proxyProtocol = true

@@ -53,9 +53,15 @@ function runCommand(command: string, env: NodeJS.ProcessEnv): Promise<number> {
 const command = process.env.INPUT_RUN;
 if (!command) throw new Error("Roach: the run input is required");
 // The runner gives an empty string for an input that the step does not set.
-const token = readEnv("INPUT_TOKEN");
+const writeToken = readEnv("INPUT_TOKEN");
+const token = writeToken ?? readEnv("INPUT_READ-TOKEN");
+if (token === undefined) {
+  throw new Error(
+    "Roach: set the read-token input to replay, or token to record",
+  );
+}
 const file = await readRoachFile();
-const config = runConfigOf(file, { canWrite: token !== undefined });
+const config = runConfigOf(file, { canWrite: writeToken !== undefined });
 const run = await startRemoteRun(
   { url: process.env.INPUT_URL!, token },
   config,

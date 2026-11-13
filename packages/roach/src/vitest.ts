@@ -8,8 +8,10 @@
  * tests of many workers record at the same time. At the end it closes the
  * run and reports it.
  *
- * - `ROACH_TOKEN` is the write token. Only this file reads it, and the
- *   workers do not get it. Without it, the run can only replay.
+ * - `ROACH_TOKEN` is the write token, and `ROACH_READ_TOKEN` is the read
+ *   token. Only this file reads them, and the workers do not get them. A
+ *   run needs one of them. With only the read token, the run can only
+ *   replay.
  * - `ROACH_URL` is the service. Default: the Roach service of Sentry.
  * - `ROACH_MODE` sets the mode. See `runConfigOf()`. With `off`, it starts
  *   no run and does not use the service, so requests go direct.
@@ -46,13 +48,20 @@ declare module "vitest" {
 export async function startRoach(
   project: Pick<TestProject, "provide">,
 ): Promise<() => Promise<void>> {
-  const token = readEnv("ROACH_TOKEN");
+  const writeToken = readEnv("ROACH_TOKEN");
+  const token = writeToken ?? readEnv("ROACH_READ_TOKEN");
   delete process.env.ROACH_TOKEN;
+  delete process.env.ROACH_READ_TOKEN;
   const file = await readRoachFile();
-  const config = runConfigOf(file, { canWrite: token !== undefined });
+  const config = runConfigOf(file, { canWrite: writeToken !== undefined });
   if (config.mode === "off") {
     project.provide("roach", null);
     return async () => {};
+  }
+  if (token === undefined) {
+    throw new Error(
+      "Roach: set ROACH_READ_TOKEN to replay or ROACH_TOKEN to record, or set ROACH_MODE=off",
+    );
   }
   // Only a run needs it, so `off` mode works on older Node too.
   if (typeof http.setGlobalProxyFromEnv !== "function") {

@@ -49,12 +49,12 @@ For metrics, use `-f dataset=tracemetrics`,
   rate.
 - **Refused**: the proxy sent the request nowhere and answered HTTP 403.
   `roach.reason` tells why: `notAllowed` (the origin is not in `allow`),
-  `notPublic` (the address is not public), or `replayOnly` (a run without
-  the token, and no rule records the request).
-- **Busy**: the body of a run without the token did not fit in the
+  `notPublic` (the address is not public), or `replayOnly` (a run with
+  the read token, and no rule records the request).
+- **Busy**: the body of a run with the read token did not fit in the
   budget of bodies, and the proxy answered HTTP 503 with `Retry-After`.
   The run goes on, and the client can send the request again.
-- **Timeout**: the body of a run without the token did not come in 30 s,
+- **Timeout**: the body of a run with the read token did not come in 30 s,
   and the proxy answered HTTP 408.
 - **Aborted**: the client closed its connection before the body of its
   request came. The proxy sent the request nowhere. It is not an error,
@@ -134,7 +134,7 @@ sentry explore sentry/roach --dataset metrics --metric roach.request --agg sum \
   -F roach.origin
 ```
 
-Requests of runs without the token that the budget of bodies stopped
+Requests of runs with the read token that the budget of bodies stopped
 (`busy`, HTTP 503) or that were too slow (`timeout`, HTTP 408), by tenant.
 A steady count of `busy` from many tenants shows that the budget is too
 small. A count from one tenant shows one client that fills its part.
@@ -202,7 +202,7 @@ run. `miss.recorded` and `miss.request` show that value. `miss.sample:none`
 is a miss that has no recorded request to compare with.
 `miss.sample:withheld` is a miss whose recorded request had a credential
 that the proxy could not redact, so its sample has no text. This works for
-runs without the token too, such as CI of a fork. Only Sentry has these
+runs with the read token too. Only Sentry has these
 texts: the run report shows only the offset and the key, because CI logs
 can be public.
 
@@ -279,8 +279,8 @@ and the next run makes it again. Compare `roach.recording.write` with
   `miss.changed_at`, `miss.compared`, `miss.recorded`, and `miss.request`.
   The two texts have at most 160 characters each, redacted as in a
   recording, with the value of each credential query parameter redacted.
-  Every run sends them, with or without the token. No stats, report, or
-  log has the texts. The stats and report of a run with the token have
+  Every run sends them, with either token. No stats, report, or
+  log has the texts. The stats and report of a run with the write token have
   only the offset and the key ("Misses" in `README.md`).
 - `roach.store.read` spans with a `roach.key` that starts with
   `_requests/` read a request sample, not a recording. Leave them out of a

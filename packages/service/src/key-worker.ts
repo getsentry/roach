@@ -1,15 +1,16 @@
 /**
- * The worker process that makes the keys of runs without the token, and
+ * The worker process that makes the keys of runs with the read token, and
  * redacts the text of their misses.
  *
- * Anyone can start a run without the token, and its value patterns and
- * bodies come from its client. Redaction takes time for each credential
- * that a run knows. Both run in this worker, so a slow request does not
- * stop the event loop that answers all runs. The service has one worker.
- * It does one job at a time, in order, and each job has a time limit (the
- * `timeout` of `vm`). A job of an ended run does not start. A run with the
- * token does this work on the main thread (`recorder.ts`), because the
- * key of a 64 MiB body can need more memory than the worker has.
+ * More jobs have the read token than the write token, and the value
+ * patterns and bodies of a run come from its client. Redaction takes time
+ * for each credential that a run knows. Both run in this worker, so a slow
+ * request does not stop the event loop that answers all runs. The service
+ * has one worker. It does one job at a time, in order, and each job has a
+ * time limit (the `timeout` of `vm`). A job of an ended run does not start.
+ * A run with the write token does this work on the main thread
+ * (`recorder.ts`), because the key of a 64 MiB body can need more memory
+ * than the worker has.
  *
  * The worker is a child process with a heap limit (`MAX_HEAP_MB`), so one
  * request cannot fill the memory of the service. It is not a worker
