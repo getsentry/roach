@@ -14,7 +14,7 @@ output "ca_cert" {
 }
 
 output "write_token" {
-  description = "The write token of all tenants. Keep it in one organization secret, ROACH_TOKEN, for the repositories that you trust."
+  description = "The token of all tenants. Each run needs it. Keep it in one organization secret, ROACH_TOKEN, for the repositories that you trust."
   value       = random_password.write_token.result
   sensitive   = true
 }

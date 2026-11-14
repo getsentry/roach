@@ -13,7 +13,6 @@ import type {
 const REFUSAL_HINTS: Record<RefusalReason, string> = {
   notAllowed: "not in allow",
   notPublic: "not a public address",
-  replayOnly: "no rule records it, and the run can only replay",
 };
 
 /** Describe the totals of a run in one line. */

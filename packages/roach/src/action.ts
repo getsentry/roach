@@ -54,8 +54,9 @@ const command = process.env.INPUT_RUN;
 if (!command) throw new Error("Roach: the run input is required");
 // The runner gives an empty string for an input that the step does not set.
 const token = readEnv("INPUT_TOKEN");
+if (!token) throw new Error("Roach: the token input is required");
 const file = await readRoachFile();
-const config = runConfigOf(file, { canWrite: token !== undefined });
+const config = runConfigOf(file);
 const run = await startRemoteRun(
   { url: process.env.INPUT_URL!, token },
   config,

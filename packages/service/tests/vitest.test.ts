@@ -153,7 +153,7 @@ afterEach(async () => {
 });
 
 describe("vitest", () => {
-  it("records each test in its own session, then replays without the token", async () => {
+  it("records each test in its own session, then replays", async () => {
     const recorded = await runVitest({ ROACH_TOKEN: TOKEN, FAIL: "1" });
     expect(recorded).toMatchObject({ code: 1 });
     expect(recorded.output).toContain("Roach (auto):");
@@ -167,11 +167,21 @@ describe("vitest", () => {
     ]);
     expect(liveRequests).toHaveLength(6);
 
-    const replayed = await runVitest({});
+    const replayed = await runVitest({
+      ROACH_TOKEN: TOKEN,
+      ROACH_MODE: "replay",
+    });
     expect(replayed).toMatchObject({ code: 0 });
     expect(replayed.output).toContain("Roach (replay):");
     expect(replayed.output).toContain("model 4 replayed, 0 live");
     expect(liveRequests).toHaveLength(6);
+  });
+
+  it("fails early without the token", async () => {
+    const result = await runVitest({});
+    expect(result.code).toBe(1);
+    expect(result.output).toContain("set ROACH_TOKEN, or set ROACH_MODE=off");
+    expect(liveRequests).toHaveLength(0);
   });
 
   it("sends requests direct in off mode, without the service", async () => {
@@ -206,7 +216,10 @@ https.request = refuse;
   });
 
   it("fails a test whose request has no recording in replay mode", async () => {
-    const result = await runVitest({});
+    const result = await runVitest({
+      ROACH_TOKEN: TOKEN,
+      ROACH_MODE: "replay",
+    });
     expect(result.code).toBe(1);
     expect(result.output).toContain("had no recording in replay mode");
     expect(liveRequests).toHaveLength(0);
@@ -216,7 +229,6 @@ https.request = refuse;
     await runVitest({ ROACH_TOKEN: TOKEN });
     await writeFile(path.join(project, "a.fixture.ts"), testFile("a-changed"));
 
-    // Only a run with the write token gets the change.
     const result = await runVitest({
       ROACH_TOKEN: TOKEN,
       ROACH_MODE: "replay",

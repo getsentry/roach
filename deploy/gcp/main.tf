@@ -65,8 +65,8 @@ resource "tls_self_signed_cert" "ca" {
   }
 }
 
-# The write token. All tenants share it, so a new project needs no change
-# here. A run without it can only replay. To change it:
+# The token. Each run needs it, in every mode. All tenants share it, so a
+# new project needs no change here. To change it:
 #   terraform apply -replace=random_password.write_token
 resource "random_password" "write_token" {
   length  = 48
@@ -92,8 +92,8 @@ resource "google_secret_manager_secret_version" "config" {
       publicUrl      = "https://${var.domain}"
       bucket         = google_storage_bucket.recordings.name
       writeTokenHash = sha256(random_password.write_token.result)
-      # The load balancer writes the address of the client in a PROXY
-      # header (proxy_header below). The service limits runs by it.
+      # The load balancer starts each connection with a PROXY header
+      # (proxy_header below). The service reads and drops it.
       proxyProtocol = true
       ca = {
         cert = tls_self_signed_cert.ca.cert_pem

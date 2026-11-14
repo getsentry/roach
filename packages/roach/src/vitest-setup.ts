@@ -54,7 +54,7 @@ function useRun(run: NonNullable<ProvidedContext["roach"]>): void {
       // must fail, also when it recovered from the error.
       if (missed > 0) {
         throw new Error(
-          `Roach: ${missed} request(s) had no recording in replay mode. Run with ROACH_TOKEN to record them.`,
+          `Roach: ${missed} request(s) had no recording in replay mode. Run in auto or record mode to record them.`,
         );
       }
     });

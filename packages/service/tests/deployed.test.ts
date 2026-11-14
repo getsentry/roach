@@ -179,7 +179,8 @@ function requestMetrics(mode: string, result: string) {
  * stderr of the action, what the command saw, and the job summary.
  */
 async function ciJob(job: {
-  token?: string;
+  /** `replay` for a job that must not record. Defaults to `auto`. */
+  mode?: "replay";
   runId: string;
   prompt: string;
   refused?: string;
@@ -243,7 +244,8 @@ console.log(JSON.stringify({
         ACTIONS_ID_TOKEN_REQUEST_URL: "https://token.actions.example/oidc",
         INPUT_RUN: "node job.mjs > result.json",
         INPUT_URL: frontUrl,
-        INPUT_TOKEN: job.token ?? "",
+        INPUT_TOKEN: TOKEN,
+        ROACH_MODE: job.mode ?? "",
       }),
       stdio: ["ignore", "ignore", "pipe"],
     },
@@ -454,10 +456,9 @@ afterAll(async () => {
 });
 
 describe("deployed roach", () => {
-  it("records with the token, replays for a fork, and counts in Sentry", async () => {
+  it("records and replays with the token, and counts in Sentry", async () => {
     const refusedOrigin = "127.0.0.3:8443";
     const writer = await ciJob({
-      token: TOKEN,
       runId: "writer",
       prompt: "hi",
       refused: `https://${refusedOrigin}/`,
@@ -469,7 +470,7 @@ describe("deployed roach", () => {
       body: modelStream(1),
     });
     expect(writer.summary).toContain("1 recordings new or changed");
-    // The command never sees the write token or the tokens of the runner.
+    // The command never sees the token or the tokens of the runner.
     expect(writer.token).toBeNull();
     expect(writer.actions).toEqual([]);
     // It trusts the authority of the service, which a restart keeps, and
@@ -486,8 +487,8 @@ describe("deployed roach", () => {
       ),
     ]);
 
-    // Without the token, the action only replays.
-    const fork = await ciJob({ runId: "fork", prompt: "hi" });
+    // A job in replay mode replays the recording.
+    const fork = await ciJob({ mode: "replay", runId: "fork", prompt: "hi" });
     expect(fork.exitCode).toBe(0);
     expect(fork.response).toEqual({
       status: 200,
@@ -497,20 +498,29 @@ describe("deployed roach", () => {
     expect(liveRequests).toBe(1);
 
     // A request without a recording fails the step, and the summary names it.
-    const miss = await ciJob({ runId: "miss", prompt: "hi", page: 2 });
+    const miss = await ciJob({
+      mode: "replay",
+      runId: "miss",
+      prompt: "hi",
+      page: 2,
+    });
     expect(miss.response.status).toBe(412);
     expect(miss.exitCode).toBe(1);
     expect(miss.summary).toMatch(/^- test: model\/[0-9a-f]{64}\.json$/m);
-    // A run without the token does not see what changed in its summary,
-    // because that shows a part of the recorded request. Sentry gets it.
-    expect(miss.summary).not.toContain("Changed at character");
+    // The summary shows where the request changed, but no text of it. CI
+    // logs can be public. Sentry gets the text.
+    expect(miss.summary).toContain("Changed at character");
     expect(miss.summary).not.toContain(String.raw`\"prompt\":\"hi\"`);
     expect(liveRequests).toBe(1);
 
-    // A failed GCS read gives a client without the token only the id of
-    // the Sentry event, never the body of the GCS response.
+    // A failed GCS read gives the client only the id of the Sentry event,
+    // never the body of the GCS response.
     failGcs = "read";
-    const brokenRead = await ciJob({ runId: "broken-read", prompt: "hi" });
+    const brokenRead = await ciJob({
+      mode: "replay",
+      runId: "broken-read",
+      prompt: "hi",
+    });
     expect(brokenRead.response.status).toBe(502);
     const readEvent =
       /^Roach error: internal error, Sentry event ([0-9a-f]{32})\n$/.exec(
@@ -522,7 +532,6 @@ describe("deployed roach", () => {
     // the same way.
     failGcs = "write";
     const brokenWrite = await ciJob({
-      token: TOKEN,
       runId: "broken-write",
       prompt: "new",
     });
@@ -664,7 +673,6 @@ describe("deployed roach", () => {
     expect(span("roach.run.start", "writer-1")).toMatchObject({
       "roach.tenant": TENANT,
       "roach.mode": "auto",
-      "roach.write": true,
       "roach.ci.run_id": "writer",
       "roach.ci.job": "test",
       "roach.ci.repo": TENANT,
@@ -706,8 +714,8 @@ describe("deployed roach", () => {
       "http.response.status_code": 502,
     });
     // The first miss of each run looks for a request sample. The writer
-    // found none. The run without the token found the writer's, and Sentry
-    // gets the redacted change, which its summary does not show. The change
+    // found none. The miss found the writer's, and Sentry gets the redacted
+    // text of the change, which its summary does not show. The change
     // is in the query, so the text shows the URL with its key redacted.
     expect(span("roach.request", "writer-1")).toMatchObject({
       "miss.sample": "none",

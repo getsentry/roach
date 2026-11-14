@@ -131,18 +131,14 @@ function resolveValue(rule: string, name: string, value: FileValue): string {
 }
 
 /**
- * The run config of `file` in the environment `env`. Without the write
- * token (`canWrite`), the mode is `replay`, as for forks. `ROACH_MODE`
- * sets another mode.
+ * The run config of `file` in the environment `env`. The mode is `auto`
+ * unless `ROACH_MODE` sets another one.
  */
 export function runConfigOf(
   file: RoachFile,
-  {
-    canWrite,
-    env = process.env,
-  }: { canWrite: boolean; env?: NodeJS.ProcessEnv },
+  env: NodeJS.ProcessEnv = process.env,
 ): RunConfig {
-  const mode = readEnv("ROACH_MODE", env) ?? (canWrite ? "auto" : "replay");
+  const mode = readEnv("ROACH_MODE", env) ?? "auto";
   if (!MODES.has(mode)) {
     throw new Error(
       `Roach: ROACH_MODE must be auto, replay, record, or off, got ${mode}`,

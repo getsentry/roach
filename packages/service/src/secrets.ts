@@ -870,7 +870,7 @@ export interface RuleToRedact {
 }
 
 /** A proxied request and its rule, as `redactRequestWith` needs them. */
-export function toRedact(
+function toRedact(
   request: { url: URL; headers: IncomingHttpHeaders; body: Buffer },
   rule: RuleToRedact,
 ): RequestToRedact {
@@ -963,7 +963,7 @@ function mayShowCredential(body: string): boolean {
  * Each step reads the text once, so a long text or many values cost
  * little.
  */
-export function redactRequestWith(
+function redactRequestWith(
   values: string[],
   text: string,
   request: RequestToRedact,
@@ -1116,9 +1116,6 @@ export function createSecrets(initial: string[], limit: LearnLimit) {
     redact,
 
     redactBytes,
-
-    /** The known credentials, longer values first (`redactRequestWith`). */
-    list: longestFirst,
 
     /**
      * The text of a response body with the value of each minted credential

@@ -73,8 +73,8 @@ export interface RecordingMiss {
   file: string;
   /**
    * The first change from the request of the closest recording. Only the
-   * first miss of each session in a run with the write token has it, and
-   * only when the proxy has the text of that request.
+   * first miss of each session has it, and only when the proxy has the
+   * text of that request.
    */
   change?: RecordingChange;
 }
@@ -108,9 +108,8 @@ export interface RecordingStats {
  * Why the proxy refused a request:
  * - `notAllowed`: its origin is not in `allow`.
  * - `notPublic`: its origin is in `allow`, but its address is not public.
- * - `replayOnly`: the run can only replay, and no rule records the request.
  */
-export type RefusalReason = "notAllowed" | "notPublic" | "replayOnly";
+export type RefusalReason = "notAllowed" | "notPublic";
 
 /** The configuration of one run. The client sends it. */
 export interface RunConfig {

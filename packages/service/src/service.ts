@@ -7,12 +7,10 @@
  * run of a tenant, such as one CI job. It has its own mode, rules,
  * sessions, and stats.
  *
- * - Anyone can create a `replay` run of a tenant, so CI jobs of forks
- *   replay recordings without a secret. Such a run never writes.
- * - A run in another mode needs the write token, because it writes
- *   recordings. All tenants share one write token, and the service keeps
- *   only its SHA-256. The tenant name is a label, not proof of identity:
- *   a holder of the token can write the recordings of any tenant.
+ * - Each run needs the token, in every mode. All tenants share one token,
+ *   and the service keeps only its SHA-256 (`writeTokenHash`). The tenant
+ *   name is a label, not proof of identity: a holder of the token can read
+ *   and write the recordings of any tenant.
  * - The service gives each run its own id and token. A proxied request
  *   names its run in `Proxy-Authorization`, as `Basic base64(<id>:<token>)`.
  *   The proxy URL of the run has them, so `HTTPS_PROXY` sends them.
@@ -21,9 +19,7 @@
  *   service. Two checks keep that safe for the other tenants. The proxy
  *   sends requests only to public addresses (`addresses.ts`), so a run
  *   cannot reach the metadata server or the VPC. The key of a request has
- *   a time limit, and the keys of runs without the token are made in a
- *   worker process (`key-worker.ts`), so a slow pattern fails only its own
- *   request.
+ *   a time limit, so a slow pattern fails only its own request.
  * - The recordings of a tenant are under `<tenant>/`, in a directory or a
  *   GCS bucket (`gcs.ts`). Tenants never share recordings, because a key
  *   does not include credentials.
@@ -42,15 +38,9 @@ import {
 } from "./certificates.ts";
 import { reportInternal } from "./errors.ts";
 import { createGcsStore } from "./gcs.ts";
-import {
-  createRecorder,
-  type Attributes,
-  type Telemetry,
-  type WorkLimit,
-} from "./recorder.ts";
+import { createRecorder, type Attributes, type Telemetry } from "./recorder.ts";
 import { createFileStore } from "./recordings.ts";
-import { readJson, type BodyBudget } from "./bodies.ts";
-import { clientAddress, clientGroup } from "./clients.ts";
+import { readJson } from "./bodies.ts";
 import {
   controlRecorder,
   listenProxy,
@@ -85,8 +75,8 @@ export interface RoachServiceConfig {
   /** A GCS bucket for the recordings. Set this or `directory`. */
   bucket?: string;
   /**
-   * The SHA-256 of the write token, in hex. All tenants share the token.
-   * Give it only to CI jobs that you trust.
+   * The SHA-256 of the token, in hex. Each run needs the token, in every
+   * mode. All tenants share it. Give it only to CI jobs that you trust.
    */
   writeTokenHash: string;
   /** Credentials to redact in all recordings. */
@@ -107,11 +97,8 @@ export interface RoachServiceConfig {
   sentryDsn?: string;
   /**
    * Read a PROXY protocol v1 header at the start of each connection, such
-   * as from a GCP proxy load balancer with `proxy_header = "PROXY_V1"`. The
-   * service takes the address of the client from it, for the limit of runs
-   * for each client. A connection without the header uses the address of
-   * its socket, so the service works before and after the load balancer
-   * sends the header. Default: `false`.
+   * as from a GCP proxy load balancer with `proxy_header = "PROXY_V1"`, and
+   * drop it. A connection without the header works too. Default: `false`.
    */
   proxyProtocol?: boolean;
 }
@@ -128,7 +115,6 @@ interface Run extends ProxyTarget {
   id: string;
   token: string;
   started: number;
-  lastUsed: number;
 }
 
 /** The service gets little traffic, so it keeps all traces. */
@@ -136,92 +122,14 @@ const TRACES_SAMPLE_RATE = 1;
 /** A run that is open longer than this ends as failed, such as a dead job. */
 const RUN_TIMEOUT_MS = 6 * 60 * 60 * 1000;
 /**
- * Anyone can start a run without a token, so such runs have smaller
- * limits. One ends after 2 hours, or after 60 minutes without a proxied
- * request or a control call. The action starts the run before the command
- * of the job, so a long install or build step must not end it.
+ * The credentials that a run learns from its requests (`secrets.ts`), for
+ * credentials that change on each request, such as AWS signatures.
  */
-const PUBLIC_RUN_TIMEOUT_MS = 2 * 60 * 60 * 1000;
-const PUBLIC_RUN_IDLE_MS = 60 * 60 * 1000;
-/**
- * The open runs without a token that the service can have, for all tenants.
- * Anyone can start them with any tenant name, so the cap is not per tenant.
- * It keeps memory bounded. Runs with the token have no cap.
- */
-const MAX_PUBLIC_RUNS = 100;
-/**
- * The open runs without a token of one client address, or of one IPv6 /64,
- * so one client cannot take all places of `MAX_PUBLIC_RUNS`.
- */
-const MAX_PUBLIC_RUNS_PER_CLIENT = 10;
-/** A proxied request body of a run without a token over this gets 413. */
-const PUBLIC_MAX_BODY_BYTES = 16 * 1024 * 1024;
-/**
- * The bytes of request bodies that all runs without a token can hold at
- * one time. A request holds its body until it finishes, also while its key
- * waits for the key worker. A body that does not fit gets HTTP 503, and
- * the run goes on. With 128 MiB, 30 or 60 parallel bodies of 16 MiB take
- * at most about 1.1 GB of RSS for the service and the key worker. Without
- * the budget, 60 took 3.4 GB. The largest model request in the 14 days
- * to 2026-11-05 was about 0.65 MB.
- */
-const PUBLIC_BODY_BUDGET_BYTES = 128 * 1024 * 1024;
-/**
- * The part of `PUBLIC_BODY_BUDGET_BYTES` that the runs of one client
- * (`clientGroup()` of the client that started the run) can hold, so that
- * one client cannot take all of it. It takes 8 clients to fill the budget.
- * It is 1 body of 16 MiB, or about 25 of the largest model requests.
- */
-const PUBLIC_BODY_CLIENT_BYTES = 16 * 1024 * 1024;
-/**
- * A body of a run without a token that does not come in this time gets
- * HTTP 408, and gives its bytes back. So a client that sends a byte now
- * and then cannot hold its part of the budget. 16 MiB in 30 s is about
- * 4.5 Mbit/s.
- */
-const PUBLIC_BODY_READ_MS = 30_000;
-/**
- * The work of a run without a token (`WorkLimit`). A key has 1 s and 0.5 s
- * for each MiB of its body. One job in the key worker (`key-worker.ts`) has
- * at most 5 s, and all jobs 30 s. Past that, or when a key goes past its
- * time limit, the run ends. In the 14 days to 2026-11-05, the key time of
- * a run was at most 9.5 s (p99 9.1 s, about 1,000 keys).
- *
- * A request can have at most 100,000 changing values. The sessions of a
- * run can remember (`known`) at most 10,000 values with 256 Ki characters.
- * Past that, the run ends, so 100 runs keep at most about 200 MiB. The
- * largest model request in the 14 days to 2026-11-05 had 162,707 input
- * tokens, about 0.65 MB. In 24 model requests of Junior, the patterns of
- * its evals found at most 770 values with 15 K characters for each MiB. So
- * a session has about 500 values with 10 K characters, and the limits are
- * about 20 times that. The evals run one session at a time.
- */
-const PUBLIC_WORK_LIMIT: WorkLimit = {
-  maxJobMs: 5000,
-  maxValues: 100_000,
-  maxKnown: { values: 10_000, chars: 256 * 1024 },
-  totalMs: 30_000,
-  untrusted: true,
-};
-const WRITE_WORK_LIMIT: WorkLimit = {
-  maxJobMs: Infinity,
-  maxValues: Infinity,
-  maxKnown: { values: Infinity, chars: Infinity },
-  totalMs: Infinity,
-  untrusted: false,
-};
-/**
- * The credentials that a run learns from its requests (`secrets.ts`). A
- * run without a token gets a small limit, because anyone can start one.
- * A run with the token gets more, for credentials that change on each
- * request, such as AWS signatures.
- */
-const PUBLIC_LEARN_LIMIT = { values: 1024, length: 1024 * 1024 };
-const WRITE_LEARN_LIMIT = { values: 16 * 1024, length: 16 * 1024 * 1024 };
+const LEARN_LIMIT = { values: 16 * 1024, length: 16 * 1024 * 1024 };
 const sha256 = (value: string) => createHash("sha256").update(value).digest();
 
-/** Check that `authorization` has the write token, in constant time. */
-function isWriteToken(
+/** Check that `authorization` has the token, in constant time. */
+function hasToken(
   expected: Buffer,
   authorization: string | undefined,
 ): boolean {
@@ -323,15 +231,8 @@ function runTelemetry(
   };
 }
 
-/**
- * The store of one run. Each read and write has a span, and a run without
- * write access cannot write.
- */
-function runStore(
-  base: RecordingStore,
-  labels: Attributes,
-  canWrite: boolean,
-): RecordingStore {
+/** The store of one run. Each read and write has a span. */
+function runStore(base: RecordingStore, labels: Attributes): RecordingStore {
   const span = <T>(
     op: string,
     attributes: Record<string, string | number>,
@@ -350,7 +251,6 @@ function runStore(
       }),
     async write(recordings) {
       if (recordings.length === 0) return 0;
-      if (!canWrite) throw new Error("This run cannot write recordings");
       return span(
         "roach.store.write",
         { "roach.recordings": recordings.length },
@@ -402,14 +302,6 @@ export async function startRoachService(
     });
   }
   const runs = new Map<string, Run>();
-  /** The request bodies of all runs without a token. */
-  const publicBodies: BodyBudget = {
-    max: PUBLIC_BODY_BUDGET_BYTES,
-    perClient: PUBLIC_BODY_CLIENT_BYTES,
-    readMs: PUBLIC_BODY_READ_MS,
-    used: 0,
-    clients: new Map(),
-  };
   const authority = await createCertificateAuthority(config.ca);
   const storeOf = (tenant: string): RecordingStore =>
     config.bucket
@@ -427,11 +319,7 @@ export async function startRoachService(
       return stats;
     });
 
-  const createRun = (
-    runConfig: RunConfig,
-    canWrite: boolean,
-    client: string,
-  ): RemoteRun => {
+  const createRun = (runConfig: RunConfig): RemoteRun => {
     const id = randomBytes(8).toString("hex");
     const labels = {
       "roach.tenant": runConfig.tenant,
@@ -444,24 +332,14 @@ export async function startRoachService(
     };
     const telemetry = runTelemetry(labels, spanLabels);
     const token = randomBytes(24).toString("hex");
-    const store = runStore(storeOf(runConfig.tenant), spanLabels, canWrite);
+    const store = runStore(storeOf(runConfig.tenant), spanLabels);
     const run: Run = {
       id,
       token,
       started: Date.now(),
-      lastUsed: Date.now(),
       origins: parseOrigins(
         runConfig.allow.map((origin) => origin.replace(/\/$/, "")),
       ),
-      // A public run must not be an open proxy to the allowed origins.
-      replayOnly: !canWrite,
-      ...(canWrite
-        ? {}
-        : {
-            client,
-            maxBodyBytes: PUBLIC_MAX_BODY_BYTES,
-            bodyBudget: publicBodies,
-          }),
       privateNetworks: config.privateNetworks === true,
       // Each run learns only the credentials of its own requests.
       recorder: createRecorder(
@@ -470,17 +348,7 @@ export async function startRoachService(
           rules: runConfig.rules,
           secrets: config.secrets ?? [],
           runSecrets: runConfig.secrets ?? [],
-          // A change shows a part of a recorded request, and reads are
-          // public, so only a run with the write token gets it.
-          explainMisses: canWrite,
-          learnLimit: canWrite ? WRITE_LEARN_LIMIT : PUBLIC_LEARN_LIMIT,
-          workLimit: canWrite ? WRITE_WORK_LIMIT : PUBLIC_WORK_LIMIT,
-          endRun: (reason) => {
-            process.stderr.write(`[roach] Run ${id} ended: ${reason}\n`);
-            endRun(run).catch((error: unknown) => {
-              reportInternal(`Run ${id} end`, error, telemetry.capture(error));
-            });
-          },
+          learnLimit: LEARN_LIMIT,
           telemetry,
         },
         store,
@@ -522,6 +390,11 @@ export async function startRoachService(
       return;
     }
     if (incoming.method === "POST" && pathname === `${CONTROL_PATH}/runs`) {
+      // Check the token first, so the service reads no body without it.
+      if (!hasToken(writeTokenHash, incoming.headers.authorization)) {
+        sendJson(outgoing, 401, { error: "A run needs the token" });
+        return;
+      }
       const runConfig = await readJson<Partial<RunConfig>>(incoming);
       const tenant = runConfig.tenant;
       if (typeof tenant !== "string" || !TENANT_NAME.test(tenant)) {
@@ -533,38 +406,6 @@ export async function startRoachService(
         sendJson(outgoing, 400, { error });
         return;
       }
-      const canWrite = isWriteToken(
-        writeTokenHash,
-        incoming.headers.authorization,
-      );
-      // Reads are public. Every other mode can write, so it needs the token.
-      if (!canWrite && runConfig.mode !== "replay") {
-        sendJson(outgoing, 401, {
-          error: `${runConfig.mode} mode needs the write token`,
-        });
-        return;
-      }
-      const client = clientGroup(clientAddress(incoming));
-      if (!canWrite) {
-        let open = 0;
-        let ofClient = 0;
-        for (const other of runs.values()) {
-          if (other.replayOnly) open += 1;
-          if (other.client === client) ofClient += 1;
-        }
-        if (open >= MAX_PUBLIC_RUNS) {
-          sendJson(outgoing, 429, {
-            error: `The service has ${MAX_PUBLIC_RUNS} open runs without a token`,
-          });
-          return;
-        }
-        if (ofClient >= MAX_PUBLIC_RUNS_PER_CLIENT) {
-          sendJson(outgoing, 429, {
-            error: `Your address has ${MAX_PUBLIC_RUNS_PER_CLIENT} open runs without a token. End one first.`,
-          });
-          return;
-        }
-      }
       const valid = runConfig as RunConfig;
       const remote = Sentry.startSpan(
         {
@@ -573,12 +414,11 @@ export async function startRoachService(
           attributes: {
             "roach.tenant": tenant,
             "roach.mode": valid.mode,
-            "roach.write": canWrite,
             ...ciAttributes(valid.ci),
           },
         },
         (span) => {
-          const created = createRun(valid, canWrite, client);
+          const created = createRun(valid);
           span.setAttribute("roach.run.id", valid.name ?? created.id);
           return created;
         },
@@ -601,7 +441,6 @@ export async function startRoachService(
       outgoing.writeHead(404).end();
       return;
     }
-    run.lastUsed = Date.now();
     const rest = runRoute[2] ?? "";
     if (incoming.method === "DELETE" && rest === "") {
       sendJson(outgoing, 200, await endRun(run));
@@ -633,12 +472,8 @@ export async function startRoachService(
   const sweep = setInterval(() => {
     const now = Date.now();
     for (const run of runs.values()) {
-      const idle = run.replayOnly && now - run.lastUsed > PUBLIC_RUN_IDLE_MS;
-      const timeout = run.replayOnly ? PUBLIC_RUN_TIMEOUT_MS : RUN_TIMEOUT_MS;
-      if (idle || now - run.started > timeout) {
-        process.stderr.write(
-          `[roach] Run ${run.id} timed out${idle ? " without traffic" : ""}\n`,
-        );
+      if (now - run.started > RUN_TIMEOUT_MS) {
+        process.stderr.write(`[roach] Run ${run.id} timed out\n`);
         // A failed close must not stop the service for other runs.
         endRun(run).catch((error: unknown) => {
           reportInternal(
