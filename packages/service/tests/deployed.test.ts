@@ -181,6 +181,8 @@ function requestMetrics(mode: string, result: string) {
 async function ciJob(job: {
   /** `replay` for a job that must not record. Defaults to `auto`. */
   mode?: "replay";
+  /** Run the job without the token, as a fork. */
+  noToken?: boolean;
   runId: string;
   prompt: string;
   refused?: string;
@@ -244,7 +246,7 @@ console.log(JSON.stringify({
         ACTIONS_ID_TOKEN_REQUEST_URL: "https://token.actions.example/oidc",
         INPUT_RUN: "node job.mjs > result.json",
         INPUT_URL: frontUrl,
-        INPUT_TOKEN: TOKEN,
+        INPUT_TOKEN: job.noToken ? "" : TOKEN,
         ROACH_MODE: job.mode ?? "",
       }),
       stdio: ["ignore", "ignore", "pipe"],
@@ -544,6 +546,18 @@ describe("deployed roach", () => {
       )?.[1];
     expect(writeEvent).toBeDefined();
     expect(liveRequests).toBe(2);
+
+    // Without the token, the command runs without Roach, and its requests
+    // go direct.
+    const direct = await ciJob({
+      noToken: true,
+      runId: "fork-direct",
+      prompt: "hi",
+    });
+    expect(direct.exitCode).toBe(0);
+    expect(direct.response).toMatchObject({ status: 200, source: null });
+    expect(direct.summary).toContain("no token input, so Roach is off");
+    expect(liveRequests).toBe(3);
     for (const text of [
       brokenRead.response.body,
       brokenRead.stderr,

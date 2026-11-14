@@ -42,8 +42,10 @@ and to the job summary. After you add Roach, do the check in
 [Find changing values](#find-changing-values).
 
 - `ROACH_TOKEN`: the token of the service. Each run needs it. Only the
-  global setup reads it. Without it, the global setup fails, unless
-  `ROACH_MODE` is `off`.
+  global setup reads it. Without it, Roach is off, as with `ROACH_MODE=off`:
+  the tests run and their requests go direct. A local run needs no setup.
+  When `ROACH_MODE` asks for a run, such as `replay`, the global setup fails
+  without the token.
 - `ROACH_URL`: the service. Default: `https://roach-proxy.getsentry.net`.
 - `ROACH_MODE`: `auto`, `replay`, `record`, or `off`. Default: `auto`. Set
   `replay` for a job that must not record, such as a check that all tests
@@ -123,13 +125,15 @@ A repository adds one step and a `roach.json` file (see
 ```yaml
 - uses: getsentry/roach@v0
   with:
-    token: ${{ secrets.ROACH_TOKEN }} # required
+    token: ${{ secrets.ROACH_TOKEN }}
     run: pnpm test
 ```
 
 The action (`packages/roach/src/action.ts`) starts a run with the token in
 `auto` mode. Set `ROACH_MODE: replay` in the `env` of the step for a job
-that must not record. Without the token, the step fails. It runs `run` in
+that must not record. Without the token, it runs `run` without Roach, so
+its requests go direct, and the job summary says so. With the token, it
+runs `run` in
 bash with the proxy variables
 of the run, then ends the run and writes its stats to the job summary. The
 `url` input sets the service. Default: `https://roach-proxy.getsentry.net`.
@@ -584,8 +588,8 @@ config is `RoachServiceConfig` in `packages/service/src/service.ts`. `deploy/gcp
   proof of identity: a job with the token can read and write the
   recordings of any tenant. So give the token only to repositories and
   workflows that you trust, and never to a workflow that runs code from a
-  fork. CI jobs of forks get no secrets, so they cannot use Roach. Set
-  `ROACH_MODE=off` in them, or skip the tests that need it.
+  fork. CI jobs of forks get no secrets, so Roach is off in them, and
+  their requests go direct.
 - **Runs.** Each run has its own id, token, mode, rules, sessions, and
   stats. A proxied request names its run in `Proxy-Authorization`, as
   `Basic base64(<id>:<token>)`. The proxy URL of the run has them, so

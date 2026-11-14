@@ -7,9 +7,10 @@ inputs:
     required: true
   token:
     description: >-
-      The token of the service. Each run needs it. Give it only to
-      workflows that you trust.
-    required: true
+      The token of the service. Each run needs it. Without it, the step
+      runs the command without Roach, so requests go direct. Give it only
+      to workflows that you trust.
+    required: false
   url:
     description: The URL of the Roach service.
     required: false

@@ -44,8 +44,8 @@ const send = async (model) => {
 
 it("passes", async () => {
   const via = await send("${model}");
-  // In \`off\` mode the request goes direct, so no proxy marks it.
-  if (process.env.ROACH_MODE === "off") expect(via).toBeNull();
+  // Without Roach the request goes direct, so no proxy marks it.
+  if (process.env.EXPECT_DIRECT) expect(via).toBeNull();
   else expect(via).toMatch(/^(live|replayed)$/);
   // A child process sends through the session of its test too.
   execFileSync(process.execPath, [
@@ -177,17 +177,25 @@ describe("vitest", () => {
     expect(liveRequests).toHaveLength(6);
   });
 
-  it("fails early without the token", async () => {
-    const result = await runVitest({});
-    expect(result.code).toBe(1);
-    expect(result.output).toContain("set ROACH_TOKEN, or set ROACH_MODE=off");
-    expect(liveRequests).toHaveLength(0);
+  it("sends requests direct without the token", async () => {
+    const result = await runVitest({ EXPECT_DIRECT: "1" });
+    expect(result).toMatchObject({ code: 0 });
+    expect(result.output).toContain("no ROACH_TOKEN, so Roach is off");
+    expect(liveRequests).toHaveLength(4);
+    await expect(recordedSessions()).resolves.toEqual([]);
+
+    // A mode that asks for a run needs the token.
+    const replay = await runVitest({ ROACH_MODE: "replay" });
+    expect(replay.code).toBe(1);
+    expect(replay.output).toContain("ROACH_MODE=replay needs ROACH_TOKEN");
+    expect(liveRequests).toHaveLength(4);
   });
 
   it("sends requests direct in off mode, without the service", async () => {
     const result = await runVitest({
       ROACH_MODE: "off",
       ROACH_URL: "http://127.0.0.1:1",
+      EXPECT_DIRECT: "1",
     });
     expect(result).toMatchObject({ code: 0 });
     expect(liveRequests).toHaveLength(4);
