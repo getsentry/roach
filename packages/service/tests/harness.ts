@@ -21,7 +21,7 @@ import {
 export const budget = (ms: number) =>
   ms * Number(process.env.ROACH_TEST_SLOWDOWN ?? "1");
 
-/** The write token of a test service. */
+/** The token of a test service. */
 export const TOKEN = "write-token";
 
 /** The SHA-256 of a token in hex, as `writeTokenHash` keeps it. */

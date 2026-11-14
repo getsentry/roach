@@ -38,7 +38,7 @@ const runs: RemoteRoach[] = [];
 let agent: ProxyAgent | undefined;
 
 /**
- * Start a run with the write token. Later requests go through it. `url` is
+ * Start a run with the token. Later requests go through it. `url` is
  * `match.url` of its rule.
  */
 async function start(
@@ -624,7 +624,7 @@ describe("recording", () => {
   });
 
   it("finds the values that replace() finds", () => {
-    // `extractValues()` counts each value when it finds it. It must find
+    // `extractValues()` finds each value in an `exec()` loop. It must find
     // the same values as `replace()`, also empty ones, and with known
     // values.
     const patterns = { x: "x*", d: String.raw`\d{0,2}`, w: "ab|a" };

@@ -121,11 +121,6 @@ interface Run extends ProxyTarget {
 const TRACES_SAMPLE_RATE = 1;
 /** A run that is open longer than this ends as failed, such as a dead job. */
 const RUN_TIMEOUT_MS = 6 * 60 * 60 * 1000;
-/**
- * The credentials that a run learns from its requests (`secrets.ts`), for
- * credentials that change on each request, such as AWS signatures.
- */
-const LEARN_LIMIT = { values: 16 * 1024, length: 16 * 1024 * 1024 };
 const sha256 = (value: string) => createHash("sha256").update(value).digest();
 
 /** Check that `authorization` has the token, in constant time. */
@@ -348,7 +343,6 @@ export async function startRoachService(
           rules: runConfig.rules,
           secrets: config.secrets ?? [],
           runSecrets: runConfig.secrets ?? [],
-          learnLimit: LEARN_LIMIT,
           telemetry,
         },
         store,

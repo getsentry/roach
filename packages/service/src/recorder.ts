@@ -42,7 +42,7 @@ import {
   toRecording,
   utf8Text,
 } from "./recording-file.ts";
-import { createSecrets, type LearnLimit } from "./secrets.ts";
+import { createSecrets } from "./secrets.ts";
 import {
   recordingKey,
   RULE_NAME,
@@ -186,12 +186,11 @@ export interface RecorderConfig {
   /** Credentials to redact, in addition to the ones that it learns. */
   secrets?: string[];
   /**
-   * The `secrets` of the run config. They count toward `learnLimit`, so
-   * too many of them throw an error with HTTP status 400.
+   * The `secrets` of the run config. They count toward the limit of the
+   * credentials that a run learns (`secrets.ts`), so too many of them
+   * throw an error with HTTP status 400.
    */
   runSecrets?: string[];
-  /** The credentials that the recorder can learn from requests. */
-  learnLimit: LearnLimit;
   telemetry: Telemetry;
 }
 
@@ -207,7 +206,7 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
   const open = () =>
     [...sessions.values()].filter((s) => s.passed === undefined);
   const { telemetry } = config;
-  const secrets = createSecrets(config.secrets ?? [], config.learnLimit);
+  const secrets = createSecrets(config.secrets ?? []);
   secrets.addRunSecrets(config.runSecrets ?? []);
   /**
    * Add the values of a request to `known` of its session. A value that
@@ -478,12 +477,7 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
             headers: request.headers,
             body: request.body.toString("utf8"),
           };
-          const value = keyRequest(
-            rule,
-            toKey,
-            owner?.known,
-            keyTimeLimit(request.body.length),
-          );
+          const value = keyRequest(rule, toKey, owner?.known);
           const name = recordingKey(rule.name, value.key);
           telemetry.annotate({ "roach.key": name });
           return { keyed: value, key: name };

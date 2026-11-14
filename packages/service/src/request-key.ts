@@ -173,17 +173,18 @@ const sha256 = (text: string) =>
  * The key and the changing values of a request. `known` holds the values
  * of earlier requests in the same session (`@sentry/roach/values`). It
  * throws an error with HTTP status 400 when it takes longer than
- * `timeLimitMs`, by default `keyTimeLimit()` of the body, or when its JSON
- * body is nested deeper than `MAX_JSON_DEPTH`. The limits never change a key:
+ * `keyTimeLimit()` of the body, or when its JSON body is nested deeper
+ * than `MAX_JSON_DEPTH`. The limits never change a key:
  * a request gets its key, or it fails.
  */
 export function keyRequest(
   rule: RecordingRule,
   request: RequestToKey,
   known?: KnownValues,
-  timeLimitMs = keyTimeLimit(Buffer.byteLength(request.body)),
 ): KeyedRequest {
-  return withTimeLimit(timeLimitMs, () => keyRequestNow(rule, request, known));
+  return withTimeLimit(keyTimeLimit(Buffer.byteLength(request.body)), () =>
+    keyRequestNow(rule, request, known),
+  );
 }
 
 function keyRequestNow(

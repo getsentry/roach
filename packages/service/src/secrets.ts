@@ -837,13 +837,11 @@ function add(value: string, into: Set<string>, derived = into): void {
 
 /**
  * The most values that one run learns from its requests and its own
- * `secrets`, and their total length in characters. The values of
- * `initial` do not count.
+ * `secrets`, and their total length in characters, for credentials that
+ * change on each request, such as AWS signatures. The values of `initial`
+ * do not count.
  */
-export interface LearnLimit {
-  values: number;
-  length: number;
-}
+const LEARN_LIMIT = { values: 16 * 1024, length: 16 * 1024 * 1024 };
 
 /** `text` with each of `values` replaced. Give longer values first. */
 function redactWith(values: string[], text: string): string {
@@ -1012,11 +1010,11 @@ function redactRequestWith(
 
 /**
  * Create the secret list of one proxy run, with the values of `initial`.
- * A request that would make the run learn more than `limit` fails with
+ * A request that would make the run learn more than `LEARN_LIMIT` fails with
  * HTTP 431 and learns nothing. So the proxy never forgets a credential
  * that it saw, and it never sends or records such a request.
  */
-export function createSecrets(initial: string[], limit: LearnLimit) {
+export function createSecrets(initial: string[]) {
   const values = new Set<string>();
   let learned = { values: 0, length: 0 };
   initial.forEach((value) => add(value, values));
@@ -1029,7 +1027,7 @@ export function createSecrets(initial: string[], limit: LearnLimit) {
 
   /**
    * Add the values in `seen` that are new. When they make the run go past
-   * `limit`, it throws an error with `status` and adds nothing.
+   * `LEARN_LIMIT`, it throws an error with `status` and adds nothing.
    */
   const admit = (
     seen: Set<string>,
@@ -1042,10 +1040,10 @@ export function createSecrets(initial: string[], limit: LearnLimit) {
       next.values += 1;
       next.length += part.length;
     }
-    if (next.values > limit.values || next.length > limit.length) {
+    if (next.values > LEARN_LIMIT.values || next.length > LEARN_LIMIT.length) {
       throw httpError(
         status,
-        `this run cannot learn more credentials (${limit.values} values or ${limit.length} characters, with the parts of each value). Start a new run.`,
+        `this run cannot learn more credentials (${LEARN_LIMIT.values} values or ${LEARN_LIMIT.length} characters, with the parts of each value). Start a new run.`,
       );
     }
     learned = next;
