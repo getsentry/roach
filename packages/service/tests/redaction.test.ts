@@ -1109,23 +1109,6 @@ describe("redaction", () => {
     expect((await stored("api")).size).toBe(0);
   });
 
-  it("learns a credential with `/` without more values toward the limit", async () => {
-    // A SigV4 `Authorization` header has a new value with `/` on each
-    // request. A run without the token learns at most 1,024 values, and
-    // this header has 401: the value and its 400 parts.
-    const run = await startRemoteRun(
-      { url: service.url },
-      { tenant: TENANT, mode: "replay", allow: [origin], rules: [rule()] },
-    );
-    runs.push(run);
-    const parts = Array.from({ length: 400 }, (_, i) => `scope/${i}/request`);
-    const live = await send(run, "/v1/fields", "{}", {
-      authorization: parts.join(", "),
-    });
-    expect(live.body.toString()).not.toMatch(/cannot learn more/);
-    expect(live.source).toBe("missed");
-  });
-
   it("redacts a learned credential that the upstream writes with `\\/`", async () => {
     const run = await start("auto");
     const headers = { "x-api-key": "abc/def/ghi/jkl012" };

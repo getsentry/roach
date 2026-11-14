@@ -153,16 +153,11 @@ export type KnownValues = ReadonlyMap<string, string>;
  * model repeats the short commit id of a `git push` range in its reply,
  * and a later request sends that reply back. A pattern wins over a known
  * value at the same place.
- *
- * Past `maxValues` values, it stops and throws an error with HTTP status
- * 400. It counts each value when it finds it, so a text with millions of
- * values cannot fill the memory before the error.
  */
 export function extractValues(
   text: string,
   patterns: ValuePatterns | undefined,
   known?: KnownValues,
-  maxValues = Infinity,
 ): { text: string; values: RequestValues } {
   const values: RequestValues = new Map();
   if (!patterns || Object.keys(patterns).length === 0) {
@@ -175,22 +170,13 @@ export function extractValues(
   const search = hasKnown
     ? new RegExp(`${pattern.source}|(${literals([...known.keys()])})`, "g")
     : pattern;
-  // An `exec()` loop, not `replace()`: `replace()` finds all matches
-  // before it calls its function, so it cannot stop at `maxValues`. The
-  // loop finds the same matches, also the empty ones.
+  // An `exec()` loop. It finds the same matches as `replace()`, also the
+  // empty ones, so the keys stay the same.
   const parts: string[] = [];
-  let count = 0;
   let end = 0;
   search.lastIndex = 0;
   try {
     for (let match = search.exec(text); match; match = search.exec(text)) {
-      count += 1;
-      if (count > maxValues) {
-        throw Object.assign(
-          new Error("the request has too many changing values"),
-          { status: 400 },
-        );
-      }
       const value = match[0];
       const name =
         hasKnown && match[knownGroup] !== undefined

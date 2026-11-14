@@ -131,18 +131,31 @@ function resolveValue(rule: string, name: string, value: FileValue): string {
 }
 
 /**
- * The run config of `file` in the environment `env`. Without the write
- * token (`canWrite`), the mode is `replay`, as for forks. `ROACH_MODE`
- * sets another mode.
+ * What to do without the token: Roach is off, so requests go direct and
+ * need no service. Returns the note to show. A `ROACH_MODE` other than
+ * `off` asks for a run, so then it throws. `tokenName` names the token in
+ * the messages.
+ */
+export function offWithoutToken(
+  tokenName: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const mode = readEnv("ROACH_MODE", env);
+  if (mode !== undefined && mode !== "off") {
+    throw new Error(`Roach: ROACH_MODE=${mode} needs ${tokenName}`);
+  }
+  return `Roach: no ${tokenName}, so Roach is off and requests go direct.`;
+}
+
+/**
+ * The run config of `file` in the environment `env`. The mode is `auto`
+ * unless `ROACH_MODE` sets another one.
  */
 export function runConfigOf(
   file: RoachFile,
-  {
-    canWrite,
-    env = process.env,
-  }: { canWrite: boolean; env?: NodeJS.ProcessEnv },
+  env: NodeJS.ProcessEnv = process.env,
 ): RunConfig {
-  const mode = readEnv("ROACH_MODE", env) ?? (canWrite ? "auto" : "replay");
+  const mode = readEnv("ROACH_MODE", env) ?? "auto";
   if (!MODES.has(mode)) {
     throw new Error(
       `Roach: ROACH_MODE must be auto, replay, record, or off, got ${mode}`,

@@ -49,13 +49,7 @@ For metrics, use `-f dataset=tracemetrics`,
   rate.
 - **Refused**: the proxy sent the request nowhere and answered HTTP 403.
   `roach.reason` tells why: `notAllowed` (the origin is not in `allow`),
-  `notPublic` (the address is not public), or `replayOnly` (a run without
-  the token, and no rule records the request).
-- **Busy**: the body of a run without the token did not fit in the
-  budget of bodies, and the proxy answered HTTP 503 with `Retry-After`.
-  The run goes on, and the client can send the request again.
-- **Timeout**: the body of a run without the token did not come in 30 s,
-  and the proxy answered HTTP 408.
+  or `notPublic` (the address is not public).
 - **Aborted**: the client closed its connection before the body of its
   request came. The proxy sent the request nowhere. It is not an error,
   so Sentry gets no event.
@@ -79,7 +73,6 @@ For metrics, use `-f dataset=tracemetrics`,
 | `roach.ci.ref`              | `GITHUB_REF` of the run                          | spans, errors                        |
 | `roach.session`             | session (test) name of a request                 | `roach.request`                      |
 | `roach.key`                 | recording key of a request                       | `roach.key`, `roach.store.read`      |
-| `roach.write`               | the run has the write token (boolean)            | `roach.run.start`                    |
 | `roach.recordings`          | files that one write sends to the store          | `roach.store.write`                  |
 | `roach.written`             | files that were new or changed                   | `roach.store.write`, `roach.run.end` |
 | `http.request.method`       | method of the request                            | `roach.request`, `roach.upstream`    |
@@ -96,12 +89,16 @@ A metric for a `notAllowed` request has `roach.origin:other`, because the
 client picks that origin. Its span has the origin.
 
 A filter on a boolean or a number attribute needs its type, such as
-`tags[roach.write,boolean]:true` or `tags[roach.missed,number]:>0`.
+`tags[roach.missed,number]:>0`.
 
 Data from before this naming has the same attributes without `roach.`
 (`tenant`, `mode`, `rule`, `result`, `origin`, `key`, `write`, `recordings`,
 `written`), and `run` in place of `roach.run.id`. Its `roach.store.read`
 spans have `result` `hit` and `miss`.
+
+Data from before each run needed the token can also have `roach.write`
+on `roach.run.start`, the results `busy` and `timeout`, and the reason
+`replayOnly`. These came from runs without the token.
 
 ## Query Recipes
 
@@ -110,7 +107,7 @@ counts are estimates (see [Sampling](#sampling)).
 
 Cached and uncached requests by rule. The hit rate of a rule is
 `replayed / (replayed + live + missed)`. Do not count `passthrough`,
-`refused`, `busy`, `timeout`, or `aborted`.
+`refused`, or `aborted`.
 
 ```bash
 sentry explore sentry/roach --dataset metrics --metric roach.request --agg sum \
@@ -132,16 +129,6 @@ Refused requests, by reason and origin.
 sentry explore sentry/roach --dataset metrics --metric roach.request --agg sum \
   --period 24h -q 'roach.result:refused' -F roach.tenant -F roach.reason \
   -F roach.origin
-```
-
-Requests of runs without the token that the budget of bodies stopped
-(`busy`, HTTP 503) or that were too slow (`timeout`, HTTP 408), by tenant.
-A steady count of `busy` from many tenants shows that the budget is too
-small. A count from one tenant shows one client that fills its part.
-
-```bash
-sentry explore sentry/roach --dataset metrics --metric roach.request --agg sum \
-  --period 24h -q 'roach.result:[busy,timeout]' -F roach.tenant -F roach.result
 ```
 
 Time saved by a replay. Compare `live` and `replayed` for each rule. Use
@@ -201,9 +188,8 @@ Where the requests of misses changed, and what changed. The same
 run. `miss.recorded` and `miss.request` show that value. `miss.sample:none`
 is a miss that has no recorded request to compare with.
 `miss.sample:withheld` is a miss whose recorded request had a credential
-that the proxy could not redact, so its sample has no text. This works for
-runs without the token too, such as CI of a fork. Only Sentry has these
-texts: the run report shows only the offset and the key, because CI logs
+that the proxy could not redact, so its sample has no text. Only Sentry
+has these texts: the run report shows only the offset and the key, because CI logs
 can be public.
 
 ```bash
@@ -221,14 +207,11 @@ sentry explore sentry/roach --dataset spans --period 24h \
   -F http.response.status_code -F 'count()'
 ```
 
-Runs by mode, and how many have the write token.
+Runs by mode.
 
 ```bash
 sentry explore sentry/roach --dataset spans --period 24h \
   -q 'span.op:roach.run.start' -F roach.mode -F 'count()'
-sentry explore sentry/roach --dataset spans --period 24h \
-  -q 'span.op:roach.run.start tags[roach.write,boolean]:true' -F roach.tenant \
-  -F 'count()'
 ```
 
 Unexpected failures, such as a failed GCS call. The client got HTTP 502 or
@@ -279,9 +262,8 @@ and the next run makes it again. Compare `roach.recording.write` with
   `miss.changed_at`, `miss.compared`, `miss.recorded`, and `miss.request`.
   The two texts have at most 160 characters each, redacted as in a
   recording, with the value of each credential query parameter redacted.
-  Every run sends them, with or without the token. No stats, report, or
-  log has the texts. The stats and report of a run with the token have
-  only the offset and the key ("Misses" in `README.md`).
+  Every run sends them. No stats, report, or log has the texts. The stats
+  and report of a run have only the offset and the key ("Misses" in `README.md`).
 - `roach.store.read` spans with a `roach.key` that starts with
   `_requests/` read a request sample, not a recording. Leave them out of a
   hit rate of `roach.store.read`. Each write of recordings has a second

@@ -13,9 +13,9 @@ const MODES = new Set<RecordingMode>(["auto", "off", "record", "replay"]);
 const MAX_RUN_NAME = 128;
 
 /**
- * Limits of the config of a run. Anyone can start a run, so they keep the
- * work of a run small: the service makes a certificate for each host that
- * a run tunnels to, and runs each value pattern on each request.
+ * Limits of the config of a run. All runs share one process, so they keep
+ * the work of a run small: the service makes a certificate for each host
+ * that a run tunnels to, and runs each value pattern on each request.
  */
 const MAX_RUN_ORIGINS = 32;
 const MAX_RULES = 64;

@@ -4,12 +4,19 @@
  *
  * It starts a run, runs the command of the step with the proxy variables of
  * the run, and ends the run. The run config comes from `roach.json`
- * (`config.ts`).
+ * (`config.ts`). Without the token, it runs the command without Roach
+ * (`offWithoutToken()`).
  * The runner gives each input as `INPUT_<NAME>`.
  */
 import { spawn } from "node:child_process";
+import { appendFile } from "node:fs/promises";
 import { startRemoteRun } from "./client.ts";
-import { readEnv, readRoachFile, runConfigOf } from "./config.ts";
+import {
+  offWithoutToken,
+  readEnv,
+  readRoachFile,
+  runConfigOf,
+} from "./config.ts";
 import { writeRunReport } from "./report.ts";
 
 /**
@@ -54,8 +61,20 @@ const command = process.env.INPUT_RUN;
 if (!command) throw new Error("Roach: the run input is required");
 // The runner gives an empty string for an input that the step does not set.
 const token = readEnv("INPUT_TOKEN");
+/** The environment of the job, without `HIDDEN_VARIABLE`. */
+const jobEnv = Object.fromEntries(
+  Object.entries(process.env).filter(([name]) => !HIDDEN_VARIABLE.test(name)),
+);
+if (!token) {
+  const note = offWithoutToken("token input");
+  process.stderr.write(`${note}\n`);
+  if (process.env.GITHUB_STEP_SUMMARY) {
+    await appendFile(process.env.GITHUB_STEP_SUMMARY, `${note}\n`);
+  }
+  process.exit(await runCommand(command, jobEnv));
+}
 const file = await readRoachFile();
-const config = runConfigOf(file, { canWrite: token !== undefined });
+const config = runConfigOf(file);
 const run = await startRemoteRun(
   { url: process.env.INPUT_URL!, token },
   config,
@@ -67,14 +86,7 @@ process.stdout.write(`::add-mask::${run.token}\n`);
 let exitCode = 1;
 try {
   const session = await run.startSession(process.env.GITHUB_JOB ?? "command");
-  exitCode = await runCommand(command, {
-    ...Object.fromEntries(
-      Object.entries(process.env).filter(
-        ([name]) => !HIDDEN_VARIABLE.test(name),
-      ),
-    ),
-    ...run.env,
-  });
+  exitCode = await runCommand(command, { ...jobEnv, ...run.env });
   const { missed } = await session.end(exitCode === 0);
   if (missed > 0 && exitCode === 0) exitCode = 1;
 } finally {

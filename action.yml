@@ -7,8 +7,9 @@ inputs:
     required: true
   token:
     description: >-
-      The write token of the service. Without it, the run can only replay,
-      as in jobs of forks. Give it only to workflows that you trust.
+      The token of the service. Each run needs it. Without it, the step
+      runs the command without Roach, so requests go direct. Give it only
+      to workflows that you trust.
     required: false
   url:
     description: The URL of the Roach service.

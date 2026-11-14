@@ -8,8 +8,9 @@
  * tests of many workers record at the same time. At the end it closes the
  * run and reports it.
  *
- * - `ROACH_TOKEN` is the write token. Only this file reads it, and the
- *   workers do not get it. Without it, the run can only replay.
+ * - `ROACH_TOKEN` is the token of the service. Each run needs it. Only
+ *   this file reads it, and the workers do not get it. Without it, Roach
+ *   is off (`offWithoutToken()`).
  * - `ROACH_URL` is the service. Default: the Roach service of Sentry.
  * - `ROACH_MODE` sets the mode. See `runConfigOf()`. With `off`, it starts
  *   no run and does not use the service, so requests go direct.
@@ -21,6 +22,7 @@ import { startRemoteRun } from "./client.ts";
 import {
   DEFAULT_NO_PROXY,
   DEFAULT_SERVICE_URL,
+  offWithoutToken,
   readEnv,
   readRoachFile,
   runConfigOf,
@@ -49,8 +51,13 @@ export async function startRoach(
   const token = readEnv("ROACH_TOKEN");
   delete process.env.ROACH_TOKEN;
   const file = await readRoachFile();
-  const config = runConfigOf(file, { canWrite: token !== undefined });
+  const config = runConfigOf(file);
   if (config.mode === "off") {
+    project.provide("roach", null);
+    return async () => {};
+  }
+  if (token === undefined) {
+    process.stderr.write(`${offWithoutToken("ROACH_TOKEN")}\n`);
     project.provide("roach", null);
     return async () => {};
   }

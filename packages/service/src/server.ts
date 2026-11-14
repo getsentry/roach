@@ -23,8 +23,8 @@
  * `missed` (`replay` mode had no recording), or `passthrough` (no rule
  * matched).
  *
- * Request bodies and their shared budget are in `bodies.ts`. The PROXY
- * protocol header and the address of the client are in `clients.ts`.
+ * Request bodies are in `bodies.ts`. The PROXY protocol header is in
+ * `clients.ts`.
  */
 import { timingSafeEqual } from "node:crypto";
 import http from "node:http";
@@ -41,13 +41,7 @@ import type { CertificateAuthority } from "./certificates.ts";
 import { reportInternal } from "./errors.ts";
 import type { ProxyRequest, Recorder, Telemetry } from "./recorder.ts";
 import type { OpenedSession } from "@sentry/roach/types";
-import {
-  type BodyBudget,
-  type Held,
-  readBody,
-  readJson,
-  release,
-} from "./bodies.ts";
+import { readBody, readJson } from "./bodies.ts";
 import { acceptProxied } from "./clients.ts";
 
 /** Headers for one connection, which the proxy must not forward. */
@@ -62,10 +56,7 @@ const HOP_HEADERS = new Set([
   "upgrade",
 ]);
 const AUTHORITY = /^(\[[0-9a-f:.]+\]|[a-z0-9.-]+):(\d{1,5})$/i;
-/**
- * A proxied request body over this size gets HTTP 413, unless the target
- * has a smaller `maxBodyBytes`.
- */
+/** A proxied request body over this size gets HTTP 413. */
 const MAX_BODY_BYTES = 64 * 1024 * 1024;
 /** A tunnel that sends no byte this long after its `200` closes. */
 const TUNNEL_FIRST_BYTE_MS = 10_000;
@@ -170,18 +161,11 @@ function sendUpstream(
 
 /** Proxy one request to an allowed origin, through the recorder. */
 async function proxyRequest(
-  {
-    recorder,
-    origins,
-    replayOnly,
-    privateNetworks = false,
-    maxBodyBytes = MAX_BODY_BYTES,
-  }: ProxyTarget,
+  { recorder, origins, privateNetworks = false }: ProxyTarget,
   session: string | undefined,
   incoming: http.IncomingMessage,
   outgoing: http.ServerResponse,
   tunnelOrigin: string | undefined,
-  held: Held,
 ): Promise<void> {
   const url = new URL(
     tunnelOrigin ? `${tunnelOrigin}${incoming.url}` : (incoming.url ?? ""),
@@ -198,19 +182,10 @@ async function proxyRequest(
     method: incoming.method ?? "GET",
     url,
     headers: incoming.headers,
-    body: await readBody(incoming, maxBodyBytes, held),
+    body: await readBody(incoming, MAX_BODY_BYTES),
   };
   const rule = recorder.ruleFor(request);
 
-  if (!rule && replayOnly) {
-    // Without this, anyone could send live traffic through a public run.
-    recorder.countRefused("replayOnly", origin.origin);
-    outgoing.writeHead(403, { "content-type": "text/plain" });
-    outgoing.end(
-      "Roach: this run can only replay, and no rule records this request\n",
-    );
-    return;
-  }
   if (!rule) {
     // Learn its credentials before it goes out, so that a later recording
     // that shows them has them redacted.
@@ -309,33 +284,12 @@ export interface ProxyTarget {
   origins: Map<string, URL>;
   recorder: Recorder;
   /**
-   * Refuse requests that no rule matches, so nothing goes live. The
-   * service sets this for a run without the write token.
-   */
-  replayOnly?: boolean;
-  /**
    * Send requests to addresses that are not public too, such as
    * `127.0.0.1`. Only for tests and local development.
    */
   privateNetworks?: boolean;
   /** Set when the target stops. Its tunnels then refuse new requests. */
   closed?: boolean;
-  /** A request body over this size gets HTTP 413. Default: 64 MiB. */
-  maxBodyBytes?: number;
-  /**
-   * The budget that the request bodies of this target take from, until
-   * each request finishes. A body that does not fit gets HTTP 503, and the
-   * run goes on. Targets can share one budget.
-   */
-  bodyBudget?: BodyBudget;
-  /**
-   * The client whose part of `bodyBudget` the requests take. The service
-   * sets it for a run without the token: the address group
-   * (`clientGroup()`) of the client that started the run.
-   */
-  client?: string;
-  /** The time of the last proxied request, from `Date.now()`. */
-  lastUsed?: number;
   /** Gets a span for each proxied request. */
   telemetry: Telemetry;
 }
@@ -409,7 +363,6 @@ function serveProxied(
     outgoing.end("Roach: this run has ended\n");
     return;
   }
-  target.lastUsed = Date.now();
   // Only the origin: the path and query can hold a credential.
   const origin = String(tunnelOrigin ?? URL.parse(incoming.url ?? "")?.origin);
   const method = incoming.method ?? "GET";
@@ -422,25 +375,11 @@ function serveProxied(
         attributes: { "roach.origin": origin, "http.request.method": method },
       },
       async () => {
-        const held: Held = {
-          budget: target.bodyBudget,
-          client: target.client ?? "",
-          bytes: 0,
-        };
         try {
-          await proxyRequest(
-            target,
-            session,
-            incoming,
-            outgoing,
-            tunnelOrigin,
-            held,
-          );
+          await proxyRequest(target, session, incoming, outgoing, tunnelOrigin);
         } catch (error) {
           // In the span, so that the Sentry event is in the trace.
           answerError(target, origin, error, outgoing);
-        } finally {
-          release(held);
         }
         telemetry.annotate({
           "http.response.status_code": outgoing.statusCode,
@@ -465,32 +404,17 @@ function answerError(
     status === undefined
       ? reportInternal("Request", error, target.telemetry.capture(error))
       : (error as Error).message;
-  // A body that did not fit in the budget, that did not come in time, or
-  // whose client closed the request is not a miss and not an error. Count
-  // it, so that Sentry shows it.
-  const result = (error as { aborted?: boolean }).aborted
-    ? "aborted"
-    : status === 503
-      ? "busy"
-      : status === 408
-        ? "timeout"
-        : undefined;
-  if (result) {
-    target.telemetry.annotate({ "roach.result": result });
+  // A request whose client closed it is not a miss and not an error.
+  // Count it, so that Sentry shows it.
+  if ((error as { aborted?: boolean }).aborted) {
+    target.telemetry.annotate({ "roach.result": "aborted" });
     target.telemetry.count("roach.request", 1, {
       "roach.origin": origin,
-      "roach.result": result,
+      "roach.result": "aborted",
     });
   }
   if (!outgoing.headersSent) {
-    outgoing.writeHead(status ?? 502, {
-      "content-type": "text/plain",
-      // Clients of model APIs send a 503 again, after this time in s.
-      ...(status === 503 ? { "retry-after": "1" } : {}),
-      // The rest of a slow body does not come in time, so close the
-      // connection and do not wait for it.
-      ...(status === 408 ? { connection: "close" } : {}),
-    });
+    outgoing.writeHead(status ?? 502, { "content-type": "text/plain" });
   }
   outgoing.end(`Roach error: ${text}\n`);
 }

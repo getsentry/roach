@@ -41,12 +41,16 @@ fails. At the end, the global setup writes the stats of the run to stdout
 and to the job summary. After you add Roach, do the check in
 [Find changing values](#find-changing-values).
 
-- `ROACH_TOKEN`: the write token. Only the global setup reads it. Without
-  it, the run can only replay, as in jobs of forks.
+- `ROACH_TOKEN`: the token of the service. Each run needs it. Only the
+  global setup reads it. Without it, Roach is off, as with `ROACH_MODE=off`:
+  the tests run and their requests go direct. A local run needs no setup.
+  When `ROACH_MODE` asks for a run, such as `replay`, the global setup fails
+  without the token.
 - `ROACH_URL`: the service. Default: `https://roach-proxy.getsentry.net`.
-- `ROACH_MODE`: `auto`, `replay`, `record`, or `off`. Default: `auto` with
-  the token, `replay` without it. With `off`, the global setup starts no run,
-  so requests go direct and need no service and no token.
+- `ROACH_MODE`: `auto`, `replay`, `record`, or `off`. Default: `auto`. Set
+  `replay` for a job that must not record, such as a check that all tests
+  replay. With `off`, the global setup starts no run, so requests go direct
+  and need no service and no token.
 
 A project that has its own global setup calls `startRoach(project)` from
 `@sentry/roach/vitest` in it, and returns its teardown.
@@ -76,9 +80,9 @@ import { startRemoteRun, connectRoach } from "@sentry/roach/client";
 import { describeRecordingStats } from "@sentry/roach/report";
 import { VALUE_PATTERNS } from "@sentry/roach/values";
 
-// Once per CI job. Without `token`, only `replay` mode is allowed.
+// Once per CI job. Each run needs the token of the service.
 const run = await startRemoteRun(
-  { url: "https://roach.example.com", token: process.env.ROACH_TOKEN },
+  { url: "https://roach.example.com", token: process.env.ROACH_TOKEN! },
   {
     tenant: process.env.GITHUB_REPOSITORY!, // such as getsentry/junior
     mode: "auto",
@@ -121,17 +125,21 @@ A repository adds one step and a `roach.json` file (see
 ```yaml
 - uses: getsentry/roach@v0
   with:
-    token: ${{ secrets.ROACH_TOKEN }} # without it, the run can only replay
+    token: ${{ secrets.ROACH_TOKEN }}
     run: pnpm test
 ```
 
-The action (`packages/roach/src/action.ts`) starts a run with the token in `auto` mode, or
-without it in `replay` mode. It runs `run` in bash with the proxy variables
+The action (`packages/roach/src/action.ts`) starts a run with the token in
+`auto` mode. Set `ROACH_MODE: replay` in the `env` of the step for a job
+that must not record. Without the token, it runs `run` without Roach, so
+its requests go direct, and the job summary says so. With the token, it
+runs `run` in
+bash with the proxy variables
 of the run, then ends the run and writes its stats to the job summary. The
 `url` input sets the service. Default: `https://roach-proxy.getsentry.net`.
 
 - Only `run` uses the proxy. Later steps, such as cache and artifact
-  uploads, do not. `run` does not get the write token or the `ACTIONS_*`
+  uploads, do not. `run` does not get the token or the `ACTIONS_*`
   variables of the runner, such as `ACTIONS_RUNTIME_TOKEN` and
   `ACTIONS_ID_TOKEN_REQUEST_TOKEN`. So `run` cannot get an OIDC token.
 - `run` is one session. When it fails, the run drops its new recordings. A
@@ -232,9 +240,8 @@ A run takes `RunConfig` (`packages/roach/src/types.ts`): `tenant`, `mode`, `rule
   (see [Misses](#misses)). They also show it for a parameter whose value is
   the value of a credential field of the request body (see below). The
   other parameters do not change.
-  A run without the token learns at most 1,024 values, with a total of
-  1 Mi characters. A run with the token learns at most 16,384 values, with
-  a total of 16 Mi characters, for credentials that change on each
+  A run learns at most 16,384 values, with a total of 16 Mi characters,
+  for credentials that change on each
   request, such as AWS signatures. The whole value and each part of it
   count, also for the `secrets` of the run. The proxy also redacts each
   part with `\/` for `/`, as some servers write it in JSON, and the whole
@@ -409,8 +416,7 @@ as part of a word and does not match.
   requests until it ends. It does not drop a value, because that would
   change the keys of later requests. Only a value of over 32,767
   characters stays out: V8 cannot run a pattern with it, so it would fail
-  each later request of the session. A run without the token has a limit
-  (see below): past it, the request fails.
+  each later request of the session.
 - Values in thinking blocks of the request do not count for `n`, and the
   proxy does not look for remembered values in them. A replay keeps the
   recorded text of a thinking block, so when a later request sends it back,
@@ -426,39 +432,18 @@ Keep the patterns narrow. A broad pattern makes requests that differ in a
 real way use the same recording.
 
 The service takes any pattern that compiles in 1 s, up to 2048
-characters. A run without the token must use the same patterns as the run
-that recorded, or its keys do not match. Each key has a time limit: 1 s,
+characters. A `replay` run must use the same patterns as the run that
+recorded, or its keys do not match. Each key has a time limit: 1 s,
 and 0.5 s for each MiB of the body. The built-in patterns take about 60
 to 110 ms for each MiB. A request whose key takes longer fails with HTTP 400.
 So does a JSON body with arrays or objects nested over 64 levels deep.
 
-All runs share one process. Anyone can start a run without the token, so
-the service makes the keys of these runs in a worker process, one key at
-a time. So a slow key does not stop the other work of the service. Some
+All runs share one process, and the service makes each key in it. Some
 work, such as `JSON.parse()` of a large body, cannot stop at the time
-limit. When a key goes 1 s past its time limit, the service stops the
-worker and starts a new one. The worker has 256 MiB of heap. A key that
-needs more stops the worker, and its request fails with HTTP 400. The key
-of a 16 MiB body of small text blocks needs less. A run with the token
-makes its keys in the main process, so it has no memory limit of the
-worker. The key of a 64 MiB body can need about 1 GiB.
-
-The limits never change a key: a request gets the key that it always
-had, or it fails. A run without the token has smaller limits:
-
-- A key has at most 5 s.
-- A request can have at most 100,000 changing values. A request with more
-  fails with HTTP 400, and the run goes on.
-- The sessions of the run remember at most 10,000 values, with 256 Ki
-  characters, together. A request that would add more fails with HTTP
-  400, and the run ends. A session forgets its values when it ends. The
-  model requests of Junior have about 500 values with 10 K characters for
-  each session.
-- The keys of the run and the redaction of its misses (see
-  [Misses](#misses)) have 30 s in total. In the 14 days to 2026-11-05, the
-  keys of the largest run took 9.5 s (p99 9.1 s, about 1,000 keys).
-- When a key goes past its time limit, its worker stops, or the run goes
-  past 30 s, the run ends. Its other requests then fail with HTTP 410 or 407.
+limit. The key of a 64 MiB body can need about 1 GiB. Only CI jobs with
+the token can start runs, so the service trusts their patterns and bodies
+up to these limits. The limits never change a key: a request gets the key
+that it always had, or it fails.
 
 Avoid nested quantifiers, such as `(a+)+`.
 
@@ -472,8 +457,8 @@ vitest integration and of the GitHub Action shows these misses.
 
 The proxy also finds where the first miss of each session changed
 (`packages/service/src/misses.ts`). Sentry gets the text of the change, on the `roach.request`
-span of the miss (see [Sentry](#sentry)). The report of a run with the
-write token tells only where the change is:
+span of the miss (see [Sentry](#sentry)). The report of a run tells only
+where the change is:
 
 ```text
 - a.fixture.ts > passes: model/074d….json
@@ -500,23 +485,17 @@ shows it.
   of the request. It finds the first character that is not the same.
   Sentry gets 40 characters before it, and at most 120 characters from it,
   of each text. This is one read for each session, in every run.
-- Sentry gets the change of every run, with or without the token. So find
-  the change of a miss of a fork in Sentry.
-- Only runs with the write token get `change` in their stats and report.
-  It has the key of the recording that the sample came from (`file`), and
-  the offset (`at`). It has no text. A run without the token, such as CI of
-  a fork, gets no `change`. Reads are public, and the offset of the first
-  change would let anyone guess the requests of a tenant back, one
-  character at a time.
+- The stats and report of a run get `change`. It has the key of the
+  recording that the sample came from (`file`), and the offset (`at`). It
+  has no text.
 - A miss has no change when there is no sample, such as for a recording
   from an older version, when the sample has no text (`withheld`, see
   [Config](#config)), or when the texts are the same in the part that the
   sample keeps. A sample with no text still takes the place of the older
   sample, so a miss never compares with a request that is not the last.
 - The proxy redacts the text of the miss before it compares it. This has
-  the time limit of a key, and for a run without the token it runs in the
-  worker process of the keys (see [Changing values](#changing-values)).
-  Past the limit, the miss has no change.
+  the time limit of a key (see [Changing values](#changing-values)). Past
+  the limit, the miss has no change.
 - When the requests of a test run in parallel, their order can change.
   Then a sample can come from another request of the test.
 
@@ -538,14 +517,13 @@ is not the same as the recorded one. No error shows this. The tests pass.
    without the network. [`TELEMETRY.md`](TELEMETRY.md) shows how to find
    the runs and keys that stay live.
 2. Find the first live request of a test that did not replay. Run only
-   that test with `ROACH_MODE=replay`. It needs no token. The test fails
+   that test with `ROACH_MODE=replay`. The test fails
    at the first miss, and the run report shows its key. Fix the first miss
    of a test before the others. The others often come from it.
 3. Find the `roach.request` span of the first miss in Sentry, by its
    `roach.run.id`, `roach.session`, and `has:miss.changed_at`. Read `miss.recorded` and `miss.request`. See
    [Misses](#misses) and [`TELEMETRY.md`](TELEMETRY.md). They show the
-   changing value, with the text before it. This works for every run, with
-   or without the token. When the miss has no change, get the body of that
+   changing value, with the text before it. When the miss has no change, get the body of that
    request from two runs, and compare them. For example, add this file to `setupFiles`
    after `@sentry/roach/vitest/setup`, and run the test two times:
 
@@ -604,18 +582,14 @@ config is `RoachServiceConfig` in `packages/service/src/service.ts`. `deploy/gcp
   service has no list of tenants, so a new project needs no change to the
   service. The recordings of a tenant are under `<owner>/<repo>/` in the
   bucket. Tenants never share recordings.
-- **One write token.** All tenants share one write token. The config keeps
-  only its SHA-256, in `writeTokenHash`. The tenant name is only a label,
-  not proof of identity: a job with the token can write the recordings of
-  any tenant. So give the token only to repositories and workflows that
-  you trust, and never to a workflow that runs code from a fork.
-- **Reads are public.** Anyone can start a `replay` run of a tenant, so CI
-  jobs of forks replay without a secret. Such a run never writes, and it
-  refuses a request that no rule records, so nothing goes live. The stats
-  count these requests in `refused.replayOnly`. Every other mode needs
-  the write token. So treat each recording as readable by anyone who can
-  make its request. Do not record responses that must stay private. For
-  what a run without the token sees of a miss, see [Misses](#misses).
+- **One token.** Each run needs the token, in every mode, to read or
+  write recordings. All tenants share it. The config keeps only its
+  SHA-256, in `writeTokenHash`. The tenant name is only a label, not
+  proof of identity: a job with the token can read and write the
+  recordings of any tenant. So give the token only to repositories and
+  workflows that you trust, and never to a workflow that runs code from a
+  fork. CI jobs of forks get no secrets, so Roach is off in them, and
+  their requests go direct.
 - **Runs.** Each run has its own id, token, mode, rules, sessions, and
   stats. A proxied request names its run in `Proxy-Authorization`, as
   `Basic base64(<id>:<token>)`. The proxy URL of the run has them, so
@@ -629,15 +603,13 @@ config is `RoachServiceConfig` in `packages/service/src/service.ts`. `deploy/gcp
     It checks the address of each connection after DNS, so a host name
     cannot point a run at the metadata server, at the VPC, or at the VM.
     Only tests and local development set `privateNetworks`.
-  - A key has a time limit. The service makes the keys of runs without
-    the token in a worker process with a memory limit
-    (`packages/service/src/key-worker.ts`). So a slow pattern or a large body fails only its
-    own request, and it does not stop the service.
+  - A key has a time limit. So a slow pattern fails only its own
+    request.
 - **Sentry.** With `sentryDsn`, each read and write of a recording sends
   a span to Sentry. Each proxied request sends a span and metrics. Each
   unexpected error sends an error event. See [Sentry](#sentry).
 - **Errors.** An error that is the fault of the client, such as HTTP 400,
-  409, 413, or 429, keeps its message. Any other error, such as a failure
+  401, 409, 413, or 429, keeps its message. Any other error, such as a failure
   of the upstream or of GCS, gets HTTP 502 for a proxied request or HTTP
   500 for a control call. Its text is only `internal error, Sentry event
   <id>`, because the message of the error can have a response body. Only
@@ -655,19 +627,18 @@ attribute of Roach starts with `roach.`. Metrics have only attributes with
 few values: `roach.tenant`, `roach.mode`, `roach.rule`, `roach.origin`,
 `roach.result`, and `roach.reason`.
 
-| Metric                   | Type              | Value                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| ------------------------ | ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `roach.request`          | counter           | 1 for each proxied request. `roach.result` is `replayed`, `live`, `missed`, `passthrough`, `refused`, `busy` (HTTP 503: the body did not fit in the budget), `timeout` (HTTP 408: the body did not come in time), or `aborted` (the client closed the request before its body came). A `passthrough`, `refused`, `busy`, `timeout`, or `aborted` request has no `roach.rule`. A `refused` request has `roach.reason`, and `other` for an origin not in `allow`. |
-| `roach.request.duration` | distribution (ms) | The time to answer a request that a rule records, by `roach.result`.                                                                                                                                                                                                                                                                                                                                                                                            |
-| `roach.recording.write`  | counter           | Recordings by `roach.rule`. `roach.result` is `written` (the proxy sent them to the store) or `dropped` (their session failed).                                                                                                                                                                                                                                                                                                                                 |
+| Metric                   | Type              | Value                                                                                                                                                                                                                                                                                                                            |
+| ------------------------ | ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `roach.request`          | counter           | 1 for each proxied request. `roach.result` is `replayed`, `live`, `missed`, `passthrough`, `refused`, or `aborted` (the client closed the request before its body came). A `passthrough`, `refused`, or `aborted` request has no `roach.rule`. A `refused` request has `roach.reason`, and `other` for an origin not in `allow`. |
+| `roach.request.duration` | distribution (ms) | The time to answer a request that a rule records, by `roach.result`.                                                                                                                                                                                                                                                             |
+| `roach.recording.write`  | counter           | Recordings by `roach.rule`. `roach.result` is `written` (the proxy sent them to the store) or `dropped` (their session failed).                                                                                                                                                                                                  |
 
 Each proxied request is one trace. Each span has `roach.tenant`,
 `roach.mode`, `roach.run.id` (the `name` of the run, else its id), and the
 `roach.ci.*` attributes of the CI job of the run: `roach.ci.run_id`,
 `roach.ci.job`, `roach.ci.repo`, and `roach.ci.ref`.
 
-- `roach.run.start`: a new run, with `roach.write` (the run has the write
-  token).
+- `roach.run.start`: a new run.
 - `roach.request`: one proxied request, named `<method> <origin>`, with
   `roach.origin`, `roach.rule`, `roach.result`, `roach.session` (the name
   of the session, such as the test), `http.request.method`, and
@@ -719,38 +690,12 @@ change on each run.
 ### Limits
 
 - Runs live in memory in one process. A restart ends the open runs, and
-  their CI jobs fail. A run with the token that is open for 6 hours ends
-  as failed.
-- A run without the token ends after 2 hours, or after 60 minutes without
-  a proxied request or a control call. Its proxy URL then gets HTTP 407,
-  and its control API gets HTTP 404. The GitHub Action starts the run
-  before the command of the job, so a step that takes longer than
-  60 minutes without a request to the service fails.
-- The service can have 100 open runs without a token, for all tenants
-  together, and 10 for each client address. All addresses of one IPv6
-  /64 count as one client, and an IPv4 address in IPv6 form, such as
-  `::ffff:192.0.2.1`, counts as its IPv4 address. Another one gets HTTP
-  429 until one ends. Runs with the token have no cap. With `proxyProtocol`, the address of the
-  client comes from the PROXY protocol v1 header of the load balancer.
-  A connection without the header uses the address of the connection.
-- A proxied request body over 64 MiB gets HTTP 413, and over 16 MiB for a
-  run without the token. A control API body over 1 MiB gets HTTP 413
-  before the service parses it.
-- The requests of all runs without the token can hold 128 MiB of bodies
-  at one time, and the runs of one client 16 MiB. The client of a run is
-  the client that started it, grouped as for the limit of runs. A request
-  holds its body until it finishes, also while its key waits for the key
-  worker. A request whose body does not fit gets HTTP 503 with
-  `Retry-After: 1`, and the run goes on. The clients of model APIs send a
-  503 again. A client that does not gets the 503, and its test fails.
-  Runs with the token have no such limit.
-- A body of a run without the token that does not come in 30 s gets
-  HTTP 408, and its connection closes. The run goes on.
-- With these limits, the service and the key worker use at most about
-  1.1 GB of the 2 GB of the VM. That is for request bodies of runs with
-  the token of a normal size. A body of 64 MiB from a run with the token,
-  at the same time as runs without the token fill the budget, took about
-  2.0 GB.
+  their CI jobs fail. A run that is open for 6 hours ends as failed.
+- A proxied request body over 64 MiB gets HTTP 413. A control API body
+  over 1 MiB gets HTTP 413 before the service parses it. A start of a run
+  without the token gets HTTP 401 before the service reads its body.
+- With `proxyProtocol`, the service reads and drops the PROXY protocol v1
+  header of the load balancer. A connection without the header works too.
 - Keys and the redaction of misses have time limits. See
   [Changing values](#changing-values).
 - Request headers that do not come in 10 s get HTTP 408, and a request
@@ -763,14 +708,7 @@ change on each run.
   each request, with or without TLS. Between two requests, a connection
   closes after 6 s without a new request (the `keepAliveTimeout` of Node,
   5 s, and 1 s that Node adds), and the client opens a new one.
-- The credentials that a run learns and the values that the sessions of
-  a run without the token remember have limits. See [Config](#config) and
-  [Changing values](#changing-values).
-- A gap: a client with an IPv6 /48 has 65,536 /64s, so it can open runs
-  until the service has 100 runs without a token. Then other clients get
-  HTTP 429 until its runs end. Its runs can also hold all of the budget of
-  bodies. A body gets HTTP 408 after 30 s, but the client can start the
-  next one at once, so it holds the budget for as long as it sends.
+- The credentials that a run learns have a limit. See [Config](#config).
 - GCS deletes each recording 30 days after it was written, also when runs
   still replay it. Then `auto` mode records it again, and `replay` mode
   fails the request with HTTP 412.
@@ -781,7 +719,7 @@ change on each run.
 `deploy/gcp/` is the production setup, in Terraform. It makes:
 
 - a GCS bucket that deletes each recording after `recording_days` (30),
-- the certificate authority and the write token,
+- the certificate authority and the token,
 - the service config, in Secret Manager,
 - one Container-Optimized OS VM that runs the image
   `ghcr.io/getsentry/roach:main`, with a service account that can only use
@@ -790,8 +728,7 @@ change on each run.
   and passes the raw TCP stream, with `CONNECT`, to the VM. Each
   connection starts with a PROXY protocol v1 header with the address of
   the client (`proxy_header`). The config sets `proxyProtocol`, so the
-  service limits runs without a token by that address. The health check
-  sends the header too,
+  service reads and drops it. The health check sends the header too,
 - a service account for the `Deploy` workflow, which GitHub Actions uses
   through workload identity federation (`deploy.tf`). It can only reset
   the VM.
@@ -825,7 +762,7 @@ The `Deploy` workflow accepts these runs like push runs.
    project. Another deployment changes these values. It has no origins or
    patterns: runs send them.
 3. The Terraform state is in the private bucket that `backend "gcs"` in
-   `versions.tf` names. The state holds the CA key and the write token, so
+   `versions.tf` names. The state holds the CA key and the token, so
    the bucket must stay private. Make the bucket before the first
    `terraform init`.
 4. Log in with `gcloud auth application-default login`, then apply:
@@ -838,7 +775,7 @@ The `Deploy` workflow accepts these runs like push runs.
 
 5. Point an A record of `domain` at the `ip_address` output. The
    certificate works some minutes after DNS does.
-6. Put the write token in one GitHub organization secret, `ROACH_TOKEN`.
+6. Put the token in one GitHub organization secret, `ROACH_TOKEN`.
    Give it access only to the repositories that you trust. This command
    does not show the token:
 
@@ -912,7 +849,7 @@ To add a project, add its repository to the repositories of the
 organization. Its CI jobs set `tenant` to `GITHUB_REPOSITORY`, and send
 their own origins and patterns. The service needs no change.
 
-To change the write token, run
+To change the token, run
 `terraform apply -var-file=roach.tfvars -replace=random_password.write_token`,
 set the secret again, and restart the VM.
 
@@ -944,12 +881,11 @@ The calls of a run are under `/__roach/runs/<id>`. They need
 The service also has:
 
 - `POST /__roach/runs` with a `RunConfig`: start a run. Send
-  `Authorization: Bearer <write token>` for any mode but `replay`. Returns
+  `Authorization: Bearer <token>` of the service, in every mode. Returns
   HTTP 201 with the `id`, `token`, proxy `url`, `controlUrl`, and `caCert`
-  of the run. A body that is not JSON or a config that is not valid gets
-  HTTP 400, a body over 1 MiB gets HTTP 413, a mode other than
-  `replay` without the token gets HTTP 401, and a run past the limit of
-  runs without a token gets HTTP 429 (see [Limits](#limits)).
+  of the run. A call without the token, or with a wrong one, gets HTTP 401
+  before the service reads the body. A body that is not JSON or a config
+  that is not valid gets HTTP 400, and a body over 1 MiB gets HTTP 413.
 - `DELETE /__roach/runs/<id>`: end the run. Returns its stats.
 - `GET /__roach/ca.pem`: the CA certificate. No token.
 
@@ -1052,9 +988,8 @@ In `packages/service/src/`:
 - `cli.ts`: the command line, which the image runs.
 - `server.ts`: sockets, HTTPS interception, the allow list, and the control
   API.
-- `bodies.ts`: request bodies, their size limits, and the budget that the
-  bodies of runs without the token share.
-- `clients.ts`: the PROXY protocol header and the address of a client.
+- `bodies.ts`: request bodies and their size limits.
+- `clients.ts`: the PROXY protocol header of the load balancer.
 - `run-config.ts`: the check of the run config of a client, with its
   limits.
 - `errors.ts`: the errors that are the fault of the client, and the log
@@ -1064,9 +999,6 @@ In `packages/service/src/`:
 - `recording-file.ts`: a recording file from a live response, the response
   of a replay, and the decoding of compressed bodies.
 - `request-key.ts`: the key of a request.
-- `key-worker.ts`: the worker process that makes the keys of runs without
-  the token and redacts the text of their misses, with a time limit and a
-  memory limit.
 - `misses.ts`: request samples and the first change of a miss.
 - `store.ts`: the formats of recordings and request samples, and the
   store contract.
