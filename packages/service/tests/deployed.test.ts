@@ -122,7 +122,7 @@ function readEnvelope(envelope: string) {
 
 /**
  * An Anthropic Messages stream with its usage. The first event gives the
- * input tokens, and the last one gives the total output tokens.
+ * input tokens, and `message_delta` gives the total output tokens.
  */
 const modelStream = (n: number) =>
   [
@@ -139,6 +139,7 @@ const modelStream = (n: number) =>
       },
     },
     { type: "message_delta", n, usage: { output_tokens: 7 } },
+    { type: "message_stop" },
   ]
     .map((data) => `event: ${data.type}\ndata: ${JSON.stringify(data)}\n\n`)
     .join("");

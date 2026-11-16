@@ -50,6 +50,7 @@ import {
   type RecordingStore,
   type RequestSample,
 } from "./store.ts";
+import { isEventStream, isFailedStream } from "./streams.ts";
 import { usageAttributes } from "./usage.ts";
 import type {
   RecordingMiss,
@@ -162,8 +163,16 @@ const METRIC_OTHER_ORIGIN = "other";
 const MAX_ENDED_SESSIONS = 1000;
 /** Open sessions of a run, such as one for each test worker. */
 const MAX_OPEN_SESSIONS = 64;
-/** Statuses that are never recorded, because they are temporary. */
-const isTemporaryStatus = (status: number) => status === 429 || status >= 500;
+/**
+ * Whether a response is a temporary failure, so it is never recorded: a 429
+ * or 5xx status, or a model stream that failed after HTTP 200.
+ */
+function isTemporaryFailure({ status, headers, body }: ProxyResponse) {
+  if (status === 429 || status >= 500) return true;
+  if (!isEventStream(headers["content-type"])) return false;
+  const text = utf8Text(body);
+  return text !== undefined && isFailedStream(text);
+}
 
 function matches(
   { match }: RecordingRule,
@@ -600,7 +609,7 @@ export function createRecorder(config: RecorderConfig, store: RecordingStore) {
           ),
         ),
       ) as Recording;
-      if (!isTemporaryStatus(recording.response.status)) {
+      if (!isTemporaryFailure(live)) {
         let stored: Recording;
         try {
           stored = toStored(recording);
