@@ -12,7 +12,12 @@
  * So a later request sends back the values of the recording run in its
  * thinking blocks, and `request-key.ts` must not fill placeholders from
  * them.
+ *
+ * A provider can send HTTP 200 and then fail the stream. The recorder does
+ * not keep such a stream (`isFailedStream`), because a replay would repeat
+ * the failure on each run.
  */
+import { isObject } from "./json-strings.ts";
 
 /** The text field of each delta type that the proxy merges. */
 const DELTA_FIELDS: Record<string, string> = {
@@ -112,4 +117,49 @@ export function mapStreamEvents(
       isThinking(event) ? event : { text: change(event.text) },
     ),
   );
+}
+
+/** Event types that end a model stream with an error. */
+const ERROR_EVENT_TYPES = new Set(["error", "response.failed"]);
+
+/** The finish reasons that a stream event sets. */
+function finishReasons(data: Record<string, unknown>): unknown[] {
+  const delta = isObject(data.delta) ? data.delta : {};
+  const choices = Array.isArray(data.choices) ? data.choices : [];
+  return [
+    data.finishReason,
+    delta.stop_reason,
+    ...choices.map((choice) =>
+      isObject(choice) ? choice.finish_reason : undefined,
+    ),
+  ].filter((reason) => reason !== undefined && reason !== null);
+}
+
+/**
+ * Whether a model stream failed. It failed when it has an error event
+ * (`event: error`, a `type` of `error` or `response.failed`, or an `error`
+ * object), a finish reason of `error`, or no end: an Anthropic Messages
+ * stream without `message_stop`, or an OpenAI Chat Completions stream
+ * without a finish reason.
+ */
+export function isFailedStream(body: string): boolean {
+  let messageStarted = false;
+  let messageStopped = false;
+  let chatCompletion = false;
+  let finished = false;
+  for (const { text, data } of splitEvents(body)) {
+    if (/^event:\s*error\s*$/m.test(text)) return true;
+    if (!data) continue;
+    if (ERROR_EVENT_TYPES.has(String(data.type)) || isObject(data.error)) {
+      return true;
+    }
+    if (data.type === "message_start") messageStarted = true;
+    if (data.type === "message_stop") messageStopped = true;
+    if (data.object === "chat.completion.chunk") chatCompletion = true;
+    for (const reason of finishReasons(data)) {
+      if (reason === "error") return true;
+      finished = true;
+    }
+  }
+  return (messageStarted && !messageStopped) || (chatCompletion && !finished);
 }

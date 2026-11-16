@@ -77,6 +77,14 @@ async function start(
 const delta = (type: string, field: string, text: string) =>
   `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type, [field]: text } })}\n\n`;
 
+/** One named event of a stream. */
+const streamEvent = (name: string, data: unknown) =>
+  `event: ${name}\ndata: ${JSON.stringify(data)}\n\n`;
+
+/** One chunk of an OpenAI Chat Completions stream, with one choice. */
+const chatChunk = (choice: Record<string, unknown>) =>
+  `data: ${JSON.stringify({ object: "chat.completion.chunk", choices: [{ index: 0, ...choice }] })}\n\n`;
+
 /** Send requests through the proxy. */
 async function send(bodies: unknown[], target = `${origin}/v1/messages`) {
   const responses: Array<{ body: string; source: unknown }> = [];
@@ -228,6 +236,77 @@ describe("recording", () => {
       passthrough: {},
       refused: {},
     });
+  });
+
+  it("does not record a model stream that fails after HTTP 200", async () => {
+    const messageStart = streamEvent("message_start", {
+      type: "message_start",
+      message: { id: "msg_1", stop_reason: null },
+    });
+    const text = delta("text_delta", "text", "Looking it up.");
+    const failures = [
+      // A gateway timeout after the first content.
+      messageStart +
+        text +
+        streamEvent("error", {
+          type: "error",
+          error: { type: "timeout_error", message: "Upstream timed out" },
+        }),
+      // A message that never ends.
+      messageStart + text,
+      // An OpenAI Chat Completions error, and a stream without an end.
+      chatChunk({ delta: { content: "Hi" } }) +
+        `data: ${JSON.stringify({ error: { message: "upstream failed" } })}\n\n`,
+      chatChunk({ delta: { content: "Hi" } }),
+      `data: ${JSON.stringify({ type: "finish", finishReason: "error" })}\n\n`,
+    ];
+    const running = await start("auto");
+    for (const failure of failures) {
+      respond = () => failure;
+      const first = await session(running, [{ messages: ["hi"] }]);
+      // The client gets the failed stream as it came.
+      expect(first[0]).toEqual({ body: failure, source: "live" });
+      const again = await session(running, [{ messages: ["hi"] }]);
+      expect(again[0]!.source).toBe("live");
+    }
+    expect(liveRequests).toBe(2 * failures.length);
+    expect(await files()).toEqual([]);
+  });
+
+  it("records a model stream that ends", async () => {
+    const anthropic = [
+      streamEvent("message_start", {
+        type: "message_start",
+        message: { id: "msg_1", stop_reason: null },
+      }),
+      delta("text_delta", "text", "Done."),
+      streamEvent("message_delta", {
+        type: "message_delta",
+        delta: { stop_reason: "end_turn" },
+      }),
+      streamEvent("message_stop", { type: "message_stop" }),
+    ].join("");
+    const chat = [
+      chatChunk({ delta: { content: "Done." } }),
+      chatChunk({ delta: {}, finish_reason: "stop" }),
+      "data: [DONE]\n\n",
+    ].join("");
+    const running = await start("auto");
+    respond = (body) => (body.includes("chat") ? chat : anthropic);
+    await session(running, [
+      { messages: ["messages"] },
+      { messages: ["chat"] },
+    ]);
+    const replay = await session(running, [
+      { messages: ["messages"] },
+      { messages: ["chat"] },
+    ]);
+
+    expect([...replay]).toEqual([
+      { body: anthropic, source: "replayed" },
+      { body: chat, source: "replayed" },
+    ]);
+    expect(await files()).toHaveLength(2);
   });
 
   it("replays a response with the changing values of the current request", async () => {

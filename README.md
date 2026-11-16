@@ -388,6 +388,12 @@ it. See [Misses](#misses).
 - A request outside a session is written at once.
 - A 429 or 5xx response is never recorded. A replay does not write the
   file again.
+- A model stream that fails after HTTP 200 is never recorded either. It
+  fails when it has an error event (`event: error`, a `type` of `error` or
+  `response.failed`, or an `error` object), a finish reason of `error`, or
+  no end: an Anthropic Messages stream without `message_stop`, or an OpenAI
+  Chat Completions stream without a finish reason. The client gets the
+  stream as it came.
 
 ## Changing values
 
@@ -1004,7 +1010,8 @@ In `packages/service/src/`:
   store contract.
 - `recordings.ts`: the file store, for tests and development.
 - `gcs.ts`: the GCS store.
-- `streams.ts`: merges the deltas of a recorded model stream.
+- `streams.ts`: merges the deltas of a recorded model stream, and finds a
+  failed stream.
 - `usage.ts`: the token usage of a model response, for Sentry.
 - `secrets.ts`: redaction of credentials.
 - `json-strings.ts`: the parse of a JSON body, and the one-pass scan of
