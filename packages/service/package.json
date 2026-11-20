@@ -15,7 +15,7 @@
   "devDependencies": {
     "@types/node": "catalog:",
     "typescript": "catalog:",
-    "undici": "^8.12.3",
+    "undici": "^8.12.4",
     "vitest": "catalog:"
   },
   "engines": {
