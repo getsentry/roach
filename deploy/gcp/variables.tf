@@ -36,10 +36,14 @@ variable "deploy_repository_id" {
   type        = string
 }
 
+# Not a shared-core type (e2-micro, e2-small, e2-medium). Those sustain only
+# part of a vCPU, and the proxy uses CPU for each request. When many CI runs
+# use Roach at the same time, a shared core runs out of burst, and every
+# request gets about 10 times slower.
 variable "machine_type" {
   description = "The machine type of the VM."
   type        = string
-  default     = "e2-small"
+  default     = "e2-standard-2"
 }
 
 variable "recording_days" {
